@@ -443,7 +443,7 @@ impl SqlRows<'_> {
                 i64::try_from(row.delivery_generation).map_err(storage)?,
                 row.delivery_until.map(stamp),
                 optional_json(&row.diagnostic)?,
-                i64::try_from(row.output.as_ref().map(encoded_bytes).transpose()?.unwrap_or(0)).map_err(storage)?,
+                i64::try_from(stored_output_bytes(&row)?).map_err(storage)?,
                 &row.admission,
             ]).map_err(storage)?;
         if old.as_ref().is_none_or(|old| old.owners != row.owners) {
@@ -788,6 +788,15 @@ fn candidate_page_bytes(
     })
 }
 
+// An encoded output is never empty (`[]`), so zero means "not yet counted".
+fn stored_output_bytes(row: &JobRecord) -> Result<usize, JobError> {
+    match &row.output {
+        Some(_) if row.output_bytes > 0 => Ok(row.output_bytes),
+        Some(output) => encoded_bytes(output),
+        None => Ok(0),
+    }
+}
+
 // Encoded delivery size from a content-free snapshot; a present output adds
 // `,"output":` plus its encoded value.
 fn delivery_bytes(delivery: &Delivery, output_bytes: Option<usize>) -> Result<usize, JobError> {
@@ -804,10 +813,10 @@ fn delivery_bytes(delivery: &Delivery, output_bytes: Option<usize>) -> Result<us
 // page can carry. Until delivery, only the delivery ordinal and lease grow:
 // measure their widest encodings.
 fn undeliverable(row: &mut JobRecord, config: &JobConfig) -> Result<Option<usize>, JobError> {
-    let Some(output) = row.output.take() else {
+    if row.output.is_none() {
         return Ok(None);
-    };
-    let content = (row.payload.take(), row.admission.take());
+    }
+    let content = (row.payload.take(), row.admission.take(), row.output.take());
     let snapshot = Delivery {
         completion: JobRecord {
             delivery_generation: u64::MAX,
@@ -819,9 +828,8 @@ fn undeliverable(row: &mut JobRecord, config: &JobConfig) -> Result<Option<usize
             generation: u64::MAX,
         },
     };
-    (row.payload, row.admission) = content;
-    let size = delivery_bytes(&snapshot, Some(encoded_bytes(&output)?))?;
-    row.output = Some(output);
+    (row.payload, row.admission, row.output) = content;
+    let size = delivery_bytes(&snapshot, Some(stored_output_bytes(row)?))?;
     let page = size.checked_add(2).ok_or(JobError::Storage)?;
     Ok((page > config.max_page_bytes).then_some(page))
 }
@@ -1193,6 +1201,8 @@ fn apply_job_request(
                 finish(&mut row, JobState::Purged, now, config)?;
                 delete_copies(&mut row);
             } else {
+                // Count once: the page check and the stored length both reuse it.
+                row.output_bytes = output.as_ref().map(encoded_bytes).transpose()?.unwrap_or(0);
                 row.output = output;
                 let state = if row.cancel_requested {
                     JobState::Cancelled
