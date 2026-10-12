@@ -246,7 +246,7 @@ impl Shared {
         // A heartbeat failure is recorded above but never prevents this attempt.
         let completion = self
             .op(JobRequest::Complete {
-                job: claim.id,
+                job: claim.id.clone(),
                 generation: claim.generation,
                 state,
                 origin: ResultOrigin::Handler,
@@ -257,6 +257,14 @@ impl Shared {
             .await;
         match completion {
             Ok(JobResponse::Done) => {}
+            // The store already ended the job; report why its result was not kept.
+            Ok(JobResponse::ResultRefused { bytes }) => errors.push(
+                JobError::ResultTooLarge {
+                    job: claim.id,
+                    bytes,
+                }
+                .into(),
+            ),
             Ok(_) => errors.push(JobError::InvalidRequest.into()),
             Err(error) => errors.push(error.into()),
         }

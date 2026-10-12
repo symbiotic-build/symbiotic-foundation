@@ -1368,6 +1368,55 @@ async fn runner_oversized_result_is_terminal_and_typed() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+/// A raw result under `max_result_bytes` whose delivery cannot fit one legal page
+/// fails visibly instead of stalling every later completion in its scope.
+#[tokio::test]
+async fn runner_result_larger_than_a_delivery_page_fails_and_later_completions_deliver() {
+    let mut s = Suite::new();
+    s.now = Utc::now();
+    let oversized = s.insert(s.spec("page-oversized")).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = s
+        .runner(1, {
+            let calls = calls.clone();
+            move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(vec![255; 1024 * 1024]) }
+            }
+        })
+        .await;
+    s.final_row(&oversized).await;
+    let stopped = runner.shutdown().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    s.now = Utc::now() + Duration::seconds(1);
+    let later = s.insert(s.spec("page-later")).await;
+    let claim = s.claim().await;
+    assert_eq!(claim.id, later);
+    s.complete(&claim, data!({ "answer": "later" })).await;
+    let deliveries = s.deliveries(64, s.config.max_page_bytes).await;
+    assert_eq!(
+        deliveries
+            .iter()
+            .map(|d| d.completion.id.clone())
+            .collect::<Vec<_>>(),
+        vec![oversized.clone(), later]
+    );
+    assert_eq!(deliveries[0].completion.state, JobState::Failed);
+    assert_eq!(
+        deliveries[0].completion.diagnostic,
+        Some(symbiotic_core::DiagnosticCode::QueueFailure)
+    );
+    assert!(deliveries[0].completion.output.is_none());
+    assert_eq!(
+        deliveries[1].completion.output,
+        Some(data!({ "answer": "later" }))
+    );
+    assert!(matches!(stopped, Err(RunnerError::Workers(workers))
+        if matches!(workers.as_slice(), [RunnerError::Workers(errors)]
+            if matches!(errors.as_slice(), [RunnerError::Store(JobError::ResultTooLarge { job, .. })] if job == &oversized))));
+}
+
 #[tokio::test]
 async fn runner_handoff_retains_only_one_payload_buffer() {
     struct BorrowedHandler(Arc<tokio::sync::Notify>);
@@ -2754,6 +2803,63 @@ async fn jobs_binary_bytes_and_raw_size_bounds() {
     assert!(serde_json::to_vec(&vec![delivery.clone()]).unwrap().len() <= 100_000);
     s.ack(delivery.token, Disposition::Accepted).await;
     assert!(s.get(&id).await.output.is_none());
+}
+
+/// Completion keeps exactly the handler results one maximum delivery page can
+/// carry. A larger result fails its job in the same write, and the largest kept
+/// result is delivered intact.
+#[tokio::test]
+async fn jobs_result_kept_only_when_one_delivery_page_carries_it() {
+    let mut s = Suite::new();
+    s.config.max_page_bytes = 4096;
+    let mut len = s.config.max_page_bytes / 8;
+    let mut largest = None;
+    loop {
+        s.advance(1);
+        // Equal-width keys keep every job's metadata the same size.
+        let id = s.insert(s.spec(&format!("page-{len:05}"))).await;
+        let claim = s.claim().await;
+        let response = s
+            .op(JobRequest::Complete {
+                job: id.clone(),
+                generation: claim.generation,
+                state: JobState::Succeeded,
+                origin: ResultOrigin::Handler,
+                // Each 255 byte encodes as `255,`: the widest JSON array element.
+                output: Some(vec![255; len]),
+                receipt: None,
+                diagnostic: None,
+            })
+            .await
+            .unwrap();
+        match response {
+            JobResponse::Done => {
+                let delivery = s.deliveries(1, s.config.max_page_bytes).await.remove(0);
+                assert_eq!(delivery.completion.id, id);
+                assert_eq!(delivery.completion.output, Some(vec![255; len]));
+                assert!(
+                    serde_json::to_vec(&vec![delivery.clone()]).unwrap().len()
+                        <= s.config.max_page_bytes
+                );
+                s.ack(delivery.token, Disposition::Accepted).await;
+                largest = Some(len);
+                len += 1;
+            }
+            JobResponse::ResultRefused { bytes } => {
+                assert!(bytes > s.config.max_page_bytes);
+                let row = s.get(&id).await;
+                assert_eq!(row.state, JobState::Failed);
+                assert_eq!(
+                    row.diagnostic,
+                    Some(symbiotic_core::DiagnosticCode::QueueFailure)
+                );
+                assert!(row.output.is_none() && row.lease_until.is_none());
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(largest, Some(len - 1));
 }
 
 /// Pending capacity counts raw payload bytes plus canonical metadata, without parsing content.
