@@ -48,6 +48,7 @@ pub struct JobConfig {
     /// Maximum serialized delivery page (1 MiB).
     pub max_page_bytes: usize,
     /// Maximum retained result: raw handler bytes or encoded paid answer (16 MiB; PROVISIONAL).
+    /// A handler result is also refused when its delivery cannot fit one `max_page_bytes` page.
     pub max_result_bytes: usize,
     /// Hard pending, running and final-but-unconfirmed population bound (1024; PROVISIONAL).
     pub max_live_jobs: usize,
@@ -508,7 +509,8 @@ pub enum JobError {
     /// An eligible completion cannot fit individually in the requested page.
     #[error("completion exceeds page byte bound: {job:?} ({bytes} bytes)")]
     CompletionTooLarge { job: JobId, bytes: usize },
-    /// A handler result exceeds the configured raw-byte limit.
+    /// A handler result exceeds `max_result_bytes` (`bytes` is its raw length), or its
+    /// one-item delivery page exceeds `max_page_bytes` (`bytes` is that encoded page length).
     #[error("result exceeds byte bound: {job:?} ({bytes} bytes)")]
     ResultTooLarge { job: JobId, bytes: usize },
     /// An inspected job cannot fit individually in the requested candidate page.

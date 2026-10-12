@@ -37,7 +37,7 @@ an in-memory runtime. Every default below is
 | `max_batch` | 64 | Bound atomic enqueue and confirmation requests. |
 | `max_page` | 64 | Bound claim, delivery and diagnostic selections. |
 | `max_page_bytes` | 1 MiB | Bound serialized candidate and completion arrays. |
-| `max_result_bytes` | 16 MiB | Refuse larger raw handler results or encoded paid answers before retention. |
+| `max_result_bytes` | 16 MiB | Refuse larger raw handler results or encoded paid answers before retention. A handler result must also fit one `max_page_bytes` delivery page. |
 | `maintenance_bytes_per_pass` | 16 MiB | Bound raw payload/result and ledger recovery bytes erased per expiry pass. |
 | `claim_lease_seconds` | 30 seconds | Permit timely handler recovery after a lost worker. |
 | `delivery_lease_seconds` | 30 seconds | Reduce overlap while retaining at-least-once delivery. |
@@ -87,7 +87,13 @@ execution and Unix epoch creation time); these defaults are not persisted.
 Completion selection reads stored encoded result lengths and delivery metadata
 before loading saved answers. The existing length column counts the serialized
 byte-array representation for exact page preflight, while the result limit and
-maintenance budget count raw bytes. Diagnostics and expiry maintenance use
-content-free projections; expiry deletes copies directly. Encoded lengths and
+maintenance budget count raw bytes. `Complete` refuses a handler result with
+`ResultTooLarge` unless its one-item delivery fits `max_page_bytes`, measured
+with the widest delivery ordinal and lease. A byte array encodes at up to four
+bytes per raw byte, so with the 1 MiB default page a handler result above about
+256 KiB raw is refused. The runner records that refusal as a Failed job with
+`queue_failure`, so an undeliverable result never blocks later deliveries.
+Diagnostics and expiry maintenance use content-free projections; expiry deletes
+copies directly. Encoded lengths and
 all indexes are rebuildable from canonical rows. The unreleased SQLite schema
 version is 16; older layouts are refused without migration.

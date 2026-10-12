@@ -788,6 +788,48 @@ fn candidate_page_bytes(
     })
 }
 
+// Encoded delivery size from a content-free snapshot; a present output adds
+// `,"output":` plus its encoded value.
+fn delivery_bytes(delivery: &Delivery, output_bytes: Option<usize>) -> Result<usize, JobError> {
+    let output = match output_bytes {
+        Some(bytes) => bytes.checked_add(10).ok_or(JobError::Storage)?,
+        None => 0,
+    };
+    encoded_bytes(delivery)?
+        .checked_add(output)
+        .ok_or(JobError::Storage)
+}
+
+// Refuse a retained handler result that no legal completion page can carry.
+// Until delivery, only the delivery ordinal and lease grow: measure their widest encodings.
+fn deliverable(row: &mut JobRecord, config: &JobConfig) -> Result<(), JobError> {
+    let Some(output) = row.output.take() else {
+        return Ok(());
+    };
+    let content = (row.payload.take(), row.admission.take());
+    let snapshot = Delivery {
+        completion: JobRecord {
+            delivery_generation: u64::MAX,
+            delivery_until: Some(DateTime::<Utc>::MAX_UTC),
+            ..row.clone()
+        },
+        token: DeliveryToken {
+            job: row.id.clone(),
+            generation: u64::MAX,
+        },
+    };
+    (row.payload, row.admission) = content;
+    let size = delivery_bytes(&snapshot, Some(encoded_bytes(&output)?))?;
+    row.output = Some(output);
+    admit_page_bytes(size, 2, config.max_page_bytes, false, |bytes| {
+        JobError::ResultTooLarge {
+            job: row.id.clone(),
+            bytes,
+        }
+    })?;
+    Ok(())
+}
+
 // Enqueue is the sole creator of live rows and retained input. Both utilization
 // checks derive from canonical rows under the same IMMEDIATE transaction.
 fn insert_job(rows: &mut SqlRows<'_>, config: &JobConfig, row: JobRecord) -> Result<(), JobError> {
@@ -1163,6 +1205,7 @@ fn apply_job_request(
                 };
                 finish(&mut row, state, now, config)?;
             }
+            deliverable(&mut row, config)?;
             rows.save(row)?;
             Ok(JobResponse::Done)
         }
@@ -1282,14 +1325,7 @@ fn apply_job_request(
                     token,
                 };
                 let has_output = info.output_bytes > 0 && !row.result_expired;
-                let size = encoded_bytes(&delivery)?
-                    .checked_add(if has_output {
-                        // A present output adds `,"output":` plus its encoded value.
-                        info.output_bytes.checked_add(10).ok_or(JobError::Storage)?
-                    } else {
-                        0
-                    })
-                    .ok_or(JobError::Storage)?;
+                let size = delivery_bytes(&delivery, has_output.then_some(info.output_bytes))?;
                 let Some(required) =
                     admit_page_bytes(size, bytes, max_bytes, !admitted.is_empty(), |bytes| {
                         JobError::CompletionTooLarge {
