@@ -800,11 +800,12 @@ fn delivery_bytes(delivery: &Delivery, output_bytes: Option<usize>) -> Result<us
         .ok_or(JobError::Storage)
 }
 
-// Refuse a retained handler result that no legal completion page can carry.
-// Until delivery, only the delivery ordinal and lease grow: measure their widest encodings.
-fn deliverable(row: &mut JobRecord, config: &JobConfig) -> Result<(), JobError> {
+// The one-item page length of a retained handler result that no legal completion
+// page can carry. Until delivery, only the delivery ordinal and lease grow:
+// measure their widest encodings.
+fn undeliverable(row: &mut JobRecord, config: &JobConfig) -> Result<Option<usize>, JobError> {
     let Some(output) = row.output.take() else {
-        return Ok(());
+        return Ok(None);
     };
     let content = (row.payload.take(), row.admission.take());
     let snapshot = Delivery {
@@ -821,13 +822,8 @@ fn deliverable(row: &mut JobRecord, config: &JobConfig) -> Result<(), JobError> 
     (row.payload, row.admission) = content;
     let size = delivery_bytes(&snapshot, Some(encoded_bytes(&output)?))?;
     row.output = Some(output);
-    admit_page_bytes(size, 2, config.max_page_bytes, false, |bytes| {
-        JobError::ResultTooLarge {
-            job: row.id.clone(),
-            bytes,
-        }
-    })?;
-    Ok(())
+    let page = size.checked_add(2).ok_or(JobError::Storage)?;
+    Ok((page > config.max_page_bytes).then_some(page))
 }
 
 // Enqueue is the sole creator of live rows and retained input. Both utilization
@@ -1204,8 +1200,17 @@ fn apply_job_request(
                     state
                 };
                 finish(&mut row, state, now, config)?;
+                // Fail in this same write, so the claim cannot lapse between refusal and failure.
+                if let Some(bytes) = undeliverable(&mut row, config)? {
+                    row.output = None;
+                    if row.state != JobState::Cancelled {
+                        row.state = JobState::Failed;
+                        row.diagnostic = Some(DiagnosticCode::QueueFailure);
+                    }
+                    rows.save(row)?;
+                    return Ok(JobResponse::ResultRefused { bytes });
+                }
             }
-            deliverable(&mut row, config)?;
             rows.save(row)?;
             Ok(JobResponse::Done)
         }

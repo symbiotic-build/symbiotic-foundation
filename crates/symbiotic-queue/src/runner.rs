@@ -221,6 +221,16 @@ impl Shared {
             Self::observe_heartbeat(heartbeat.await, &cancel, &mut errors);
         }
         let (state, output, diagnostic) = match outcome {
+            Some(Ok(Ok(output))) if output.len() > self.jobs.max_result_bytes => {
+                errors.push(
+                    JobError::ResultTooLarge {
+                        job: claim.id.clone(),
+                        bytes: output.len(),
+                    }
+                    .into(),
+                );
+                (JobState::Failed, None, Some(DiagnosticCode::QueueFailure))
+            }
             Some(Ok(Ok(output))) => (JobState::Succeeded, Some(output), None),
             Some(Ok(Err(failure))) => (JobState::Failed, None, Some(failure.code)),
             Some(Err(_)) => {
@@ -234,30 +244,27 @@ impl Shared {
         };
         // Finished work, including a panic, always reaches the store's claim fence.
         // A heartbeat failure is recorded above but never prevents this attempt.
-        let complete = |state, output, diagnostic| JobRequest::Complete {
-            job: claim.id.clone(),
-            generation: claim.generation,
-            state,
-            origin: ResultOrigin::Handler,
-            output,
-            receipt: None,
-            diagnostic,
-        };
-        let mut completion = self.op(complete(state, output, diagnostic)).await;
-        // The store owns the result bounds; a result it cannot retain and deliver
-        // is a final failure, never a retry.
-        if let Err(error @ JobError::ResultTooLarge { .. }) = &completion {
-            errors.push(error.clone().into());
-            completion = self
-                .op(complete(
-                    JobState::Failed,
-                    None,
-                    Some(DiagnosticCode::QueueFailure),
-                ))
-                .await;
-        }
+        let completion = self
+            .op(JobRequest::Complete {
+                job: claim.id.clone(),
+                generation: claim.generation,
+                state,
+                origin: ResultOrigin::Handler,
+                output,
+                receipt: None,
+                diagnostic,
+            })
+            .await;
         match completion {
             Ok(JobResponse::Done) => {}
+            // The store already ended the job; report why its result was not kept.
+            Ok(JobResponse::ResultRefused { bytes }) => errors.push(
+                JobError::ResultTooLarge {
+                    job: claim.id,
+                    bytes,
+                }
+                .into(),
+            ),
             Ok(_) => errors.push(JobError::InvalidRequest.into()),
             Err(error) => errors.push(error.into()),
         }
