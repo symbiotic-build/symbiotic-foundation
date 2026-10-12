@@ -1201,8 +1201,6 @@ fn apply_job_request(
                 finish(&mut row, JobState::Purged, now, config)?;
                 delete_copies(&mut row);
             } else {
-                // Count once: the page check and the stored length both reuse it.
-                row.output_bytes = output.as_ref().map(encoded_bytes).transpose()?.unwrap_or(0);
                 row.output = output;
                 let state = if row.cancel_requested {
                     JobState::Cancelled
@@ -1210,9 +1208,17 @@ fn apply_job_request(
                     state
                 };
                 finish(&mut row, state, now, config)?;
+                // Count a kept output once: the page check and the stored length reuse it.
+                row.output_bytes = row
+                    .output
+                    .as_ref()
+                    .map(encoded_bytes)
+                    .transpose()?
+                    .unwrap_or(0);
                 // Fail in this same write, so the claim cannot lapse between refusal and failure.
                 if let Some(bytes) = undeliverable(&mut row, config)? {
                     row.output = None;
+                    row.output_bytes = 0;
                     if row.state != JobState::Cancelled {
                         row.state = JobState::Failed;
                         row.diagnostic = Some(DiagnosticCode::QueueFailure);
