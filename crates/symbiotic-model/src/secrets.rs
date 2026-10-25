@@ -74,7 +74,7 @@ impl CredentialBoundary {
 }
 
 /// The finite credential encoding set.
-fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate::ModelError> {
+pub fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, crate::ModelError> {
     let mut encodings = SecretValue::new(vec![secret.to_owned()]);
     let escaped = SecretValue::new(serde_json::to_string(secret).map_err(|_| {
         crate::ModelError::Provider(symbiotic_core::DiagnosticCode::InvalidCredentialEncoding)

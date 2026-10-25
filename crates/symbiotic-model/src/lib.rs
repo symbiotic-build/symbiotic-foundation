@@ -80,7 +80,7 @@ mod spend;
 pub use spend::*;
 
 mod secrets;
-pub use secrets::{CredentialBoundary, SecretValue};
+pub use secrets::{CredentialBoundary, SecretValue, credential_encodings};
 mod registry;
 pub use registry::*;
 mod anthropic;
@@ -4892,7 +4892,7 @@ fn provider_finish_reason(
     })
 }
 
-fn provider_usage_identity(
+pub fn provider_usage_identity(
     trace: &mut ModelInvocationTrace,
     raw: &Value,
     request_contains_identity: impl Fn(&str) -> bool,
