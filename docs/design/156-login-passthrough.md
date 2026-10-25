@@ -284,6 +284,10 @@ pub struct PassthroughRoute {
     pub stream: StreamDialect,
     /// Lowercase caller headers copied to the provider; all others are dropped.
     pub forward_headers: Vec<String>,
+    /// Lowercase provider response headers copied back to the caller on every
+    /// response, such as an agent tool's turn-routing header; all others are dropped.
+    #[serde(default)]
+    pub return_headers: Vec<String>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     /// Existing account policy fields, shared with typed routes on the same account.
@@ -359,6 +363,15 @@ A caller disconnect cancels the upstream request.
   has a fixed body and only the allowlisted headers below.
 - **Other non-2xx:** the status is forwarded with a fixed body and no upstream
   header. The upstream body is discarded because it can echo tokens.
+
+**Returned headers.** Every response the process forwards, of any status, also
+carries the route's `return_headers` that the provider sent. Agent tools read some
+of them back on their next request; for example the Codex CLI keeps
+`x-codex-turn-state` and sends it again, so later requests of a turn reach the same
+provider state. Each value must be 1 to 8 192 bytes of printable ASCII and must not
+contain a credential the scrubber knows; otherwise that header is dropped. The
+response to a request that waited and was resent after a 429 carries the headers of
+the final provider answer.
 
 Allowlisted headers on 429 and 503 are `retry-after`, `x-ratelimit-*`, and the
 family's documented rate-limit headers. Their values must be ASCII without control
@@ -515,6 +528,7 @@ Each mechanism this design adds, and the requirement it serves:
 | Shared admission | the account-wide slot limit and cooldown |
 | `max_queue_wait_seconds`, off by default | hosts that need a hard limit on waiting (decision 4) |
 | Resend after 429 | no 429 reaches the caller (decision 5) |
+| `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
 | Usage reader | usage receipts (#156 item 3) |
@@ -547,6 +561,10 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Lock:** import is refused while the process runs.
 - **Forwarding:** the provider fixture receives the caller body byte for byte, the
   injected headers, only `forward_headers`, and no caller `Authorization`.
+- **Returned headers:** a fixture 200 with `x-codex-turn-state: abc` and
+  `set-cookie: x` reaches the caller with `x-codex-turn-state: abc` only when it is in
+  `return_headers`, and never with `set-cookie`; a value containing a known token is
+  dropped.
 - **Routes:** an unknown path, a query string and a redirect answer are refused with
   no credential sent.
 - **429 is waited out:** a fixture answers 429 with `Retry-After: 30`, then 200. The
