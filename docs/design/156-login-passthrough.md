@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 156
 ---
 
@@ -13,9 +13,9 @@ This record designs two additions to the credential process for
 2. a **passthrough route**, which forwards an agent tool's own streaming HTTP request
    through the account's existing queue limits without decoding it.
 
-Nothing here is implemented. The operator approves this record before
-implementation starts. It changes a security boundary and the
-[boundary contract](../architecture/boundary.md), so delegated approval does not apply.
+Nothing here is implemented yet. The operator approved this record on 2026-10-25
+(§Operator decisions). It changes a security boundary and the
+[boundary contract](../architecture/boundary.md), so only the operator could approve it.
 
 ## Operator decisions
 
@@ -26,9 +26,11 @@ The operator decided on 2026-10-25:
   it over the passthrough socket (§Design).
 - **No signed admission on passthrough routes:** the socket's same-UID peer check is
   the caller check (§What passthrough does not reuse).
-
-Still open: whether a request waits for a slot and through a cooldown, or gets 429 at
-once (key decision 4). The record stays `draft` until that is decided.
+- **Foundation waits out a rate limit for its callers:** during an account cooldown
+  nothing goes out, and every caller waits in Foundation until the account-wide
+  deadline. A request that itself got 429 is held and resent after the deadline. No
+  429 reaches the caller. A maximum wait exists as a setting and is off by default.
+  Slot waits are unbounded while the caller stays connected (key decisions 4 and 5).
 
 ## Problem
 
@@ -96,17 +98,17 @@ account (two or three streams to start).
   connect to it directly.
 - **Account cooldown:** the existing durable "do not send before" time for an account
   queue, stored by `QueueBackend::note_cooldown` and read by `cooldown_until`.
-- **Cooldown wait bound:** `max_queue_wait_seconds`, the longest a passthrough
-  request may wait out an account cooldown before the credential process answers 429.
-  Waiting for a free slot has no such bound.
+- **Maximum cooldown wait:** `max_queue_wait_seconds`, an optional route setting, off
+  by default. When set, a request that has waited that long for cooldowns gets 429
+  with the remaining cooldown. Waiting for a free slot never counts against it.
 - **Stream dialect:** which provider event format a route streams, so the scrubber
   and usage reader know where text and usage are. Two exist: OpenAI Responses and
   OpenAI Chat Completions.
 
 ## Walkthrough
 
-One credential process serves login account `acct-1` with `max_in_flight: 2` and
-`max_queue_wait_seconds: 120`. Three agent tools (A, B and C) run under one host.
+One credential process serves login account `acct-1` with `max_in_flight: 2` and no
+maximum cooldown wait. Three agent tools (A, B and C) run under one host.
 
 **Procedure: three tools during a provider rate limit**
 
@@ -117,20 +119,18 @@ One credential process serves login account `acct-1` with `max_in_flight: 2` and
    the family's account header, and sends it to the route's fixed URL.
    - The provider answers HTTP 429 with `Retry-After: 30`.
    - The credential process records a cooldown until now + 30 s on `acct-1`.
-   - A receives 429, `Retry-After: 30`, the allowlisted rate-limit headers and a fixed body.
-3. **B arrives 5 s later:** the cooldown has 25 s left, within the 120 s bound.
-   - B's request waits; nothing is sent to the provider.
-   - At the end of the cooldown B takes a slot and is forwarded.
-   - B's tool sees one slow response, not a 429.
-4. **C arrives during a 583 s cooldown:** 583 s exceeds the 120 s bound.
-   - The credential process answers 429 with `Retry-After` equal to the remaining
-     cooldown, without contacting the provider.
-   - The host can reschedule C's job instead of holding it idle for ten minutes.
-5. **B's stream finishes:** the final `response.completed` event carries usage.
-   - The credential process records B's input, cached, output and reasoning tokens
-     in a settled spend receipt and releases the slot.
+   - A's request keeps its slot and waits; A's tool receives nothing yet.
+3. **B arrives 5 s later:** the cooldown has 25 s left.
+   - B's request takes the second slot and waits; nothing is sent to the provider.
+4. **C arrives 10 s later:** both slots are taken, so C waits for a slot.
+5. **The cooldown ends:** A's request is resent with the same body, then B's.
+   - A's and B's tools each see one slow response, not a 429.
+6. **A's stream finishes:** the final `response.completed` event carries usage.
+   - The credential process records A's input, cached, output and reasoning tokens
+     in a settled spend receipt and releases the slot. C takes it.
 
-The provider sees one request during the cooldown (A's), not three.
+The provider sees one request during the cooldown (A's first), not three, and no
+tool sees a 429.
 
 ## Design
 
@@ -289,8 +289,10 @@ pub struct PassthroughRoute {
     /// Existing account policy fields, shared with typed routes on the same account.
     pub max_in_flight: usize,
     pub requests_per_minute: Option<u32>,
-    /// Longest wait for an account cooldown before answering 429; slot waits are unbounded.
-    pub max_queue_wait_seconds: u64,
+    /// Optional maximum total cooldown wait before answering 429; off when absent.
+    /// Slot waits never count against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_wait_seconds: Option<u64>,
     /// Longest silence between two upstream bytes; there is no total deadline.
     pub idle_timeout_seconds: u64,
 }
@@ -326,21 +328,19 @@ typed routes.
 1. **Match the route:** method and path select one route; anything else gets 404.
 2. **Check the login:** a route in `login_required` answers 503 with code
    `credential_unavailable` and sends nothing.
-3. **Check the cooldown:** if `cooldown_until` is later than now + `max_queue_wait_seconds`,
-   answer 429 at once.
-   - `Retry-After` is the remaining whole seconds, rounded up.
-4. **Wait out the cooldown:** within `max_queue_wait_seconds` from arrival.
-   - A later 429 can push the cooldown past the bound; the request then gets 429
-     with the remaining cooldown.
-5. **Wait for a slot and pacing budget:** FIFO, as long as the caller stays connected.
-   - A slot wait is the normal state of a low in-flight limit, not a failure, so it
-     never turns into a 429.
+3. **Wait for a slot and pacing budget:** FIFO, as long as the caller stays connected.
+   - A slot wait is the normal state of a low in-flight limit, not a failure.
    - A caller that disconnects while waiting leaves the queue; nothing is sent.
-   - The cooldown is checked again after the slot is granted, because another
-     caller's 429 may have set one meanwhile.
+4. **Wait out the cooldown:** while `cooldown_until` is in the future, send nothing.
+   - The request keeps its slot; during a cooldown no slot could send anyway.
+   - With `max_queue_wait_seconds` set, a request whose cooldown waits reach it gets
+     429 with the remaining cooldown and the allowlisted headers.
+5. **Keep the caller waiting:** see §Long waits.
 6. **Renew if needed:** take a renewal when the access token expires within 300 s.
 7. **Reserve and send:** reserve one request in the spend ledger, inject the
    credential headers, and send the caller's body bytes unchanged.
+8. **On a 429 before any response byte:** set the cooldown, record a `rate_limited`
+   receipt, and go back to step 4 with the same body.
 
 The slot is held until the response stream ends, fails or the caller disconnects.
 A caller disconnect cancels the upstream request.
@@ -354,14 +354,23 @@ A caller disconnect cancels the upstream request.
   route reads it as `text/event-stream`.
 - **401:** the process renews once and resends once, before any byte reaches the
   caller. A second 401 marks the login `renewal_failed` and returns 401.
-- **429:** sets the account cooldown, then answers 429 with a fixed body and only the
-  allowlisted headers below. The process never resends a 429 itself.
+- **429:** sets the account cooldown, and the request waits and is resent (step 8).
+  The caller receives 429 only when its `max_queue_wait_seconds` is reached; then it
+  has a fixed body and only the allowlisted headers below.
 - **Other non-2xx:** the status is forwarded with a fixed body and no upstream
   header. The upstream body is discarded because it can echo tokens.
 
 Allowlisted headers on 429 and 503 are `retry-after`, `x-ratelimit-*`, and the
 family's documented rate-limit headers. Their values must be ASCII without control
 characters and at most 256 bytes each, or they are dropped.
+
+**Long waits.** A request can wait minutes for a slot or a cooldown before its first
+response byte. The credential process sends the caller nothing during the wait by
+default. A host whose tool gives up on a silent request before its first byte measures
+that limit (see §Open questions). If a tool has such a limit, the process sends a
+keep-alive that does not change the final response. The first candidate is an HTTP/1.1
+interim `102 Processing` response every 30 s, which HTTP clients skip before the final
+status. This is chosen only after a measurement shows the tool needs it and skips it.
 
 **Cooldown value.** A `Retry-After` header in seconds or as an HTTP date sets the
 cooldown, parsed by the shared retry module from
@@ -416,10 +425,12 @@ The process therefore does not apply these typed-route mechanisms to them:
 - signed attempts, permits and grant revisions;
 - answer recovery and same-attempt status;
 - the request failure budget and the unresolved-request block. An `Unknown`
-  passthrough receipt does not block the next passthrough request, because the agent
-  tool, not Foundation, decides whether to resend;
+  passthrough receipt does not block the next passthrough request;
 - the response cache and request deduplication;
-- automatic retry, except the single resend after a 401 described above.
+- the known-zero rule for automatic retry. A passthrough request is resent after a
+  429 (step 8) and once after a 401. A provider that answers 429 before any response
+  byte has refused the request, and `Retry-After` is its instruction to send it again
+  later; the receipt of the refused attempt still stays `Unknown`.
 
 This extends the boundary contract: passthrough routes serve trusted same-UID hosts
 outside Memory's data authorization. Approval of this record includes adding that
@@ -443,6 +454,9 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
   start empty. The tool's own stream retry resends that step.
 - **Restart during a renewal:** the fence stays set and the account is
   `login_required` until a fresh import.
+- **Long cooldown:** callers wait without a deadline of their own. A host's job
+  deadline, which disconnects the caller, bounds the wait; a host that needs a shorter
+  bound sets `max_queue_wait_seconds`.
 - **Upstream silence:** a gap longer than `idle_timeout_seconds` ends the stream with
   an error and an `Unknown` receipt.
 
@@ -464,20 +478,22 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
    scheduler, as [AI runtime facade decision 1](8-ai-runtime.md#decisions) requires.
    - *Rejected:* a new passthrough queue. Typed and passthrough calls on one account
      would not share a cooldown.
-4. **A request waits out a cooldown up to `max_queue_wait_seconds`, then gets 429
-   with the remaining cooldown. It waits for a slot as long as its caller stays
-   connected.**
-   - *Rejected:* answering 429 at once during every cooldown. An agent tool configured without HTTP-level
+4. **Every caller waits out a cooldown in Foundation; no 429 reaches it by default.**
+   During a cooldown nothing is allowed to go out, even when a slot frees, so waiting
+   is the only useful action. A maximum wait is an optional setting, off by default.
+   Slot waits last while the caller stays connected.
+   - *Rejected:* answering 429 at once. An agent tool configured without HTTP-level
      retries can treat a 429 like a dropped stream and retry with its own short
      backoff, so even a short cooldown would use up its retries.
-   - *Rejected:* waiting out any cooldown without a bound. A ten-minute cooldown would
-     hold every waiting connection, and its host's job, idle for ten minutes.
-   - *Rejected:* bounding slot waits too. With the two or three streams a login allows,
-     waiting for a slot is routine; a bound would turn ordinary queueing into 429s and
-     spend the tool's retries.
-5. **Foundation never resends a 429.** The spend contract treats a 429 as unknown
-   charge and allows automatic retry only with known-zero evidence. The tool owns its
-   request.
+   - *Rejected:* a default wait bound of 120 s (the earlier draft). Each longer
+     cooldown would still end the tool's run and make the host reschedule it.
+   - *Rejected:* bounding slot waits. With the two or three streams a login allows,
+     waiting for a slot is routine.
+5. **Foundation resends a request that got 429, after the cooldown.** The request has
+   not reached the caller yet, its body is buffered within `max_request_bytes`, and the
+   provider's `Retry-After` asks for exactly that.
+   - *Rejected:* returning the first 429 and holding only later callers. That tool
+     would still see a 429 and fail as above.
 6. **Redaction on streams, with the credential boundary's encoding set.** See
    §Scrubbing for why refusal does not fit a stream.
 7. **Login families are a closed list in code.** The injected headers decide where a
@@ -497,7 +513,8 @@ Each mechanism this design adds, and the requirement it serves:
 | `GET /health` | hosts must not start work on a dead login or a stopped process |
 | Passthrough socket and parser | undecoded forwarding (#156 item 2) |
 | Shared admission | the account-wide slot limit and cooldown |
-| `max_queue_wait_seconds` | decision 4 |
+| `max_queue_wait_seconds`, off by default | hosts that need a hard limit on waiting (decision 4) |
+| Resend after 429 | no 429 reaches the caller (decision 5) |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
 | Usage reader | usage receipts (#156 item 3) |
@@ -512,7 +529,9 @@ Removed while designing:
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
 - a total request deadline; the idle timeout fails on lack of progress instead.
-- a bound on slot waits, and the invented `Retry-After: 1` it would have needed.
+- a bound on slot waits, and the invented `Retry-After: 1` it would have needed;
+- a default cooldown bound; the setting stays, off by default;
+- a keep-alive by default; it is added only for a tool measured to need it.
 
 ## Acceptance tests
 
@@ -530,17 +549,22 @@ All use loopback provider fixtures with synthetic tokens, in
   injected headers, only `forward_headers`, and no caller `Authorization`.
 - **Routes:** an unknown path, a query string and a redirect answer are refused with
   no credential sent.
-- **429:** a fixture 429 with `Retry-After: 30` reaches the caller as 429 with
-  `retry-after: 30`, allowlisted rate-limit headers only, and a fixed body.
-- **Shared cooldown:** after that 429, a second caller with a 120 s bound waits and
-  is sent after the cooldown; the fixture sees no request during the cooldown. With
-  `Retry-After: 600`, a second caller gets 429 with about 600 s at once.
+- **429 is waited out:** a fixture answers 429 with `Retry-After: 30`, then 200. The
+  caller receives one 200 stream about 30 s later and no 429; the fixture sees the
+  same body twice.
+- **Shared cooldown:** a second caller arriving during that cooldown is sent only
+  after it ends; the fixture sees no request during the cooldown.
+- **Maximum wait:** with `max_queue_wait_seconds: 10` and `Retry-After: 600`, the
+  caller gets 429 after about 10 s with `retry-after` about 590, allowlisted headers
+  only and a fixed body.
 - **Typed and passthrough share:** a typed chat call on the same account waits out a
   cooldown set by a passthrough 429.
 - **In-flight limit:** with `max_in_flight: 2`, five callers never have more than
   two concurrent requests at the fixture.
 - **Slot wait is not a 429:** with `max_in_flight: 1`, `max_queue_wait_seconds: 5` and
   a fixture stream lasting 20 s, a second caller waits about 20 s and is forwarded.
+- **Disconnect while waiting:** a caller that disconnects during a cooldown is never
+  sent.
 - **Cooldown set during a slot wait:** a caller waiting for a slot when another
   caller's request gets 429 with `Retry-After: 30` is sent only after that cooldown.
 - **Scrubbing:** Synthetic tokens split across every chunk boundary and across
@@ -564,9 +588,8 @@ sentence in `boundary.md` and a new architecture section at closeout.
 
 ## Open questions
 
-- How long each agent tool holds an unanswered request without its own response
-  timeout, during a cooldown or a slot wait. The acceptance run of each host measures
-  it for its pinned tool version; the host sets its bound, and its job timeouts, from
-  what it measures.
+- How long each agent tool holds an unanswered request before its first byte. Each
+  host measures it for its pinned tool version. If the tool gives up, the keep-alive in
+  §Long waits is designed and measured against that tool.
 - The right `max_in_flight` for a login. The public reports suggest two or three; a
   host raises it only on measured results.
