@@ -252,6 +252,8 @@ in Unix seconds:
 
 `login` is `ok`, `expiring` (expires within two days), `renewal_failed` or
 `login_required`; static-key routes report `static` with `expires_at: null`.
+On a clean stop (SIGTERM or SIGINT), every route reports `stopping` before the
+process closes its socket.
 The file contains only route names, these fixed login states, expiry and cooldown
 times, and `updated_at`. It contains no credential, path or provider text.
 
@@ -262,9 +264,12 @@ setgid bit, so the deployment chooses who can read it. The deployment provisions
 that directory separately from the owner-only socket directory. The socket's
 permissions and same-UID peer check stay unchanged. The socket has no health route.
 
-Hosts read the file before starting work. A missing file or `updated_at` older than
-30 s means service unavailable. A publication failure is reported with a sanitized
-diagnostic; readers reject the previous file once it becomes stale.
+Hosts read the file before starting work. A missing file, `updated_at` older than
+30 s, or `stopping` means service unavailable. After a crash, the last healthy file
+can stay fresh for up to 30 s. Work admitted in that window encounters the same
+connection failure as work whose service fails mid-run.
+A publication failure is reported with a sanitized diagnostic; readers reject the
+previous file once it becomes stale.
 
 ### Passthrough route
 
@@ -499,7 +504,11 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
 
 - **Credential process not running:** the socket connect fails. The host treats
   this as "service unavailable". A host using the health file also starts no new
-  work when the file is missing or its `updated_at` is older than 30 s.
+  work when the file is missing, its `updated_at` is older than 30 s, or it reports
+  `stopping`. On SIGTERM or SIGINT, the process publishes `stopping` before closing
+  its socket. After a crash, the last healthy file can stay fresh for up to 30 s.
+  Work admitted in that window encounters the same connection failure as work
+  whose service fails mid-run.
 - **Renewal failed:** the route reports `renewal_failed` or `login_required` and
   answers 503 `credential_unavailable`. An operator signs in again and imports.
 - **Restart during a stream:** the caller's stream ends without its final chunk. The
@@ -603,7 +612,11 @@ All use loopback provider fixtures with synthetic tokens, in
   every state change updates it. Without state changes, publication intervals are
   at most 10 s and `updated_at` advances in Unix seconds.
 - **Health staleness:** host admission reports service unavailable for a missing
-  file or an `updated_at` older than 30 s; a fresh usable entry permits work.
+  file, an `updated_at` older than 30 s, or `stopping`; a fresh usable entry permits
+  work.
+- **Health on clean shutdown:** SIGTERM makes the file show `stopping` for every
+  route before the socket refuses connections. Host admission reports service
+  unavailable even while that file is fresh.
 - **Health replacement:** readers concurrent with publication see complete old or
   new JSON, never a partial file. Each replacement has mode 0640 and inherits the
   configured directory's group. Synthetic credentials, paths and provider text
