@@ -39,6 +39,30 @@ Two parts are missing:
 Without both, ten tools on one account that start a burst each receive their own
 HTTP 429. Each tool backs off alone, and the next burst repeats it.
 
+### The limit is on concurrent streams
+
+Public reports indicate that subscription logins are limited by the number of
+simultaneous streams, not only by usage:
+
+- [openai/codex#41702](https://github.com/openai/codex/issues/41702) (open): repeated
+  429s on one Pro login with four or five agents running across sessions.
+  [#42685](https://github.com/openai/codex/issues/42685) (closed as its duplicate)
+  reports failures beyond about two or three simultaneous streams.
+- [#53978](https://github.com/openai/codex/issues/53978),
+  [#54010](https://github.com/openai/codex/issues/54010) and
+  [#55805](https://github.com/openai/codex/issues/55805) (open) report 429s with
+  70–90% of the weekly allowance left. #55805 reports 155–288 s retry waits.
+
+`ASSUMPTION` (reported by these issues and by an operator's own login, not a
+provider specification): the same login answers single requests normally while
+parallel requests get 429, and the `Retry-After` values of concurrent requests count
+down to one shared deadline.
+
+So the per-account in-flight limit is the main control, and `Retry-After` is an
+account-wide deadline that every queued caller must respect. The design keeps
+`max_in_flight` required, with no default, and the operator sets it low for a login
+account (two or three streams to start).
+
 ## Terms
 
 - **Login account:** a provider account reached through a subscription login, not
@@ -59,22 +83,23 @@ HTTP 429. Each tool backs off alone, and the next burst repeats it.
   connect to it directly.
 - **Account cooldown:** the existing durable "do not send before" time for an account
   queue, stored by `QueueBackend::note_cooldown` and read by `cooldown_until`.
-- **Queue wait bound:** `max_queue_wait_seconds`, the longest a passthrough request
-  may wait for a slot or a cooldown before the credential process answers 429.
+- **Cooldown wait bound:** `max_queue_wait_seconds`, the longest a passthrough
+  request may wait out an account cooldown before the credential process answers 429.
+  Waiting for a free slot has no such bound.
 - **Stream dialect:** which provider event format a route streams, so the scrubber
   and usage reader know where text and usage are. Two exist: OpenAI Responses and
   OpenAI Chat Completions.
 
 ## Walkthrough
 
-One credential process serves login account `acct-1` with `max_in_flight: 4` and
+One credential process serves login account `acct-1` with `max_in_flight: 2` and
 `max_queue_wait_seconds: 120`. Three agent tools (A, B and C) run under one host.
 
 **Procedure: three tools during a provider rate limit**
 
 1. **A sends a turn:** `POST /v1/responses` with a placeholder token, to the host.
    - The host checks its own sandbox rules and forwards it over the passthrough socket.
-   - The credential process takes one of the four slots and sees no cooldown.
+   - The credential process takes one of the two slots and sees no cooldown.
 2. **The credential process forwards A's request:** injects the access token and
    the family's account header, and sends it to the route's fixed URL.
    - The provider answers HTTP 429 with `Retry-After: 30`.
@@ -251,7 +276,7 @@ pub struct PassthroughRoute {
     /// Existing account policy fields, shared with typed routes on the same account.
     pub max_in_flight: usize,
     pub requests_per_minute: Option<u32>,
-    /// Longest wait for a slot or a cooldown before answering 429.
+    /// Longest wait for an account cooldown before answering 429; slot waits are unbounded.
     pub max_queue_wait_seconds: u64,
     /// Longest silence between two upstream bytes; there is no total deadline.
     pub idle_timeout_seconds: u64,
@@ -291,13 +316,17 @@ typed routes.
 3. **Check the cooldown:** if `cooldown_until` is later than now + `max_queue_wait_seconds`,
    answer 429 at once.
    - `Retry-After` is the remaining whole seconds, rounded up.
-4. **Wait:** wait for the cooldown to end, then for a slot (FIFO), then for pacing
-   budget, all within `max_queue_wait_seconds` from arrival.
-   - A wait that reaches the bound answers 429 with the remaining cooldown, or
-     `Retry-After: 1` when only slots were busy.
+4. **Wait out the cooldown:** within `max_queue_wait_seconds` from arrival.
+   - A later 429 can push the cooldown past the bound; the request then gets 429
+     with the remaining cooldown.
+5. **Wait for a slot and pacing budget:** FIFO, as long as the caller stays connected.
+   - A slot wait is the normal state of a low in-flight limit, not a failure, so it
+     never turns into a 429.
    - A caller that disconnects while waiting leaves the queue; nothing is sent.
-5. **Renew if needed:** take a renewal when the access token expires within 300 s.
-6. **Reserve and send:** reserve one request in the spend ledger, inject the
+   - The cooldown is checked again after the slot is granted, because another
+     caller's 429 may have set one meanwhile.
+6. **Renew if needed:** take a renewal when the access token expires within 300 s.
+7. **Reserve and send:** reserve one request in the spend ledger, inject the
    credential headers, and send the caller's body bytes unchanged.
 
 The slot is held until the response stream ends, fails or the caller disconnects.
@@ -422,13 +451,17 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
    scheduler, as [AI runtime facade decision 1](8-ai-runtime.md#decisions) requires.
    - *Rejected:* a new passthrough queue. Typed and passthrough calls on one account
      would not share a cooldown.
-4. **A request waits up to `max_queue_wait_seconds`, then gets 429 with the remaining
-   cooldown.**
+4. **A request waits out a cooldown up to `max_queue_wait_seconds`, then gets 429
+   with the remaining cooldown. It waits for a slot as long as its caller stays
+   connected.**
    - *Rejected:* answering 429 at once during every cooldown. An agent tool configured without HTTP-level
      retries can treat a 429 like a dropped stream and retry with its own short
      backoff, so even a short cooldown would use up its retries.
-   - *Rejected:* waiting without a bound. A ten-minute cooldown would hold every
-     waiting connection, and its host's job, idle for ten minutes.
+   - *Rejected:* waiting out any cooldown without a bound. A ten-minute cooldown would
+     hold every waiting connection, and its host's job, idle for ten minutes.
+   - *Rejected:* bounding slot waits too. With the two or three streams a login allows,
+     waiting for a slot is routine; a bound would turn ordinary queueing into 429s and
+     spend the tool's retries.
 5. **Foundation never resends a 429.** The spend contract treats a 429 as unknown
    charge and allows automatic retry only with known-zero evidence. The tool owns its
    request.
@@ -466,6 +499,7 @@ Removed while designing:
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
 - a total request deadline; the idle timeout fails on lack of progress instead.
+- a bound on slot waits, and the invented `Retry-After: 1` it would have needed.
 
 ## Acceptance tests
 
@@ -492,6 +526,10 @@ All use loopback provider fixtures with synthetic tokens, in
   cooldown set by a passthrough 429.
 - **In-flight limit:** with `max_in_flight: 2`, five callers never have more than
   two concurrent requests at the fixture.
+- **Slot wait is not a 429:** with `max_in_flight: 1`, `max_queue_wait_seconds: 5` and
+  a fixture stream lasting 20 s, a second caller waits about 20 s and is forwarded.
+- **Cooldown set during a slot wait:** a caller waiting for a slot when another
+  caller's request gets 429 with `Retry-After: 30` is sent only after that cooldown.
 - **Scrubbing:** Synthetic tokens split across every chunk boundary and across
   Responses and Chat Completions deltas are redacted in all listed encodings.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
@@ -513,6 +551,9 @@ sentence in `boundary.md` and a new architecture section at closeout.
 
 ## Open questions
 
-- Whether each agent tool holds an unanswered request for `max_queue_wait_seconds`
-  without its own response timeout. The acceptance run of each host measures it for
-  its pinned tool version; the host sets the bound below what it measures.
+- How long each agent tool holds an unanswered request without its own response
+  timeout, during a cooldown or a slot wait. The acceptance run of each host measures
+  it for its pinned tool version; the host sets its bound, and its job timeouts, from
+  what it measures.
+- The right `max_in_flight` for a login. The public reports suggest two or three; a
+  host raises it only on measured results.
