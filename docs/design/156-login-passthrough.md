@@ -364,6 +364,17 @@ A caller disconnect cancels the upstream request.
 - **Other non-2xx:** the status is forwarded with a fixed body and no upstream
   header. The upstream body is discarded because it can echo tokens.
 
+**Forwarded request headers.** The route copies the caller headers named in
+`forward_headers`, with their values unchanged, and drops all others. Agent tools put
+their session and routing identity in request headers, and the provider uses it to
+send the requests of one conversation to the same prompt cache. The Codex CLI, for
+example, sends `session-id`, `thread-id`, `x-client-request-id`, `x-codex-turn-state`,
+`x-codex-turn-metadata`, `x-codex-window-id` and `x-codex-parent-thread-id`. A route
+that drops them still works, but each request lands on a cold cache, which costs more
+input tokens and time. The host's route configuration must list every such header its
+tool sends. Each value must be 1 to 8 192 bytes of printable ASCII, or the header is
+dropped.
+
 **Returned headers.** Every response the process forwards, of any status, also
 carries the route's `return_headers` that the provider sent. Agent tools read some
 of them back on their next request; for example the Codex CLI keeps
@@ -561,6 +572,9 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Lock:** import is refused while the process runs.
 - **Forwarding:** the provider fixture receives the caller body byte for byte, the
   injected headers, only `forward_headers`, and no caller `Authorization`.
+- **Forwarded headers:** a caller request with `session-id`, `x-codex-turn-state`,
+  `x-codex-window-id`, `authorization` and `cookie` reaches the fixture with the first
+  three unchanged, when they are in `forward_headers`, and without the last two.
 - **Returned headers:** a fixture 200 with `x-codex-turn-state: abc` and
   `set-cookie: x` reaches the caller with `x-codex-turn-state: abc` only when it is in
   `return_headers`, and never with `set-cookie`; a value containing a known token is
