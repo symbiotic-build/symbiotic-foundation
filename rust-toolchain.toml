@@ -1,6 +1,6 @@
 # One dated toolchain for local builds and CI (operator 2026-10-05): nightly 1.101.
 # Bump it together with the code it needs; never follow a moving "nightly".
 [toolchain]
-channel = "nightly-2026-10-03"
+channel = "nightly-2026-10-25"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

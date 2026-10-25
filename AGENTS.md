@@ -13,7 +13,7 @@ Reviews: Warden, our review service, reviews pull requests on request: comment `
 
 ## Build and verification
 
-[CI](.github/workflows/ci.yml) uses Rust 1.93.0 and the **debug** profile on
+[CI](.github/workflows/ci.yml) uses the pinned nightly-2026-10-25 toolchain and the **debug** profile on
 pull requests and pushes to `master`. Its full test matrix covers workspace
 default features, `symbiotic-model` without default features, and
 `symbiotic-queue` with `conformance` enabled.
