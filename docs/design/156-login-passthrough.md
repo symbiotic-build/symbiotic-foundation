@@ -17,6 +17,19 @@ Nothing here is implemented. The operator approves this record before
 implementation starts. It changes a security boundary and the
 [boundary contract](../architecture/boundary.md), so delegated approval does not apply.
 
+## Operator decisions
+
+The operator decided on 2026-10-25:
+
+- **Login and passthrough in the credential process:** one credential process per
+  account owns the login and forwards the account's agent traffic; the host relays to
+  it over the passthrough socket (§Design).
+- **No signed admission on passthrough routes:** the socket's same-UID peer check is
+  the caller check (§What passthrough does not reuse).
+
+Still open: whether a request waits for a slot and through a cooldown, or gets 429 at
+once (key decision 4). The record stays `draft` until that is decided.
+
 ## Problem
 
 Agent command-line tools such as the Codex CLI speak their provider's streaming
