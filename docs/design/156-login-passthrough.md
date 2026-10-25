@@ -108,12 +108,15 @@ account (two or three streams to start).
 ## Walkthrough
 
 One credential process serves login account `acct-1` with `max_in_flight: 2` and no
-maximum cooldown wait. Three agent tools (A, B and C) run under one host.
+maximum cooldown wait. It publishes health through `health_path`. Three agent
+tools (A, B and C) run under one host.
 
 **Procedure: three tools during a provider rate limit**
 
 1. **A sends a turn:** `POST /v1/responses` with a placeholder token, to the host.
-   - The host checks its own sandbox rules and forwards it over the passthrough socket.
+   - Before starting the tools, the host reads the published health file and checks
+     its `updated_at` is no older than 30 s and the route's login is usable.
+   - The host checks its own sandbox rules and forwards the turn over the passthrough socket.
    - The credential process takes one of the two slots and sees no cooldown.
 2. **The credential process forwards A's request:** injects the access token and
    the family's account header, and sends it to the route's fixed URL.
@@ -129,8 +132,9 @@ maximum cooldown wait. Three agent tools (A, B and C) run under one host.
    - The credential process records A's input, cached, output and reasoning tokens
      in a settled spend receipt and releases the slot. C takes it.
 
-The provider sees one request during the cooldown (A's first), not three, and no
-tool sees a 429.
+The provider receives no request between the first 429 and the cooldown's end.
+No tool sees a 429. If B had already been sent when A's 429 arrived, B could also
+receive 429. Its request would also wait out the shared cooldown and be resent.
 
 ## Design
 
@@ -237,16 +241,30 @@ It prints no token. It runs no provider tool and sends no request: the operator 
 in with the provider's own tool first. After import, only the credential process may
 renew the login; the native file becomes stale at the first rotation.
 
-**Health.** The passthrough socket answers `GET /health` locally with one entry per
-route, and no credential value:
+**Health.** `PassthroughConfig.health_path` optionally names a sanitized JSON file
+for hosts that must read health without access to the passthrough socket. When
+configured, the process publishes one entry per route and a top-level `updated_at`
+in Unix seconds:
 
 ```json
-{"routes":[{"name":"codex_responses","login":"ok","expires_at":1793000000,"cooldown_until":null}]}
+{"updated_at":1792000000,"routes":[{"name":"codex_responses","login":"ok","expires_at":1793000000,"cooldown_until":null}]}
 ```
 
 `login` is `ok`, `expiring` (expires within two days), `renewal_failed` or
-`login_required`; static-key routes report `static`. Hosts read it before starting
-work.
+`login_required`; static-key routes report `static` with `expires_at: null`.
+The file contains only route names, these fixed login states, expiry and cooldown
+times, and `updated_at`. It contains no credential, path or provider text.
+
+The process writes at startup, on every state change, and at least every 10 s.
+Each publication uses a temporary file in the destination directory, sync, rename,
+and directory sync. The file has mode 0640. Its group comes from the directory's
+setgid bit, so the deployment chooses who can read it. The deployment provisions
+that directory separately from the owner-only socket directory. The socket's
+permissions and same-UID peer check stay unchanged. The socket has no health route.
+
+Hosts read the file before starting work. A missing file or `updated_at` older than
+30 s means service unavailable. A publication failure is reported with a sanitized
+diagnostic; readers reject the previous file once it becomes stale.
 
 ### Passthrough route
 
@@ -263,6 +281,9 @@ pub struct ProcessConfig {
 pub struct PassthroughConfig {
     /// Socket inside an existing owner-only directory; distinct from `socket_path`.
     pub socket_path: PathBuf,
+    /// Optional sanitized health file in a deployment-provisioned setgid directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_path: Option<PathBuf>,
     /// Maximum concurrent passthrough connections, including waiting ones.
     pub max_connections: usize,
     pub routes: Vec<PassthroughRoute>,
@@ -310,7 +331,7 @@ pub enum StreamDialect { OpenaiResponses, OpenaiChatCompletions }
 
 New public names follow the existing configuration conventions: lower snake case
 fields, snake case enum tags, subject first (`max_queue_wait_seconds`, not
-`queue_wait_max_seconds`).
+`queue_wait_max_seconds`). `health_path` follows the same field convention.
 
 **Transport.** The passthrough socket speaks HTTP/1.1, one request per connection,
 and answers with `Connection: close` and a chunked body. It uses the existing socket
@@ -331,7 +352,8 @@ typed routes.
 
 1. **Match the route:** method and path select one route; anything else gets 404.
 2. **Check the login:** a route in `login_required` answers 503 with code
-   `credential_unavailable` and sends nothing.
+   `credential_unavailable` and sends nothing. This uses the process's current
+   state; a host's earlier health-file check does not replace it.
 3. **Wait for a slot and pacing budget:** FIFO, as long as the caller stays connected.
    - A slot wait is the normal state of a low in-flight limit, not a failure.
    - A caller that disconnects while waiting leaves the queue; nothing is sent.
@@ -343,11 +365,16 @@ typed routes.
 6. **Renew if needed:** take a renewal when the access token expires within 300 s.
 7. **Reserve and send:** reserve one request in the spend ledger, inject the
    credential headers, and send the caller's body bytes unchanged.
+   - Check the shared cooldown again at dispatch. Once a cooldown is recorded, no
+     request leaves for the provider until it ends; return to step 4 instead.
 8. **On a 429 before any response byte:** set the cooldown, record a `rate_limited`
    receipt, and go back to step 4 with the same body.
 
 The slot is held until the response stream ends, fails or the caller disconnects.
-A caller disconnect cancels the upstream request.
+A caller disconnect cancels the upstream request. Requests remain concurrent up to
+`max_in_flight`; a limit of two permits two streams, without serialization.
+Requests already sent when the first 429 arrives may also receive 429. Each such
+request follows step 8 and waits out the shared cooldown before being resent.
 
 **Responses.**
 
@@ -359,6 +386,8 @@ A caller disconnect cancels the upstream request.
 - **401:** the process renews once and resends once, before any byte reaches the
   caller. A second 401 marks the login `renewal_failed` and returns 401.
 - **429:** sets the account cooldown, and the request waits and is resent (step 8).
+  This also applies to every request already in flight when the first 429 arrives.
+  After the cooldown is recorded, no new request is sent until it ends.
   The caller receives 429 only when its `max_queue_wait_seconds` is reached; then it
   has a fixed body and only the allowlisted headers below.
 - **Other non-2xx:** the status is forwarded with a fixed body and no upstream
@@ -468,9 +497,9 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
 
 ## Failure modes
 
-- **Credential process not running:** the socket connect fails. The host must treat
-  this as "service unavailable" and not start new work; `GET /health` failing is the
-  check.
+- **Credential process not running:** the socket connect fails. The host treats
+  this as "service unavailable". A host using the health file also starts no new
+  work when the file is missing or its `updated_at` is older than 30 s.
 - **Renewal failed:** the route reports `renewal_failed` or `login_required` and
   answers 503 `credential_unavailable`. An operator signs in again and imports.
 - **Restart during a stream:** the caller's stream ends without its final chunk. The
@@ -534,7 +563,7 @@ Each mechanism this design adds, and the requirement it serves:
 | Renewal fence | prevents reuse of a possibly rotated refresh token, which the provider can punish by revoking the login; no existing check covers a crash between exchange and install |
 | Store lifetime lock | stops import from replacing a store the process is renewing |
 | `login import` | the only way to create a store without copying tokens by hand |
-| `GET /health` | hosts must not start work on a dead login or a stopped process |
+| Health file | a host whose poller runs as another user must read health without reaching the passthrough socket |
 | Passthrough socket and parser | undecoded forwarding (#156 item 2) |
 | Shared admission | the account-wide slot limit and cooldown |
 | `max_queue_wait_seconds`, off by default | hosts that need a hard limit on waiting (decision 4) |
@@ -549,7 +578,7 @@ Each mechanism this design adds, and the requirement it serves:
 Removed while designing:
 
 - cross-process shared and renewal locks, and renewal adoption (decision 1);
-- a separate health snapshot file; `GET /health` replaces it;
+- a socket health route; the health file is the only health publication;
 - parsing response bodies for reset hints; headers only;
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
@@ -570,6 +599,15 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Store checks:** group-readable, symlinked, wrong-owner, wrong-issuer and
   unknown-field stores are refused at startup.
 - **Lock:** import is refused while the process runs.
+- **Health heartbeat:** with `health_path` configured, startup publishes health and
+  every state change updates it. Without state changes, publication intervals are
+  at most 10 s and `updated_at` advances in Unix seconds.
+- **Health staleness:** host admission reports service unavailable for a missing
+  file or an `updated_at` older than 30 s; a fresh usable entry permits work.
+- **Health replacement:** readers concurrent with publication see complete old or
+  new JSON, never a partial file. Each replacement has mode 0640 and inherits the
+  configured directory's group. Synthetic credentials, paths and provider text
+  never appear in the file; only the declared fields do.
 - **Forwarding:** the provider fixture receives the caller body byte for byte, the
   injected headers, only `forward_headers`, and no caller `Authorization`.
 - **Forwarded headers:** a caller request with `session-id`, `x-codex-turn-state`,
@@ -586,6 +624,10 @@ All use loopback provider fixtures with synthetic tokens, in
   same body twice.
 - **Shared cooldown:** a second caller arriving during that cooldown is sent only
   after it ends; the fixture sees no request during the cooldown.
+- **Concurrent 429s:** with `max_in_flight: 2`, two requests are in flight before
+  the first 429 arrives. Both receive 429 and are resent after the shared cooldown.
+  The fixture receives no request during the cooldown, and both callers receive
+  complete 200 streams without a 429.
 - **Maximum wait:** with `max_queue_wait_seconds: 10` and `Retry-After: 600`, the
   caller gets 429 after about 10 s with `retry-after` about 590, allowlisted headers
   only and a fixed body.
