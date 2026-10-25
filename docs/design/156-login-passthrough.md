@@ -355,6 +355,17 @@ that ends without a usage event, fails, or is cut by a disconnect or restart kee
 the receipt `Unknown`. A login account has no per-request price, so measured receipts
 carry token counts and no `cost_micro_usd`.
 
+The process also returns the measured usage to the host as an HTTP trailer on the
+chunked response, when the host's request carried `TE: trailers`:
+
+```text
+symbiotic-usage: input_tokens=1200, cached_input_tokens=800, output_tokens=310, reasoning_tokens=96
+```
+
+A host can then count usage per job, or per anything it knows and Foundation does not,
+without parsing the stream. A stream without a usage event gets no trailer. The
+process keeps no per-caller totals and enforces no per-caller ceiling.
+
 ### What passthrough does not reuse
 
 Passthrough requests have no invocation identity and no Memory data authorization.
@@ -444,6 +455,7 @@ Each mechanism this design adds, and the requirement it serves:
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
 | Usage reader | usage receipts (#156 item 3) |
+| `symbiotic-usage` trailer | hosts that enforce their own per-job token ceilings need each response's usage; without it they would parse the stream a second time |
 | 401 renewal and one resend | a token revoked before its expiry would otherwise fail every request until restart |
 
 Removed while designing:
@@ -484,6 +496,9 @@ All use loopback provider fixtures with synthetic tokens, in
   Responses and Chat Completions deltas are redacted in all listed encodings.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
   counts; a cut stream produces an `Unknown` receipt.
+- **Usage trailer:** with `TE: trailers`, the same stream ends with a
+  `symbiotic-usage` trailer carrying those counts; without a usage event, or without
+  `TE: trailers`, no trailer is sent.
 - **Restart:** a cooldown set before a restart still delays the first request after it.
 - **401:** one 401 causes one renewal and one resend; two 401s mark `renewal_failed`.
 - **Peer UID:** a connection from another UID is refused before parsing.
