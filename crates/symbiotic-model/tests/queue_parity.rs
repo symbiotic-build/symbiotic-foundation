@@ -3573,7 +3573,13 @@ impl QueueBackend for ReferenceIds {
     }
 
     async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
-        self.inner.get_item(&self.stored_id(item_id)).await
+        let mut item = self.inner.get_item(&self.stored_id(item_id)).await?;
+        if self.advertise_at_enqueue
+            && let Some(item) = &mut item
+        {
+            item.item_id = self.reference_id.clone();
+        }
+        Ok(item)
     }
     async fn heartbeat(
         &self,
@@ -3624,6 +3630,89 @@ impl QueueBackend for ReferenceIds {
     }
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
         self.inner.reclaim_expired_leases(queue_id).await
+    }
+}
+
+#[tokio::test]
+async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
+    use symbiotic_core::DiagnosticCode;
+
+    // Original policy vectors for item-a, request("retry compatibility"),
+    // attempt one, a 1 000 ms base, and 0..=20 seconds of jitter.
+    for (error, expected_ms) in [
+        (
+            ModelError::RateLimited(DiagnosticCode::HttpRateLimited),
+            6_000,
+        ),
+        (
+            ModelError::Unavailable(DiagnosticCode::HttpUnavailable),
+            16_000,
+        ),
+        (
+            ModelError::Provider(DiagnosticCode::ProviderFailure),
+            17_000,
+        ),
+        (
+            // Bare timeouts have uncertain spend and do not retry. This
+            // synthetic HTTP failure carries the fixture's known-zero charge.
+            ModelError::Http {
+                primary: Box::new(ModelError::Timeout(DiagnosticCode::HttpTimeout)),
+                status: 408,
+                retry_after_seconds: None,
+            },
+            14_000,
+        ),
+    ] {
+        for wrapped in [false, true] {
+            let error = if wrapped {
+                ModelError::Diagnostics {
+                    primary: Box::new(ModelError::Http {
+                        primary: Box::new(error.clone()),
+                        status: 503,
+                        retry_after_seconds: None,
+                    }),
+                    secondary: vec![DiagnosticCode::StorageFailure],
+                }
+            } else {
+                error.clone()
+            };
+            let backend = Arc::new(ReferenceIds::new("item-a".into(), true, false));
+            let raw = Loopback::new(unique_identity()).failing_first(vec![error]);
+            let provider = queued(
+                raw,
+                backend.clone(),
+                ModelQueueConfig {
+                    logical_retry_attempts: 1,
+                    retry_attempts: 1,
+                    retry_base_delay_ms: 1_000,
+                    retry_jitter_seconds: 20,
+                    retry_provider_errors: true,
+                    ..config()
+                },
+            );
+            let before = Utc::now();
+            provider
+                .chat(request("retry compatibility"))
+                .await
+                .unwrap_err();
+            let after = Utc::now();
+            let item = backend
+                .get_item(&QueueItemId("item-a".into()))
+                .await
+                .unwrap()
+                .unwrap();
+            let delay = chrono::Duration::milliseconds(expected_ms);
+            assert_eq!(
+                item.status,
+                QueueStatus::Dead,
+                "expected {expected_ms} ms, wrapped={wrapped}: {item:?}"
+            );
+            assert!(
+                (before + delay..=after + delay).contains(&item.run_after),
+                "expected {expected_ms} ms, wrapped={wrapped}: {before} <= start <= {after}, deadline={}",
+                item.run_after,
+            );
+        }
     }
 }
 

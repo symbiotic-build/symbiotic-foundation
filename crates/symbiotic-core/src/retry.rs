@@ -55,6 +55,11 @@ pub fn backoff_ms(attempt: u32, base_ms: u64) -> u64 {
 /// item-id bytes, request-hash bytes, the attempt as four little-endian bytes,
 /// and error-kind bytes; SHA-256 that sequence, then interpret its first eight
 /// bytes as a little-endian `u64`. This module does not hash caller data.
+/// Error-kind bytes are the UTF-8 bytes of `rate_limited` for
+/// `ModelError::RateLimited`, `unavailable` for `ModelError::Unavailable`,
+/// `timeout` for `ModelError::Timeout`, and `other` for every other primary
+/// variant. Select the primary error by recursively unwrapping
+/// `ModelError::HttpNotSent`, `ModelError::Http`, and `ModelError::Diagnostics`.
 /// Arithmetic saturates before the final clamp.
 ///
 /// # Errors
