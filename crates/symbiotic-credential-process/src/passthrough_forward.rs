@@ -2,6 +2,36 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+struct AttemptLog<'a> {
+    route: &'a str,
+    attempt: u32,
+    new_session: bool,
+    observed: Option<u16>,
+}
+impl AttemptLog<'_> {
+    fn warn(
+        &self,
+        code: &str,
+        class: Option<ErrorClass>,
+        bytes_reached_caller: bool,
+        action: &str,
+        delay_ms: Option<u128>,
+    ) {
+        tracing::warn!(
+            route = self.route,
+            status = self.observed,
+            code,
+            ?class,
+            attempt = self.attempt,
+            new_session = self.new_session,
+            bytes_reached_caller,
+            action,
+            delay_ms,
+            "upstream failure"
+        );
+    }
+}
+
 struct Failure {
     status: u16,
     code: String,
@@ -24,7 +54,7 @@ impl Failure {
 }
 enum AnswerOutcome {
     Complete,
-    Terminated,
+    Terminated(&'static str),
     Failure(Failure),
 }
 #[derive(Default)]
@@ -192,14 +222,12 @@ impl Passthrough {
         }
         fixed(write, status, code, &headers).await
     }
-    #[allow(clippy::too_many_arguments)]
     async fn retry_decision(
         &self,
         route: &Route,
         failure: &Failure,
-        new_session: bool,
+        log: &AttemptLog<'_>,
         policy: &RetryPolicy,
-        attempt: u32,
         started: bool,
         fallback_available: bool,
     ) -> Result<RetryDecision> {
@@ -215,7 +243,7 @@ impl Passthrough {
         let context = RetryContext {
             class,
             code: failure.code.clone(),
-            attempt,
+            attempt: log.attempt,
             bytes_reached_caller: started,
             route_name: route.config.name.clone(),
         };
@@ -267,16 +295,16 @@ impl Passthrough {
             None
         };
         // One journal line per retry decision, before the hold or cooldown is recorded.
-        tracing::warn!(
-            route = %route.config.name,
-            code = %failure.code,
-            ?class,
-            attempt,
-            new_session,
-            bytes_reached_caller = started,
-            action = ?rule.action,
-            delay_ms = delay.map(|d| d.as_millis()),
-            "upstream failure"
+        log.warn(
+            &failure.code,
+            Some(class),
+            started,
+            match rule.action {
+                RetryAction::RetrySame => "retry_same",
+                RetryAction::Switch => "switch",
+                RetryAction::Fail => "fail",
+            },
+            delay.map(|d| d.as_millis()),
         );
         if let Some(delay) = delay {
             let until = self
@@ -550,6 +578,12 @@ impl Passthrough {
                 continue;
             };
             attempt = attempt.saturating_add(1);
+            let log = AttemptLog {
+                route: &route.config.name,
+                attempt,
+                new_session: was_new,
+                observed: sent.as_ref().ok().map(|r| r.status().as_u16()),
+            };
             let failure = match sent {
                 Err(_) => Failure::network("network", None),
                 Ok(mut response) => {
@@ -594,20 +628,17 @@ impl Passthrough {
                                 route.retries.failures.store(0, Ordering::Release);
                                 return Ok(());
                             }
-                            AnswerOutcome::Terminated => return Ok(()),
+                            AnswerOutcome::Terminated(code) => {
+                                log.warn(code, None, started, "fail", None);
+                                return self
+                                    .local_error(write, started, 502, code, &wait, None)
+                                    .await;
+                            }
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
-                        // The provider's own status; the retry decision line follows for
-                        // failures that reach it.
-                        tracing::warn!(
-                            route = %route.config.name,
-                            status,
-                            attempt,
-                            new_session = was_new,
-                            "upstream refused"
-                        );
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
+                            log.warn("upstream_status", None, started, "fail", None);
                             return self
                                 .local_error(write, false, 401, "upstream_status", &wait, None)
                                 .await;
@@ -618,10 +649,12 @@ impl Passthrough {
                         {
                             let renewed = login_request.retried();
                             if login.after_unauthorized(login_request).await.is_ok() {
+                                log.warn("upstream_status", None, started, "renew", None);
                                 *injected = login_request.headers().clone();
                                 continue;
                             }
                             if !renewed {
+                                log.warn("credential_unavailable", None, started, "fail", None);
                                 return self
                                     .local_error(
                                         write,
@@ -647,6 +680,7 @@ impl Passthrough {
                                 }
                             }
                             Err(EgressError::LimitExceeded) => {
+                                log.warn("response_too_large", None, started, "fail", None);
                                 return self
                                     .local_error(
                                         write,
@@ -668,15 +702,7 @@ impl Passthrough {
                 policy.extend(named.clone());
             }
             let decision = self
-                .retry_decision(
-                    route,
-                    &failure,
-                    was_new,
-                    &policy,
-                    attempt,
-                    started,
-                    fallback.len() != 0,
-                )
+                .retry_decision(route, &failure, &log, &policy, started, fallback.len() != 0)
                 .await?;
             // Keep the single probe until its outcome has recorded the shared hold.
             drop(session);
@@ -800,17 +826,7 @@ impl Passthrough {
             || !matches!(kind, "text/event-stream" | "application/json")
             || (*started && kind != "text/event-stream")
         {
-            return self
-                .local_error(
-                    write,
-                    *started,
-                    502,
-                    "invalid_provider_response",
-                    wait,
-                    None,
-                )
-                .await
-                .map(|()| AnswerOutcome::Terminated);
+            return Ok(AnswerOutcome::Terminated("invalid_provider_response"));
         }
         let kind = kind.to_owned();
         let mut adapter = ResponsesAdapter::default();
@@ -829,10 +845,7 @@ impl Passthrough {
             let Some(bytes) = next else {
                 if kind == "application/json" {
                     if serde_json::from_slice::<serde_json::Value>(&json).is_err() {
-                        return self
-                            .local_error(write, *started, 502, "invalid_provider_json", wait, None)
-                            .await
-                            .map(|()| AnswerOutcome::Terminated);
+                        return Ok(AnswerOutcome::Terminated("invalid_provider_json"));
                     }
                     if !*started {
                         self.answer_head(route, response, write, &kind, wait)
@@ -850,10 +863,7 @@ impl Passthrough {
             };
             received = received.saturating_add(bytes.len());
             if received > route.config.max_response_bytes {
-                return self
-                    .local_error(write, *started, 502, "response_too_large", wait, None)
-                    .await
-                    .map(|()| AnswerOutcome::Terminated);
+                return Ok(AnswerOutcome::Terminated("response_too_large"));
             }
             if kind == "application/json" {
                 json.extend_from_slice(&bytes);
@@ -863,10 +873,7 @@ impl Passthrough {
                 Ok(e) => e,
                 Err(error) => {
                     let error = crate::stream::StreamError::from(error);
-                    return self
-                        .local_error(write, *started, 502, error.0, wait, None)
-                        .await
-                        .map(|()| AnswerOutcome::Terminated);
+                    return Ok(AnswerOutcome::Terminated(error.0));
                 }
             };
             for event in events {
@@ -895,10 +902,7 @@ impl Passthrough {
                 let clean = match join.accept(event) {
                     Ok(c) => c,
                     Err(e) => {
-                        return self
-                            .local_error(write, *started, 502, e.0, wait, None)
-                            .await
-                            .map(|()| AnswerOutcome::Terminated);
+                        return Ok(AnswerOutcome::Terminated(e.0));
                     }
                 };
                 if !clean.is_empty() {
