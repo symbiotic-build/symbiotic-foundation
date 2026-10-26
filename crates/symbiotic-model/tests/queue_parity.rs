@@ -3744,9 +3744,10 @@ async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
                             .finish(&reference, SpendState::Released, None, None, None)
                             .unwrap();
                     }
-                    let provider = queued(
+                    let provider = QueuedChatProvider::new(
                         raw.clone(),
                         backend.clone(),
+                        "worker",
                         ModelQueueConfig {
                             logical_retry_attempts: attempt,
                             retry_attempts: attempt,
