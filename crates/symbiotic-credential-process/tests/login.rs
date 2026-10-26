@@ -29,8 +29,12 @@ fn write(path: &Path, value: &Value) {
 fn native(path: &Path) -> String {
     let access = format!(
         "synthetic.{}.signature",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&json!({"exp": now()+3600})).unwrap())
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(
+                &json!({"exp": now()+3600,"iss":"https://auth.openai.com","client_id":CLIENT})
+            )
+            .unwrap()
+        )
     );
     write(
         path,
@@ -308,7 +312,7 @@ async fn failed_import_installation_fences_old_store_until_durable_replacement()
     let access = format!(
         "synthetic.{}.signature",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&json!({"exp":now()+3600,"padding":"x".repeat(512)})).unwrap()
+            serde_json::to_vec(&json!({"exp":now()+3600,"iss":"https://auth.openai.com","client_id":CLIENT,"padding":"x".repeat(512)})).unwrap()
         )
     );
     write(
@@ -340,4 +344,31 @@ async fn failed_import_installation_fences_old_store_until_durable_replacement()
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn codex_import_refuses_mismatched_issuer_and_client_claims() {
+    protect_process().unwrap();
+    for field in ["iss", "client_id"] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("native");
+        let store = dir.path().join("store");
+        let mut claims =
+            json!({"iss":"https://auth.openai.com","client_id":CLIENT,"exp":now()+3600});
+        claims[field] = json!("mismatched");
+        let access = format!(
+            "synthetic.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).unwrap())
+        );
+        write(
+            &source,
+            &json!({"tokens":{"access_token":access,"refresh_token":"synthetic-refresh","id_token":"synthetic-id","account_id":"synthetic-account"}}),
+        );
+        assert!(
+            import_native(LoginFamily::ChatgptCodex, &source, &store, false, LIMIT).is_err(),
+            "accepted {field}"
+        );
+        assert!(!store.exists(), "installed mismatched {field}");
+    }
 }

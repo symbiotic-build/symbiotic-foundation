@@ -250,6 +250,21 @@ impl Login {
         self.http.wire_base = Some(base.into());
     }
 
+    // Safe pre-send failures may renew again; uncertain/terminal failures refuse.
+    pub(crate) async fn usable(&self) -> Result<()> {
+        let (failure, _, retry_renewal) = *self.health_state.borrow();
+        let renewing = self.renewing.load(std::sync::atomic::Ordering::Acquire);
+        let fenced = self.fence.metadata().map_err(|_| UNAVAILABLE)?.len() != 0;
+        if !renewing
+            && (fenced
+                || failure == Some(LoginHealth::LoginRequired)
+                || (failure == Some(LoginHealth::RenewalFailed) && !retry_renewal))
+        {
+            return Err(UNAVAILABLE);
+        }
+        Ok(())
+    }
+
     /// Report non-secret state and token expiry as Unix seconds, without renewal.
     pub async fn health(&self) -> Result<(LoginHealth, u64)> {
         let (failure, expires_at, _) = *self.health_state.borrow();
@@ -325,7 +340,7 @@ impl Login {
     }
 
     /// Every credential value held during this handle's lifetime, including rotations.
-    /// The caller owns a zeroizing snapshot for response scrubbing.
+    /// The caller owns a zeroizing snapshot for response-header checks.
     pub async fn held_secrets(&self) -> SecretValue<Vec<String>> {
         self.history_state.borrow().clone()
     }
@@ -525,19 +540,20 @@ fn now() -> Result<u64> {
         .map(|d| d.as_secs())
         .map_err(|_| UNAVAILABLE)
 }
-fn jwt_exp(token: &str) -> Option<u64> {
-    #[derive(Deserialize)]
-    struct Claims {
-        exp: u64,
-    }
+fn jwt_claims<T: serde::de::DeserializeOwned>(token: &str) -> Option<T> {
     let bytes = SecretValue::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token.split('.').nth(1)?)
             .ok()?,
     );
-    serde_json::from_slice::<Claims>(&bytes)
-        .ok()
-        .map(|claims| claims.exp)
+    serde_json::from_slice(&bytes).ok()
+}
+fn jwt_exp(token: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Claims {
+        exp: u64,
+    }
+    jwt_claims::<Claims>(token).map(|claims| claims.exp)
 }
 
 /// Import a native Codex auth.json or first-party scoped Grok session file.
@@ -599,7 +615,7 @@ fn parse_native(family: LoginFamily, bytes: &[u8]) -> Result<Store> {
         principal_type: Option<Token>,
         principal_id: Option<Token>,
     }
-    let mut store = Store {
+    let store = || Store {
         version: 1,
         family,
         issuer: family.issuer().into(),
@@ -622,11 +638,24 @@ fn parse_native(family: LoginFamily, bytes: &[u8]) -> Result<Store> {
             {
                 return Err(UNAVAILABLE);
             }
-            store.expires_at = jwt_exp(native.tokens.access_token.text()).ok_or(UNAVAILABLE)?;
+            #[derive(Deserialize)]
+            struct Claims {
+                iss: String,
+                client_id: String,
+                exp: u64,
+            }
+            let claims =
+                jwt_claims::<Claims>(native.tokens.access_token.text()).ok_or(UNAVAILABLE)?;
+            if claims.iss != family.issuer() || claims.client_id != family.client_id() {
+                return Err(UNAVAILABLE);
+            }
+            let mut store = store();
+            store.expires_at = claims.exp;
             store.access_token = native.tokens.access_token;
             store.refresh_token = native.tokens.refresh_token;
             store.id_token = Some(native.tokens.id_token);
             store.account_id = Some(native.tokens.account_id);
+            Ok(store)
         }
         LoginFamily::XaiGrok => {
             #[derive(Deserialize)]
@@ -643,6 +672,7 @@ fn parse_native(family: LoginFamily, bytes: &[u8]) -> Result<Store> {
             {
                 return Err(UNAVAILABLE);
             }
+            let mut store = store();
             store.expires_at = u64::try_from(
                 chrono::DateTime::parse_from_rfc3339(&token.expires_at)
                     .map_err(|_| UNAVAILABLE)?
@@ -653,9 +683,9 @@ fn parse_native(family: LoginFamily, bytes: &[u8]) -> Result<Store> {
             store.refresh_token = token.refresh_token;
             store.principal_type = token.principal_type;
             store.principal_id = token.principal_id;
+            Ok(store)
         }
     }
-    Ok(store)
 }
 
 #[derive(Deserialize)]
@@ -1020,7 +1050,7 @@ mod tests {
         let access = format!(
             "synthetic.{}.sig",
             base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(format!("{{\"exp\":{}}}", now().unwrap() + 3600))
+                .encode(serde_json::to_vec(&json!({"exp":now().unwrap()+3600,"iss":"https://auth.openai.com","client_id":CODEX_CLIENT})).unwrap())
         );
         fs::write(&native, serde_json::to_vec(&json!({"tokens":{"access_token":access,"refresh_token":"fresh-refresh","id_token":"fresh-id","account_id":"account"}})).unwrap()).unwrap();
         use std::os::unix::fs::PermissionsExt;

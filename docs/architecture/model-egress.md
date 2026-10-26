@@ -997,8 +997,8 @@ new-session holds even when routes use distinct runtime account scopes. Failure
 counts share the runtime account scope; session holds share the login store.
 The bare cooldown backend costs one read before preparation and one under the
 send gate, plus a monotonic write when extending a cooldown. Session checks add
-bounded memory lookups and no database rows. Holding item events earns complete
-credential redaction; retaining original complete items earns exact continuation
+bounded memory lookups and no database rows. Holding item events prevents partial
+items reaching callers; retaining original complete items earns exact continuation
 replay. The health file remains a derived view of that process and backend state.
 An eligible attempt reads the existing cooldown twice: before preparation and
 under the existing account rate gate immediately before dispatch. A 429 takes
@@ -1044,24 +1044,26 @@ The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque
 items, deltas and their identity, provider sequence, usage and classified errors.
 The first adapter is Responses SSE. Other stream dialects are visibly refused at
 validation until their adapters exist. Unchanged Responses events round-trip exactly.
-The credential process holds each item's events until its done event. It scrubs
-every string and each concatenated delta field against all known credential
-encodings, including rotated values, before releasing events in order.
+The credential process holds each item's events until its done event, then releases
+them in order.
+No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+The corresponding Warden matching-filter removal is tracked by
+[warden#493](https://github.com/symbiotic-build/warden/issues/493).
 `max_held_event_bytes` defaults to 67 108 864 and bounds one held item's events.
-Overflow emits a visible error. Candidate-suffix machinery is removed.
+Overflow emits a visible error.
 
 On a handled mid-answer failure, the queue discards partial output and continues
 with the original input plus every completed provider item exactly as received,
 including encrypted reasoning. Complete interleaved items survive partial-item
-discard. Release checks the current credential set and compacts discarded output
-positions. Content indexes and reasoning summary indexes keep delta fields separate.
+discard. Release compacts discarded output positions.
 Joined attempts use the first response ID,
 contiguous sequence numbers and offset output indexes. Later created/in-progress
 events are suppressed. One final completed event contains all output items and
-summed reported usage. Fail decisions emit the original scrubbed error event.
+summed reported usage. Fail decisions emit the original error event.
 Caller disconnect cancels all work. Only JSON and uncompressed event streams are
 accepted. Idle timeout is classified as network failure and uses the same policy.
-Spend receipts and usage trailers remain step 2.
+Passthrough requests do not yet record spend receipts or return the usage trailer;
+[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
 
 Configured `return_headers` carry safe printable ASCII values of 1–8 192 bytes.
 Recognized provider rate-limit headers are forwarded on every status, including

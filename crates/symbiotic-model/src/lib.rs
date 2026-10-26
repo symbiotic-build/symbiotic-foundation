@@ -5045,7 +5045,7 @@ fn provider_finish_reason(
     })
 }
 
-pub fn provider_usage_identity(
+fn provider_usage_identity(
     trace: &mut ModelInvocationTrace,
     raw: &Value,
     request_contains_identity: impl Fn(&str) -> bool,

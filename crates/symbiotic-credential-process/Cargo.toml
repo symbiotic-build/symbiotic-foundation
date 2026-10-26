@@ -22,7 +22,7 @@ symbiotic-queue = { path = "../symbiotic-queue" }
 symbiotic-supervise = { path = "../symbiotic-supervise" }
 symbiotic-egress = { path = "../symbiotic-egress" }
 symbiotic-trace = { path = "../symbiotic-trace" }
-tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "signal"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 uuid.workspace = true

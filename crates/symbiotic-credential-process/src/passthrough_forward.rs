@@ -72,8 +72,9 @@ impl Passthrough {
                     .map_err(|_| EgressError::StateUnavailable)?;
                 (s.until, s.probing)
             };
-            if let Some(until) = until.filter(|t| *t > self.now()) {
-                let remaining = (until - self.now())
+            let now = self.now();
+            if let Some(until) = until.filter(|t| *t > now) {
+                let remaining = (until - now)
                     .to_std()
                     .map_err(|_| EgressError::StateUnavailable)?;
                 let budget = route
@@ -126,16 +127,16 @@ impl Passthrough {
         wait: &mut WaitTime,
     ) -> Result<Option<DateTime<Utc>>> {
         loop {
-            let Some(until) = route
+            let until = route
                 .account
                 .cooldown_until()
                 .await
-                .map_err(|_| EgressError::StateUnavailable)?
-                .filter(|t| *t > self.now())
-            else {
+                .map_err(|_| EgressError::StateUnavailable)?;
+            let now = self.now();
+            let Some(until) = until.filter(|t| *t > now) else {
                 return Ok(None);
             };
-            let remaining = (until - self.now())
+            let remaining = (until - now)
                 .to_std()
                 .map_err(|_| EgressError::StateUnavailable)?;
             let budget = route
@@ -327,7 +328,12 @@ impl Passthrough {
         let mut wait = WaitTime::default();
         let mut started = false;
         let mut join = ItemJoin::new(route.config.max_held_event_bytes);
-        let mut body = original.clone();
+        let mut buffered = reqwest::Request::new(
+            reqwest::Method::POST,
+            reqwest::Url::parse("https://provider.invalid")
+                .map_err(|_| EgressError::InvalidRequest)?,
+        );
+        *buffered.body_mut() = Some(original.clone().into());
         let mut slot = None;
         let mut authentication: Option<(HeaderMap, Option<LoginRequest>)> = None;
         let mut attempt = 0u32;
@@ -456,19 +462,6 @@ impl Passthrough {
             });
             #[cfg(test)]
             let destination = wire_url.as_ref().unwrap_or(destination);
-            // Build transport before taking the rate gate: reservation is immediately before send.
-            let transport = route
-                .client
-                .request(
-                    match route.config.method {
-                        PassthroughMethod::Get => reqwest::Method::GET,
-                        PassthroughMethod::Post => reqwest::Method::POST,
-                    },
-                    destination,
-                )
-                .headers(headers)
-                .body(body.clone())
-                .send();
             let grant = match route
                 .account
                 .request_admission()
@@ -488,6 +481,27 @@ impl Passthrough {
                     .local_error(write, started, 503, "credential_unavailable", &wait, None)
                     .await;
             }
+            // Reusable body storage is cloned only after admission succeeds.
+            let transport_request = route
+                .client
+                .request(
+                    match route.config.method {
+                        PassthroughMethod::Get => reqwest::Method::GET,
+                        PassthroughMethod::Post => reqwest::Method::POST,
+                    },
+                    destination,
+                )
+                .headers(headers)
+                .body(
+                    buffered
+                        .try_clone()
+                        .and_then(|mut request| request.body_mut().take())
+                        .ok_or(EgressError::StateUnavailable)?,
+                )
+                .build()
+                .map_err(|_| EgressError::InvalidRequest)?;
+            // execute() starts reqwest's timers; defer it until the grant actually sends.
+            let transport = async { route.client.execute(transport_request).await };
             let mut was_new = false;
             // Step 2: reserve a passthrough spend receipt immediately before sending.
             let sent = grant
@@ -566,6 +580,11 @@ impl Passthrough {
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
+                        if status == 401 && matches!(route.credential, Credential::Static(_)) {
+                            return self
+                                .local_error(write, false, 401, "upstream_status", &wait, None)
+                                .await;
+                        }
                         if status == 401
                             && let (Credential::Login(login), Some((injected, Some(login_request)))) =
                                 (&route.credential, authentication.as_mut())
@@ -633,29 +652,31 @@ impl Passthrough {
                 .await?;
             // Keep the single probe until its outcome has recorded the shared hold.
             drop(session);
-            if started {
-                let complete = join
-                    .discard_partial(&route.secrets().await)
-                    .map_err(|_| EgressError::InvalidProviderJson)?;
+            let complete = join
+                .discard_partial()
+                .map_err(|_| EgressError::InvalidProviderJson)?;
+            if !complete.is_empty() {
+                if !started {
+                    let mut headers =
+                        returned(&route.config, &failure.headers, &route.secrets().await, 200);
+                    headers.push((
+                        "x-symbiotic-queue-waited-ms".into(),
+                        wait.total.as_millis().to_string(),
+                    ));
+                    head(write, 200, "text/event-stream", &headers).await?;
+                    started = true;
+                }
                 chunk(write, &complete).await?;
             }
             match decision.action {
                 RetryAction::Fail => {
-                    if started && let Some(mut event) = failure.event {
-                        let bytes =
-                            crate::stream::clean_event_bytes(&mut event, &route.secrets().await)
-                                .map_err(|_| EgressError::InvalidProviderJson)?;
+                    if started && let Some(event) = failure.event {
+                        let bytes = ResponsesAdapter::encode(&event)
+                            .map_err(|_| EgressError::InvalidProviderJson)?;
                         chunk(write, &bytes).await?;
                         return finish(write).await;
                     }
                     if !started {
-                        if failure.status == 401
-                            && matches!(route.credential, Credential::Static(_))
-                        {
-                            return self
-                                .local_error(write, false, 401, "upstream_status", &wait, None)
-                                .await;
-                        }
                         let secrets = route.secrets().await;
                         let mut h =
                             returned(&route.config, &failure.headers, &secrets, failure.status);
@@ -702,10 +723,12 @@ impl Passthrough {
             if failure.new_session {
                 slot = None;
             }
-            if started {
-                body = join
-                    .continuation(&original)
-                    .map_err(|_| EgressError::InvalidProviderJson)?;
+            if join.has_completed_items() {
+                *buffered.body_mut() = Some(
+                    join.continuation(&original)
+                        .map_err(|_| EgressError::InvalidProviderJson)?
+                        .into(),
+                );
             }
             join.next_attempt();
         }
@@ -777,28 +800,18 @@ impl Passthrough {
             };
             let Some(bytes) = next else {
                 if kind == "application/json" {
-                    let clean = match crate::stream::scrub_json(&json, &route.secrets().await) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return self
-                                .local_error(
-                                    write,
-                                    *started,
-                                    502,
-                                    "invalid_provider_json",
-                                    wait,
-                                    None,
-                                )
-                                .await
-                                .map(|()| AnswerOutcome::Terminated);
-                        }
-                    };
+                    if serde_json::from_slice::<serde_json::Value>(&json).is_err() {
+                        return self
+                            .local_error(write, *started, 502, "invalid_provider_json", wait, None)
+                            .await
+                            .map(|()| AnswerOutcome::Terminated);
+                    }
                     if !*started {
                         self.answer_head(route, response, write, &kind, wait)
                             .await?;
                         *started = true;
                     }
-                    chunk(write, &clean).await?;
+                    chunk(write, &json).await?;
                     finish(write).await?;
                     return Ok(AnswerOutcome::Complete);
                 }
@@ -851,7 +864,7 @@ impl Passthrough {
                         ..
                     }
                 );
-                let clean = match join.accept(event, &route.secrets().await) {
+                let clean = match join.accept(event) {
                     Ok(c) => c,
                     Err(e) => {
                         return self

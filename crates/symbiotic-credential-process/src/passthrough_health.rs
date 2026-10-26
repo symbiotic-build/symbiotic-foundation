@@ -73,6 +73,7 @@ impl Passthrough {
             .iter()
             .filter_map(|(n, v)| {
                 (ResponsesAdapter::rate_header(n.as_str())
+                    && !contains_secret(n.as_str().as_bytes(), &secrets)
                     && safe_value(v.as_bytes(), &secrets, 256))
                 .then(|| v.to_str().ok().map(|v| (n.to_string(), v.to_owned())))
                 .flatten()
@@ -180,7 +181,10 @@ impl Passthrough {
                 rate_limits: h
                     .rate_limits
                     .iter()
-                    .filter(|(_, v)| safe_value(v.as_bytes(), &secrets, 256))
+                    .filter(|(k, v)| {
+                        !contains_secret(k.as_bytes(), &secrets)
+                            && safe_value(v.as_bytes(), &secrets, 256)
+                    })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 rate_limits_seen_at: h.rate_limits_seen_at,
@@ -252,7 +256,7 @@ mod tests {
      {
         let directory = tempfile::tempdir().unwrap();
         let config = super::super::tests::config(directory.path());
-        let process = CredentialProcess::open(config).unwrap();
+        let process = super::super::tests::open(config).unwrap();
         let pass = process.inner.passthrough.as_ref().unwrap();
         let config = process.config().passthrough.as_ref().unwrap();
         let path = config.health_path.as_ref().unwrap();

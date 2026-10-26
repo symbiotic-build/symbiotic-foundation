@@ -128,7 +128,6 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
 }
 pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
-    write_private(&dir.join("key"), KEY.as_bytes());
     write_private(&dir.join("admission"), &[b'a'; 32]);
     serde_json::from_value(json!({
         "version":4,"state_dir":dir.join("state"),"socket_path":dir.join("typed.sock"),
@@ -143,6 +142,20 @@ pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
             "max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}
     })).unwrap()
 }
+pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
+    let key = config.state_dir.parent().unwrap().join("key");
+    if config
+        .passthrough
+        .as_ref()
+        .unwrap()
+        .routes
+        .iter()
+        .any(|route| matches!(&route.secret, SecretSource::OwnerOnlyFile { path } if path == &key))
+    {
+        write_private(&key, KEY.as_bytes());
+    }
+    CredentialProcess::open(config)
+}
 impl Harness {
     async fn start(fixture: &Fixture, change: impl FnOnce(&mut ProcessConfig)) -> Self {
         Self::with_hook(fixture, change, None).await
@@ -152,10 +165,18 @@ impl Harness {
         change: impl FnOnce(&mut ProcessConfig),
         hook: Option<RetryHook>,
     ) -> Self {
+        Self::with_clock(fixture, change, hook, None).await
+    }
+    async fn with_clock(
+        fixture: &Fixture,
+        change: impl FnOnce(&mut ProcessConfig),
+        hook: Option<RetryHook>,
+        clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config(dir.path());
         change(&mut config);
-        let mut process = CredentialProcess::open(config).unwrap();
+        let mut process = open(config).unwrap();
         let pass = Arc::get_mut(&mut process.inner)
             .unwrap()
             .passthrough
@@ -163,6 +184,7 @@ impl Harness {
             .unwrap();
         pass.wire_base = Some(fixture.base.clone());
         pass.retry_hook = hook;
+        pass.clock = clock;
         for route in &mut pass.routes {
             route.client = reqwest::Client::builder()
                 .no_proxy()
@@ -584,14 +606,14 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
     let directory = tempfile::tempdir().unwrap();
     let mut settings = config(directory.path());
     settings.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
-    let mut process = CredentialProcess::open(settings).unwrap();
+    let mut process = open(settings).unwrap();
     let frozen_at = Utc::now() + chrono::Duration::seconds(60);
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
         .as_mut()
         .unwrap();
-    pass.frozen_at = Some(frozen_at);
+    pass.clock = Some(Arc::new(move || frozen_at));
     let account = pass.routes[0].account.clone();
     for (nanoseconds, seconds) in [(1, 1), (1_000_000_000, 1), (1_000_000_001, 2)] {
         account
@@ -614,44 +636,6 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
         assert_eq!(body, br#"{"error":{"code":"rate_limited"}}"#);
         handler.await.unwrap().unwrap();
     }
-}
-
-#[tokio::test]
-async fn split_sse_deltas_are_scrubbed_through_the_socket() {
-    let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |_| {}).await;
-    let call = harness.call().await;
-    let upstream = fixture.next().await;
-    let text = format!(
-        "data: {{\"type\":\"response.output_text.delta\",\"item_id\":\"item\",\"output_index\":0,\"content_index\":0,\"delta\":\"{}\"}}\n\ndata: {{\"type\":\"response.output_text.delta\",\"item_id\":\"item\",\"output_index\":0,\"content_index\":0,\"delta\":\"{}\"}}\n\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"item\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{}}}}\n\n",
-        &KEY[..12],
-        &KEY[12..]
-    );
-    upstream
-        .reply
-        .send(Reply {
-            status: 200,
-            headers: vec![("content-type".into(), "text/event-stream".into())],
-            body: text.into_bytes(),
-        })
-        .ok()
-        .unwrap();
-    let (status, _, body) = decoded(&call.await.unwrap());
-    assert_eq!(status, 200);
-    let body = String::from_utf8(body).unwrap();
-    assert!(!body.contains(KEY));
-    let text: String = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|event| {
-            event
-                .get("delta")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect();
-    assert_eq!(text, "[redacted]");
 }
 
 #[tokio::test]
@@ -717,7 +701,7 @@ async fn cooldown_is_durable_across_runtime_restart() {
     let _ = (&mut harness.task).await;
     let retained = std::mem::replace(&mut harness._dir, tempfile::tempdir().unwrap());
     drop(harness);
-    let mut process = CredentialProcess::open(config).unwrap();
+    let mut process = open(config).unwrap();
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
@@ -1016,7 +1000,7 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
 #[tokio::test]
 async fn peer_uid_check_refuses_a_foreign_uid_before_parsing() {
     let dir = tempfile::tempdir().unwrap();
-    let process = CredentialProcess::open(config(dir.path())).unwrap();
+    let process = open(config(dir.path())).unwrap();
     let listener = bind(&process).unwrap();
     let socket_path = process
         .config()
@@ -1100,31 +1084,6 @@ async fn failed_forced_renewal_returns_unavailable_and_retains_the_fence() {
         .await;
     assert_eq!(decoded(&harness.call().await.await.unwrap()).0, 503);
     assert!(fixture.incoming.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn renewed_and_original_tokens_are_both_scrubbed_from_the_final_body() {
-    let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, login_config).await;
-    let call = harness.call().await;
-    fixture
-        .next()
-        .await
-        .reply
-        .send(Reply::status(401))
-        .ok()
-        .unwrap();
-    fixture.next().await.reply.send(renewal()).ok().unwrap();
-    let upstream = fixture.next().await;
-    let mut reply = Reply::json();
-    reply.body=br#"{"text":"synthetic-old-access synthetic-new-access synthetic-old-refresh synthetic-new-refresh synthetic-account"}"#.to_vec();
-    upstream.reply.send(reply).ok().unwrap();
-    let (status, _, body) = decoded(&call.await.unwrap());
-    assert_eq!(status, 200);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap(),
-        json!({"text":"[redacted] [redacted] [redacted] [redacted] [redacted]"})
-    );
 }
 
 #[tokio::test]
@@ -1545,7 +1504,7 @@ async fn concurrent_expiring_callers_share_a_failed_renewal_and_send_no_provider
 #[tokio::test]
 async fn passthrough_contract_parser_refuses_bare_newlines_before_or_within_the_request() {
     let directory = tempfile::tempdir().unwrap();
-    let process = CredentialProcess::open(config(directory.path())).unwrap();
+    let process = open(config(directory.path())).unwrap();
     // Exercise the HTTP connection boundary without a listening socket or provider.
     // A valid unknown path returns 404. Malformed framing must return 400 instead.
     for (bytes, status) in [
@@ -2015,13 +1974,14 @@ async fn unreachable_provider_recovers_after_several_backoffs_with_one_late_answ
     assert_eq!(decoded(&call.await.unwrap()).2, br#"{"result":"ok"}"#);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waiter() {
     let dir = tempfile::tempdir().unwrap();
     let mut settings = config(dir.path());
     login_config(&mut settings);
     settings.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1;
-    let process = CredentialProcess::open(settings).unwrap();
+    let process = open(settings).unwrap();
+    assert!(!dir.path().join("key").exists());
     let pass = process.inner.passthrough.as_ref().unwrap();
     let permit = pass.routes[0].account.acquire().await.unwrap();
     let (mut caller, server) = UnixStream::pair().unwrap();
@@ -2042,6 +2002,7 @@ async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waite
         waiting,
         &json!({"request_id":"synthetic-job","reason":"slot","since":since})
     );
+    tokio::time::advance(Duration::from_millis(250)).await;
     write_private(
         &dir.path().join("login.json.renewal"),
         b"uncertain_rotation",
@@ -2059,10 +2020,249 @@ async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waite
         .lines()
         .find_map(|l| l.strip_prefix("x-symbiotic-queue-waited-ms: "))
         .unwrap();
-    assert!(waited.parse::<u64>().is_ok());
+    assert_eq!(waited.parse::<u64>().unwrap(), 250);
     handler.await.unwrap().unwrap();
     pass.publish_health(settings, "running").await.unwrap();
     let health: Value =
         serde_json::from_slice(&fs::read(settings.health_path.as_ref().unwrap()).unwrap()).unwrap();
     assert_eq!(health["routes"][0]["waiting"], json!([]));
+}
+
+#[tokio::test]
+async fn safe_presend_renewal_failure_recovers_on_the_next_socket_request() {
+    let provider = Fixture::start().await;
+    let address = provider.base.strip_prefix("http://").unwrap().to_owned();
+    let mut unavailable = Fixture::without_provider();
+    unavailable.base = provider.base.clone();
+    drop(provider);
+    let harness = Harness::start(&unavailable, |config| {
+        login_config(config);
+        let path = config.state_dir.parent().unwrap().join("login.json");
+        let mut store: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        store["expires_at"] = json!(Utc::now().timestamp() + 30);
+        write_private(&path, &serde_json::to_vec(&store).unwrap());
+    })
+    .await;
+    assert_eq!(decoded(&harness.call().await.await.unwrap()).0, 503);
+    let mut restored = Fixture::at(&address).await;
+    let call = harness.call().await;
+    let exchange = restored.next().await;
+    assert!(exchange.head.starts_with("POST /oauth/token HTTP/1.1"));
+    exchange.reply.send(renewal()).ok().unwrap();
+    let request = restored.next().await;
+    assert!(
+        request
+            .head
+            .contains("authorization: Bearer synthetic-new-access")
+    );
+    request.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&call.await.unwrap()).2, br#"{"result":"ok"}"#);
+}
+
+#[tokio::test]
+async fn completed_item_behind_partial_before_headers_survives_disconnect() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let original = json!({"input":[{"role":"user","content":"question"}]});
+    let caller = harness
+        .connect("/v1/responses", &serde_json::to_vec(&original).unwrap(), "")
+        .await;
+    let retained = json!({"id":"retained","type":"reasoning","encrypted_content":"opaque"});
+    let events = [
+        json!({"type":"response.output_text.delta","item_id":"partial","output_index":0,"delta":"discard me"}),
+        json!({"type":"response.output_item.done","output_index":1,"item":retained}),
+    ];
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: events
+                .into_iter()
+                .flat_map(|v| format!("data: {v}\n\n").into_bytes())
+                .collect(),
+        })
+        .ok()
+        .unwrap();
+    let continuation = fixture.next().await;
+    let mut expected = original;
+    expected["input"]
+        .as_array_mut()
+        .unwrap()
+        .push(retained.clone());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&continuation.body).unwrap(),
+        expected
+    );
+    let answer = json!({"id":"answer","type":"message","content":[]});
+    let events = [
+        json!({"type":"response.created","response":{"id":"second"}}),
+        json!({"type":"response.output_item.done","output_index":0,"item":answer}),
+        json!({"type":"response.completed","response":{"id":"second","output":[answer]}}),
+    ];
+    continuation
+        .reply
+        .send(Reply {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: events
+                .into_iter()
+                .flat_map(|v| format!("data: {v}\n\n").into_bytes())
+                .collect(),
+        })
+        .ok()
+        .unwrap();
+    let (status, _, body) = decoded(&read(caller).await);
+    assert_eq!(status, 200);
+    let events = ResponsesAdapter::default().feed(&body, 100_000).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e.record().value["type"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("response.output_item.done"),
+            json!("response.output_item.done"),
+            json!("response.completed")
+        ]
+    );
+    assert_eq!(
+        events.last().unwrap().record().value["response"]["output"],
+        json!([retained, answer])
+    );
+    assert!(!String::from_utf8(body).unwrap().contains("discard me"));
+}
+
+#[tokio::test]
+async fn account_gate_wait_does_not_consume_the_upstream_timeout() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let model::ModelRequestAdmission::Ready(grant) =
+        harness.account().request_admission().await.unwrap()
+    else {
+        panic!("ready account");
+    };
+    let call = harness.call().await;
+    // A pending receive proves no provider dispatch while holding the gate.
+    // Its duration exceeds the configured one-second upstream read timeout.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1100), fixture.incoming.recv())
+            .await
+            .is_err()
+    );
+    drop(grant);
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&call.await.unwrap()).2, br#"{"result":"ok"}"#);
+}
+
+#[tokio::test]
+async fn static_unauthorized_ignores_retry_overrides() {
+    let mut fixture = Fixture::start().await;
+    let hook: RetryHook = Arc::new(|_| {
+        Some(RetryRule {
+            action: RetryAction::RetrySame,
+            max_attempts: Some(2),
+            backoff: RetryBackoff {
+                base_delay_ms: Some(1),
+            },
+        })
+    });
+    let harness = Harness::with_hook(&fixture, |_| {}, Some(hook)).await;
+    let call = harness.call().await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply {
+            status: 401,
+            headers: Vec::new(),
+            body: b"discarded upstream body".to_vec(),
+        })
+        .ok()
+        .unwrap();
+    let bytes = tokio::select! {
+        response = call => response.unwrap(),
+        _ = fixture.incoming.recv() => panic!("static-key 401 resent the rejected credential"),
+    };
+    let (status, _, body) = decoded(&bytes);
+    assert_eq!(
+        (status, body),
+        (401, br#"{"error":{"code":"upstream_status"}}"#.to_vec())
+    );
+    assert!(fixture.incoming.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn credential_in_response_header_name_is_dropped_from_reply_and_health() {
+    let mut fixture = Fixture::start().await;
+    let configured = format!("x-{KEY}-reply");
+    let recognized = format!("x-{KEY}-limit-name");
+    let harness = Harness::start(&fixture, |config| {
+        config.passthrough.as_mut().unwrap().routes[0]
+            .return_headers
+            .push(configured.clone());
+    })
+    .await;
+    let call = harness.call().await;
+    let mut reply = Reply::json();
+    reply.headers.extend([
+        (configured, "safe".into()),
+        (recognized, "1".into()),
+        ("x-codex-primary-used-percent".into(), "7".into()),
+    ]);
+    fixture.next().await.reply.send(reply).ok().unwrap();
+    let (status, headers, body) = decoded(&call.await.unwrap());
+    assert_eq!((status, body), (200, br#"{"result":"ok"}"#.to_vec()));
+    assert!(!headers.contains(KEY));
+    assert!(headers.contains("x-codex-primary-used-percent: 7\r\n"));
+    let health = harness
+        .health_where(|h| h["routes"][0]["rate_limits"]["x-codex-primary-used-percent"] == "7")
+        .await;
+    assert_eq!(
+        health["routes"][0]["rate_limits"],
+        json!({"x-codex-primary-used-percent":"7"})
+    );
+}
+
+#[tokio::test]
+async fn deadline_crossing_between_clock_reads_allows_socket_dispatch() {
+    for session_hold in [false, true] {
+        let mut fixture = Fixture::start().await;
+        let deadline = Utc::now() - chrono::Duration::seconds(1);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let clock = Arc::new(move || {
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                deadline - chrono::Duration::milliseconds(1)
+            } else {
+                deadline + chrono::Duration::milliseconds(1)
+            }
+        });
+        let harness = Harness::with_clock(
+            &fixture,
+            |config| {
+                if session_hold {
+                    config.passthrough.as_mut().unwrap().routes[0].new_session =
+                        Some(NewSessionConfig {
+                            session_headers: vec!["session-id".into()],
+                        });
+                }
+            },
+            None,
+            Some(clock),
+        )
+        .await;
+        if session_hold {
+            let pass = harness.process.inner.passthrough.as_ref().unwrap();
+            pass.routes[0].retries.sessions.state.lock().unwrap().until = Some(deadline);
+        } else {
+            harness.account().note_cooldown(deadline).await.unwrap();
+        }
+        let caller = harness
+            .connect("/v1/responses", b"{}", "session-id: synthetic-session\r\n")
+            .await;
+        fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).2, br#"{"result":"ok"}"#);
+    }
 }

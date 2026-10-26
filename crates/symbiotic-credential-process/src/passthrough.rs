@@ -111,7 +111,7 @@ pub struct PassthroughRoute {
     pub return_headers: Vec<String>,
     /// Maximum buffered caller body bytes.
     pub max_request_bytes: usize,
-    /// Maximum upstream body bytes before filtering; overflow ends the response.
+    /// Maximum upstream body bytes; overflow ends the response.
     pub max_response_bytes: usize,
     /// Provisional retained event-envelope bound per item; defaults to 64 MiB.
     #[serde(default = "crate::stream::default_max_held_event_bytes")]
@@ -359,7 +359,7 @@ pub(crate) struct Passthrough {
     #[cfg(test)]
     wire_base: Option<String>,
     #[cfg(test)]
-    frozen_at: Option<DateTime<Utc>>,
+    clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
 }
 impl Passthrough {
     pub(crate) fn open(config: &ProcessConfig, runtime: &Runtime) -> Result<Option<Self>> {
@@ -455,14 +455,14 @@ impl Passthrough {
             #[cfg(test)]
             wire_base: None,
             #[cfg(test)]
-            frozen_at: None,
+            clock: None,
         }))
     }
 
     fn now(&self) -> DateTime<Utc> {
         #[cfg(test)]
-        if let Some(now) = self.frozen_at {
-            return now;
+        if let Some(clock) = &self.clock {
+            return clock();
         }
         Utc::now()
     }
@@ -476,13 +476,7 @@ impl Route {
     }
     async fn usable(&self) -> Result<()> {
         if let Credential::Login(login) = &self.credential {
-            let health = login.health().await?.0;
-            if matches!(
-                health,
-                LoginHealth::LoginRequired | LoginHealth::RenewalFailed
-            ) {
-                return Err(EgressError::CredentialUnavailable);
-            }
+            login.usable().await?;
         }
         Ok(())
     }
@@ -517,11 +511,24 @@ pub fn bind(process: &CredentialProcess) -> Result<UnixListener> {
 /// Serve HTTP until SIGTERM/SIGINT. Publish `stopping` before closing the listener.
 /// Every handler is owned here and cancelled on shutdown or server failure.
 pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result<()> {
-    let mut shutdown = signals::Shutdown::install()?;
-    serve_until(process, listener, shutdown.wait(), current_uid()).await
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).map_err(|_| EgressError::StateUnavailable)?;
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|_| EgressError::StateUnavailable)?;
+    serve_until(
+        process,
+        listener,
+        async move {
+            let received = tokio::select! {
+                received = term.recv() => received,
+                received = interrupt.recv() => received,
+            };
+            received.ok_or(EgressError::StateUnavailable)
+        },
+        current_uid(),
+    )
+    .await
 }
-#[path = "passthrough_signals.rs"]
-mod signals;
 
 async fn serve_until(
     process: CredentialProcess,
@@ -756,6 +763,7 @@ fn returned(
             let rate = ResponsesAdapter::rate_header(name)
                 || (matches!(status, 429 | 503) && rate_header(name, route));
             if forbidden_header(name)
+                || contains_secret(name.as_bytes(), secrets)
                 || !(rate || route.return_headers.iter().any(|h| h == name))
                 || !safe_value(value.as_bytes(), secrets, if rate { 256 } else { 8192 })
             {

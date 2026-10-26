@@ -17,17 +17,6 @@ pub enum ErrorClass {
     Final,
 }
 
-/// One logical delta string with its adapter-supplied field identity.
-#[derive(Clone, Debug)]
-pub struct ItemDelta {
-    /// Stable field identity within one item, including content-part and delta kind.
-    pub field_id: String,
-    /// Decoded delta text or function-call argument fragment.
-    pub text: String,
-    /// Location used by the adapter to replace the caller-facing string.
-    pub json_pointer: String,
-}
-
 /// Original provider data and neutral event identity.
 #[derive(Clone, Debug)]
 pub struct ItemRecord {
@@ -37,21 +26,15 @@ pub struct ItemRecord {
     pub item_id: Option<String>,
     /// Attempt-local output position.
     pub output_index: Option<u64>,
-    /// Content-part position within the item.
-    pub content_part_index: Option<u64>,
-    /// Function-call identity, when present.
-    pub function_call_id: Option<String>,
     /// Original provider event sequence.
     pub provider_sequence_number: Option<u64>,
     /// Provider response identity carried by lifecycle or response events.
     pub response_id: Option<String>,
-    /// Delta string location and field identity, for complete-item redaction.
-    pub delta: Option<ItemDelta>,
     original: Value,
     wire: Vec<u8>,
 }
 
-/// Neutral events consumed by the shared hold, scrub and join engine.
+/// Neutral events consumed by the shared hold and join engine.
 #[derive(Clone, Debug)]
 pub enum ItemEvent {
     /// Initial response lifecycle event.
@@ -143,7 +126,6 @@ pub struct JoinFields<'a> {
 #[derive(Default)]
 pub struct ResponsesAdapter {
     pending: Vec<u8>,
-    calls: std::collections::HashMap<String, String>,
 }
 impl ResponsesAdapter {
     /// Decode complete SSE records, refusing an unfinished record above the item limit.
@@ -199,58 +181,25 @@ impl ResponsesAdapter {
                 return Err(ItemStreamError::InvalidEvent);
             }
         }
-        let part_index = value["content_index"]
-            .as_u64()
-            .or_else(|| value["summary_index"].as_u64());
         let kind = value["type"].as_str().unwrap_or("").to_owned();
-        if let (Some(item), Some(call)) = (
-            value["item"]["id"].as_str(),
-            value["item"]["call_id"].as_str(),
-        ) {
-            self.calls.insert(item.to_owned(), call.to_owned());
-        }
+        let delta = value["delta"].is_string();
         let item_id = value["item_id"]
             .as_str()
             .or_else(|| value["item"]["id"].as_str())
             .map(str::to_owned);
-        let function_call_id = value["call_id"]
-            .as_str()
-            .or_else(|| value["item"]["call_id"].as_str())
-            .map(str::to_owned)
-            .or_else(|| item_id.as_ref().and_then(|id| self.calls.get(id)).cloned());
-        let delta = value["delta"].as_str().map(|text| ItemDelta {
-            field_id: serde_json::json!([
-                kind,
-                item_id,
-                value["output_index"],
-                part_index,
-                function_call_id
-            ])
-            .to_string(),
-            text: text.to_owned(),
-            json_pointer: "/delta".into(),
-        });
         let record = ItemRecord {
             item_id,
             output_index: value["output_index"].as_u64(),
-            content_part_index: part_index,
-            function_call_id,
             provider_sequence_number: value["sequence_number"].as_u64(),
             response_id: value
                 .pointer("/response/id")
                 .or_else(|| value.get("response_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            delta,
             original: value.clone(),
             value,
             wire,
         };
-        if kind == "response.output_item.done"
-            && let Some(id) = &record.item_id
-        {
-            self.calls.remove(id);
-        }
         Ok(match kind.as_str() {
             "response.created" => ItemEvent::ResponseStarted(record),
             "response.in_progress" => ItemEvent::ResponseInProgress(record),
@@ -287,7 +236,7 @@ impl ResponsesAdapter {
                     completed: true,
                 }
             }
-            _ if record.delta.is_some() => ItemEvent::ItemDelta(record),
+            _ if delta => ItemEvent::ItemDelta(record),
             _ => ItemEvent::Other(record),
         })
     }
@@ -531,31 +480,6 @@ mod tests {
             .flat_map(|v| format!("data: {v}\n\n").into_bytes())
             .collect();
         let events = ResponsesAdapter::default().feed(&wire, 4096).unwrap();
-        let first = events[1].record();
-        let second = events[2].record();
-        assert_eq!(
-            (
-                first.item_id.as_deref(),
-                first.output_index,
-                first.content_part_index,
-                first.function_call_id.as_deref(),
-                first.provider_sequence_number
-            ),
-            (
-                Some("call-item"),
-                Some(0),
-                None,
-                Some("function-call"),
-                Some(1)
-            )
-        );
-        assert_eq!(second.function_call_id.as_deref(), Some("function-call"));
-        assert_eq!(first.delta.as_ref().unwrap().text, "{\"x\":");
-        assert_eq!(second.delta.as_ref().unwrap().text, "1}");
-        assert_eq!(
-            first.delta.as_ref().unwrap().field_id,
-            second.delta.as_ref().unwrap().field_id
-        );
         assert_eq!(
             events
                 .iter()

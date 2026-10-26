@@ -54,13 +54,16 @@ The lead decided on 2026-10-26:
 
 ## Operator decisions on 2026-10-26
 
-These decisions replace delta-tail scrubbing, resend-only retries and upstream
-hang-up behavior in the original record.
+These decisions replace resend-only retries and upstream hang-up behavior in the
+original record.
 
 - Adapters classify failures. One configurable policy table chooses retry, switch
   or fail. One shared queue engine owns backoff before and during an answer.
-- Output-item events wait for `response.output_item.done`. Complete items are
-  scrubbed as one unit. Half-finished items never reach the caller.
+- Output-item events wait for `response.output_item.done`. Half-finished items
+  never reach the caller.
+- No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+  The corresponding Warden matching-filter removal is tracked by
+  [warden#493](https://github.com/symbiotic-build/warden/issues/493).
 - A handled mid-answer failure discards the partial item and continues with every
   completed output item replayed exactly, including opaque encrypted reasoning.
   Attempts join into one downstream answer. Completed interleaved items survive
@@ -141,9 +144,8 @@ account (two or three streams to start).
 - **Maximum cooldown wait:** `max_queue_wait_seconds`, an optional route setting, off
   by default. When set, a request that has waited that long for cooldowns gets 429
   with the remaining cooldown. Waiting for a free slot never counts against it.
-- **Stream dialect:** which provider event format a route streams, so the scrubber
-  and usage reader know where text and usage are. Only OpenAI Responses has an
-  item-stream adapter in this step.
+- **Stream dialect:** which provider event format a route streams. Only OpenAI
+  Responses has an item-stream adapter in this step.
 
 ## Walkthrough
 
@@ -480,7 +482,7 @@ credential and pacing admission. No waiting request creates a spend reservation.
 
 **Responses.**
 
-- **2xx:** streamed to the caller through the scrubber. The process sets
+- **2xx:** streamed to the caller. The process sets
   `Content-Type` to the validated format, `text/event-stream` or `application/json`;
   any other upstream type, or a compressed body, ends the response with an error.
   A family whose endpoint omits the type on its event stream (the ChatGPT Codex
@@ -494,7 +496,7 @@ credential and pacing admission. No waiting request creates a spend reservation.
   upstream header, renewal or resend.
 - **Other failures:** classification and the policy below determine whether to
   retry, switch or return the fixed status/body. A mid-answer fail action ends the
-  downstream stream with the original error event, after credential redaction.
+  downstream stream with the original error event.
 
 **Retry policy.** The Responses adapter maps 429 and `server_is_overloaded`,
 `rate_limit_exceeded` and `slow_down` to `throttle`. DNS, connect, TLS, reset and EOF
@@ -583,7 +585,7 @@ only the route's `return_headers` that the provider sent, plus recognized provid
 are fixed. Agent tools read some of them back on their next request; for example the
 Codex CLI keeps `x-codex-turn-state` and sends it again, so later requests of a turn
 reach the same provider state. Each value must be 1 to 8 192 bytes of printable
-ASCII and must not contain a credential the scrubber knows; otherwise that header
+ASCII and must not contain a known credential; otherwise that header
 is dropped. The
 response to a request that waited and was resent after a 429 carries the headers of
 the final provider answer.
@@ -618,16 +620,11 @@ without a usable `Retry-After` uses the account's existing retry backoff
 (`retry_base_delay_ms`, doubling, 120 s clamp). Response bodies are never parsed for
 reset hints. The cooldown only moves forward, as today.
 
-**Scrubbing.** Every response string is scrubbed against all credential values
-held by this process, including rotations. Encodings are exact, JSON-escaped,
-percent-encoded in both hex cases, standard Base64 and URL-safe Base64, padded and
-unpadded. Every string and object key in the complete item and its events is
-checked. Each delta field's strings are concatenated only within that item;
-interleaved fields never concatenate. Redactions are distributed back into the
-original events before release. All item events wait until its done event, then
-leave in arrival order. `max_held_event_bytes` is the only item hold bound;
-exceeding it emits a visible static error without releasing the partial item.
-Candidate-suffix and per-delta hold machinery are removed.
+No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+
+All item events wait until the done event, then leave in arrival order.
+`max_held_event_bytes` bounds the events retained for one unfinished item.
+Exceeding it emits a visible static error without releasing the partial item.
 
 ### Internal item stream
 
@@ -635,14 +632,13 @@ Candidate-suffix and per-delta hold machinery are removed.
 `ItemStarted`, `ItemDelta`, `ItemDone`, `Usage`, `Error`, and opaque `Other` events.
 `ItemDone` carries complete provider JSON for exact replay. `Usage` carries
 `symbiotic_trace::UsageTrace`. Error events carry provider code and class. Event
-metadata carries item identity, content-part index, function-call identity and
-argument-delta location, and provider sequence number. Unknown provider fields
-remain opaque. Public Rust names use the naming conventions above.
+metadata carries item identity, output index and provider sequence number. Unknown
+provider fields remain opaque. Public Rust names use the naming conventions above.
 
 One Responses SSE adapter decodes provider events and re-encodes them. Unchanged
 events round-trip byte-for-byte. Modified events preserve every JSON field except
-explicit redaction and join edits. The credential process implements holding,
-scrubbing and joining once against the neutral enum. No Chat Completions,
+explicit join edits. The credential process implements holding and joining once
+against the neutral enum. No Chat Completions,
 Anthropic Messages or Gemini adapter is built in this step.
 
 ### Continue and join
@@ -652,13 +648,11 @@ After bytes reach the caller, a retryable `response.failed` or a disconnect befo
 back, partial output is discarded, failure count rises and shared cooldown applies.
 The continuation uses the original body with `input` extended by every completed
 output item exactly as received in its done event, including reasoning items and
-`encrypted_content`. Caller-facing redactions never alter replay data.
+`encrypted_content`.
 
 Before retrying, the process releases any complete items held behind the discarded
-partial item. Release always checks the current credential set, including rotations
-since item completion. Logical output positions follow forwarded item order; gaps
-left by discarded partial items are compacted. Reasoning summary indexes and content
-indexes both identify independent delta fields.
+partial item. Logical output positions follow forwarded item order; gaps left by
+discarded partial items are compacted.
 
 The next attempt suppresses `response.created` and `response.in_progress`, rewrites
 response IDs to the first answer's ID, continues sequence numbers, and offsets
@@ -666,7 +660,7 @@ output indexes by the number of items already forwarded. One final completed eve
 contains all forwarded items in order. Its usage sums provider-reported usage from
 all attempts; absent usage is never inferred. Further handled failures repeat this
 procedure. The caller receives no handled error event. A fail decision forwards the
-original scrubbed error event. A local protocol or hold-limit error remains visible.
+original error event. A local protocol or hold-limit error remains visible.
 
 Health adds `retried_events` (provider code, `network` or `upstream_disconnect` to
 handled count), `waiting`, `rate_limits`, `rate_limits_seen_at` and
@@ -699,6 +693,11 @@ symbiotic-usage: input_tokens=1200, cached_input_tokens=800, output_tokens=310, 
 A host can then count usage per job, or per anything it knows and Foundation does not,
 without parsing the stream. A stream without a usage event gets no trailer. The
 process keeps no per-caller totals and enforces no per-caller ceiling.
+
+**Deferred (operator decision, 2026-10-26).** The first implementation ships without
+both the spend receipts and the usage trailer above. Nothing consumes them yet: a login
+account has no per-request price, and no host enforces per-request usage yet.
+[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
 
 ### What passthrough does not reuse
 
@@ -785,9 +784,7 @@ renewal or resend.
      through the queue. It depends on client reconnect behavior and retry budget.
    - *Rejected:* resuming the agent session from its host. Every host would
      duplicate recovery and restart work the provider had already produced.
-6. **Redaction on streams, with the credential boundary's encoding set.** See
-   §Scrubbing for why refusal does not fit a stream.
-7. **Login families are a closed list in code.** The injected headers decide where a
+6. **Login families are a closed list in code.** The injected headers decide where a
    token goes, so they are not free configuration, as with the existing provider list.
 
 ## Simplification pass
@@ -808,7 +805,6 @@ Each mechanism this design adds, and the requirement it serves:
 | Resend after 429 | no 429 reaches the caller (decision 5) |
 | `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
-| Scrubber | credentials must not reach the caller, which may be untrusted |
 | Complete-item holding | prevents partial items reaching callers and enables exact continuation replay |
 | `max_held_event_bytes` | bounds retained events of one unfinished item |
 | Usage reader | usage receipts (#156 item 3) |
@@ -822,7 +818,6 @@ Removed while designing:
 - parsing response bodies for reset hints; headers only;
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
-- candidate-suffix retention and per-delta holding; the complete item is the only release unit (§Scrubbing);
 - a total request deadline; the idle timeout fails on lack of progress instead.
 - a bound on slot waits, and the invented `Retry-After: 1` it would have needed;
 - a default cooldown bound; the setting stays, off by default;
@@ -933,8 +928,7 @@ All use loopback provider fixtures with synthetic tokens, in
   before it takes the rate gate. Another caller's 429 records a cooldown under that
   gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
 - **Complete-item release:** no event of a half-finished item reaches the caller.
-  Item events release in arrival order only after the done event. Interleaved fields
-  scrub independently in every declared encoding and at every character split.
+  Item events release in arrival order only after the done event.
 - **Held-item bound:** an item exceeding `max_held_event_bytes` yields a visible error.
 - **Continue and join:** listed failed events and premature disconnects replay every
   complete item exactly, including encrypted reasoning. Partial items are discarded.
@@ -971,9 +965,8 @@ All use loopback provider fixtures with synthetic tokens, in
 
 ## Implementation size
 
-`ESTIMATE`, from the closest existing code: about 3 500 lines in
-`symbiotic-credential-process`. Login source, store and import about 700; passthrough
-socket, parser and admission about 700; scrubber and dialects about 500; usage reader
+`ESTIMATE`, from the closest existing code: login source, store and import about
+700; passthrough socket, parser and admission about 700; usage reader
 about 150; configuration and validation about 150; tests about 1 300. Plus one
 sentence in `boundary.md` and a new architecture section at closeout.
 
