@@ -15,7 +15,7 @@ APIs still require changes to meet that contract.
 
 ```mermaid
 flowchart TB
-    Core["symbiotic-core\nids, labels, tiny vocabulary"]
+    Core["symbiotic-core\nids, labels, retry policy"]
     Queue["symbiotic-queue\ndurable work contracts"]
     Trace["symbiotic-trace\ninvocation traces and sinks"]
     Model["symbiotic-model\nprovider-neutral model contracts"]
@@ -39,7 +39,7 @@ flowchart TB
 
 ### `symbiotic-core`
 
-Owns only tiny stable vocabulary:
+Owns tiny stable vocabulary and the dependency-light `retry` module:
 
 - `TraceId`
 - `QueueId`
@@ -48,6 +48,11 @@ Owns only tiny stable vocabulary:
 - `RoleBinding`
 - `InvocationSource`
 - `ModelTier`
+
+`retry` exposes `parse_retry_after`, `backoff_ms`, and `delay_ms` with plain
+inputs. It uses `httpdate` for dates and `thiserror` for typed errors; it has no
+HTTP client, async runtime, queue, or database dependency. `symbiotic-model`
+adapts HTTP headers and queue identities to this shared policy.
 
 It must not accumulate product behavior. Existing policy vocabulary outside the
 [boundary contract](architecture/boundary.md) is pending cleanup.

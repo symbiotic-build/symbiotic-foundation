@@ -18,7 +18,6 @@ async-trait.workspace = true
 base64 = "0.22"
 chrono.workspace = true
 hex.workspace = true
-httpdate = "1"
 reqwest.workspace = true
 serde.workspace = true
 # Preserve literal provider costs before converting them to exact decimal strings.

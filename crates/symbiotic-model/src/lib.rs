@@ -3216,18 +3216,7 @@ fn is_retryable(err: &ModelError, config: &ModelQueueConfig) -> bool {
         || (config.retry_provider_errors && matches!(err.primary(), ModelError::Provider(_)))
 }
 
-/// Backoff before jitter: the base delay doubling per attempt up to 32x,
-/// capped at 30 s (or at the base, if that is longer).
-#[cfg(feature = "queue")]
-fn retry_backoff_ms(attempt: u32, base_ms: u64) -> u64 {
-    let base_ms = base_ms.max(1);
-    base_ms
-        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1).min(5)))
-        .min(30_000.max(base_ms))
-}
-
-/// Delay before the next attempt: backoff plus deterministic jitter, at most
-/// two minutes.
+/// Adapt queue identity and error kind to the shared retry policy's seed.
 #[cfg(feature = "queue")]
 fn retry_delay_ms(
     attempt: u32,
@@ -3236,18 +3225,27 @@ fn retry_delay_ms(
     request_hash: &str,
     err: &ModelError,
 ) -> Result<u64, ModelError> {
-    Ok(retry_backoff_ms(attempt, config.retry_base_delay_ms)
-        .saturating_add(
-            retry_jitter_seconds(
-                config.retry_jitter_seconds,
-                item_id,
-                request_hash,
-                attempt,
-                err,
-            )?
-            .saturating_mul(1_000),
-        )
-        .clamp(1, 120_000))
+    let err_kind = match err.primary() {
+        ModelError::RateLimited(_) => "rate_limited",
+        ModelError::Unavailable(_) => "unavailable",
+        ModelError::Timeout(_) => "timeout",
+        _ => "other",
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(item_id.0.as_bytes());
+    hasher.update(request_hash.as_bytes());
+    hasher.update(attempt.to_le_bytes());
+    hasher.update(err_kind.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    symbiotic_core::retry::delay_ms(
+        attempt,
+        config.retry_base_delay_ms,
+        config.retry_jitter_seconds,
+        u64::from_le_bytes(bytes),
+    )
+    .map_err(|_| ModelError::InvalidRequest(DiagnosticCode::InvalidConfiguration))
 }
 
 #[cfg(test)]
@@ -3266,39 +3264,6 @@ fn retry_after_seconds(
     retry_delay_ms(attempt, &config, item_id, request_hash, err)
         .unwrap()
         .div_ceil(1_000)
-}
-
-#[cfg(feature = "queue")]
-fn retry_jitter_seconds(
-    max_jitter_seconds: u64,
-    item_id: &QueueItemId,
-    request_hash: &str,
-    attempt: u32,
-    err: &ModelError,
-) -> Result<u64, ModelError> {
-    if max_jitter_seconds == 0 {
-        return Ok(0);
-    }
-    let err_kind = match err.primary() {
-        ModelError::RateLimited(_) => "rate_limited",
-        ModelError::Unavailable(_) => "unavailable",
-        ModelError::Timeout(_) => "timeout",
-        _ => "other",
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(item_id.0.as_bytes());
-    hasher.update(request_hash.as_bytes());
-    hasher.update(attempt.to_le_bytes());
-    hasher.update(err_kind.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    let range = max_jitter_seconds
-        .checked_add(1)
-        .ok_or(ModelError::InvalidRequest(
-            symbiotic_core::DiagnosticCode::InvalidConfiguration,
-        ))?;
-    Ok(u64::from_le_bytes(bytes) % range)
 }
 
 /// Whether a request another call exhausted (or that was exhausted before a
@@ -4844,13 +4809,7 @@ fn parse_retry_after(
 ) -> Result<u64, ModelError> {
     let invalid = || ModelError::Provider(DiagnosticCode::InvalidResponse);
     let text = header.to_str().map_err(|_| invalid())?;
-    if text.bytes().all(|byte| byte.is_ascii_digit()) && !text.is_empty() {
-        return text.parse().map_err(|_| invalid());
-    }
-    let deadline: chrono::DateTime<Utc> = httpdate::parse_http_date(text)
-        .map_err(|_| invalid())?
-        .into();
-    Ok((deadline.timestamp() - now.timestamp()).max(0) as u64)
+    symbiotic_core::retry::parse_retry_after(text, now.timestamp()).map_err(|_| invalid())
 }
 
 fn is_known_finish_reason(reason: &str) -> bool {
@@ -6298,12 +6257,12 @@ mod tests {
     #[cfg(feature = "queue")]
     #[test]
     fn retry_backoff_doubles_from_the_base_and_caps() {
-        assert_eq!(retry_backoff_ms(1, 1_000), 1_000);
-        assert_eq!(retry_backoff_ms(2, 1_000), 2_000);
-        assert_eq!(retry_backoff_ms(6, 1_000), 30_000);
-        assert_eq!(retry_backoff_ms(1, 250), 250);
-        assert_eq!(retry_backoff_ms(3, 250), 1_000);
-        assert_eq!(retry_backoff_ms(9, 250), 8_000);
+        assert_eq!(symbiotic_core::retry::backoff_ms(1, 1_000), 1_000);
+        assert_eq!(symbiotic_core::retry::backoff_ms(2, 1_000), 2_000);
+        assert_eq!(symbiotic_core::retry::backoff_ms(6, 1_000), 30_000);
+        assert_eq!(symbiotic_core::retry::backoff_ms(1, 250), 250);
+        assert_eq!(symbiotic_core::retry::backoff_ms(3, 250), 1_000);
+        assert_eq!(symbiotic_core::retry::backoff_ms(9, 250), 8_000);
     }
 
     #[cfg(feature = "queue")]

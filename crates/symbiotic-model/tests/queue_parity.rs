@@ -3514,6 +3514,7 @@ struct ReferenceIds {
     refusal: Mutex<Option<Failure>>,
     advertise_at_enqueue: bool,
     fail_settlement: bool,
+    prior_attempts: u32,
 }
 
 impl ReferenceIds {
@@ -3525,6 +3526,7 @@ impl ReferenceIds {
             refusal: Mutex::new(None),
             advertise_at_enqueue,
             fail_settlement,
+            prior_attempts: 0,
         }
     }
 
@@ -3541,6 +3543,28 @@ impl ReferenceIds {
 impl QueueBackend for ReferenceIds {
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         let mut outcome = self.inner.enqueue(request).await?;
+        if self.prior_attempts > 0 {
+            // Seed failed attempts through the real backend, with deadlines already
+            // elapsed so only the target provider attempt needs to run.
+            for _ in 0..self.prior_attempts {
+                self.inner
+                    .claim_item(&outcome.item.item_id, "fixture", 60, Some(1))
+                    .await?
+                    .expect("prior attempt is ready");
+                self.inner
+                    .fail_with(
+                        &outcome.item.item_id,
+                        "fixture",
+                        Failure {
+                            error: symbiotic_core::DiagnosticCode::HttpUnavailable,
+                            error_class: Some(symbiotic_core::FailureClass::Provider),
+                            run_after: Some(Utc::now() - chrono::Duration::seconds(1)),
+                        },
+                    )
+                    .await?;
+            }
+            outcome.item = self.inner.get_item(&outcome.item.item_id).await?.unwrap();
+        }
         *self.original_id.lock().unwrap() = Some(outcome.item.item_id.clone());
         if self.advertise_at_enqueue {
             outcome.item.item_id = self.reference_id.clone();
@@ -3573,7 +3597,13 @@ impl QueueBackend for ReferenceIds {
     }
 
     async fn get_item(&self, item_id: &QueueItemId) -> Result<Option<QueueItem>, QueueError> {
-        self.inner.get_item(&self.stored_id(item_id)).await
+        let mut item = self.inner.get_item(&self.stored_id(item_id)).await?;
+        if self.advertise_at_enqueue
+            && let Some(item) = &mut item
+        {
+            item.item_id = self.reference_id.clone();
+        }
+        Ok(item)
     }
     async fn heartbeat(
         &self,
@@ -3625,6 +3655,142 @@ impl QueueBackend for ReferenceIds {
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
         self.inner.reclaim_expired_leases(queue_id).await
     }
+}
+
+#[tokio::test]
+async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
+    use symbiotic_core::DiagnosticCode;
+    use symbiotic_model::{SpendLedger, SpendReceiptRef, SpendReservation, SpendState};
+
+    // Apply the pre-extraction policy (90d3c27, lib.rs:6290-6337) to
+    // item-a and the serialized request("retry compatibility"). Its request
+    // hash differs from that private test's literal "same-request-shape".
+    // Preserve attempts 1, 2 and 7 with a 1 000 ms base and 0..=20 s jitter.
+    let mut scenarios = Vec::new();
+    for (error, expected) in [
+        (
+            ModelError::RateLimited(DiagnosticCode::HttpRateLimited),
+            &[(1, 6_000), (2, 20_000), (7, 46_000)][..],
+        ),
+        (
+            ModelError::Unavailable(DiagnosticCode::HttpUnavailable),
+            &[(1, 16_000), (2, 5_000), (7, 49_000)][..],
+        ),
+        (
+            ModelError::Provider(DiagnosticCode::ProviderFailure),
+            &[(1, 17_000), (2, 21_000), (7, 45_000)][..],
+        ),
+        (
+            // Bare timeouts have uncertain spend and do not retry. This
+            // synthetic HTTP failure carries the fixture's known-zero charge.
+            ModelError::Http {
+                primary: Box::new(ModelError::Timeout(DiagnosticCode::HttpTimeout)),
+                status: 408,
+                retry_after_seconds: None,
+            },
+            &[(1, 14_000)][..],
+        ),
+    ] {
+        for &(attempt, expected_ms) in expected {
+            for wrapped in [false, true] {
+                let error = if wrapped {
+                    ModelError::Diagnostics {
+                        primary: Box::new(ModelError::Http {
+                            primary: Box::new(error.clone()),
+                            status: 503,
+                            retry_after_seconds: None,
+                        }),
+                        secondary: vec![DiagnosticCode::StorageFailure],
+                    }
+                } else {
+                    error.clone()
+                };
+                scenarios.push(async move {
+                    let mut backend = ReferenceIds::new("item-a".into(), true, false);
+                    backend.prior_attempts = attempt - 1;
+                    let backend = Arc::new(backend);
+                    let raw = Loopback::new(unique_identity()).failing_first(vec![error]);
+                    let spend = ObservedSpend::new(Duration::ZERO);
+                    // Match the queued runtime's implicit invocation identity.
+                    let input = request("retry compatibility");
+                    let request_hash = symbiotic_model::configuration_revision(&input).unwrap().0;
+                    let mut descriptor = raw.descriptor().clone();
+                    descriptor.metadata =
+                        json!({"configuration": descriptor.metadata, "binding": null});
+                    let binding = symbiotic_model::configuration_revision(&(
+                        "chat",
+                        &descriptor,
+                        Option::<symbiotic_core::BindingIdentity>::None,
+                        &request_hash,
+                    ))
+                    .unwrap()
+                    .0;
+                    for prior in 1..attempt {
+                        let reference =
+                            SpendReceiptRef::new(format!("runtime:item-a:{prior}")).unwrap();
+                        assert!(
+                            spend
+                                .reserve(&SpendReservation {
+                                    reference: reference.clone(),
+                                    account: descriptor.queue_id().0,
+                                    invocation: binding.clone(),
+                                    binding: binding.clone(),
+                                    request_limit: None,
+                                })
+                                .unwrap()
+                        );
+                        // A known-zero provider failure still consumes an attempt.
+                        spend
+                            .finish(&reference, SpendState::Released, None, None, None)
+                            .unwrap();
+                    }
+                    let provider = QueuedChatProvider::new(
+                        raw.clone(),
+                        backend.clone(),
+                        "worker",
+                        ModelQueueConfig {
+                            logical_retry_attempts: attempt,
+                            retry_attempts: attempt,
+                            retry_base_delay_ms: 1_000,
+                            retry_jitter_seconds: 20,
+                            retry_provider_errors: true,
+                            ..config()
+                        },
+                    )
+                    .with_spend_ledger(spend, None);
+                    let before = Utc::now();
+                    let started = Instant::now();
+                    provider
+                        .chat(request("retry compatibility"))
+                        .await
+                        .unwrap_err();
+                    let after = Utc::now();
+                    // Bound the target failure from its provider start.
+                    let last_start = *raw.starts.lock().unwrap().last().unwrap();
+                    let before = before
+                        + chrono::Duration::from_std(last_start.duration_since(started)).unwrap();
+                    let item = backend
+                        .get_item(&QueueItemId("item-a".into()))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let delay = chrono::Duration::milliseconds(expected_ms);
+                    assert_eq!(item.attempt, attempt, "wrapped={wrapped}: {item:?}");
+                    assert_eq!(
+                        item.status,
+                        QueueStatus::Dead,
+                        "attempt={attempt}, expected {expected_ms} ms, wrapped={wrapped}: {item:?}"
+                    );
+                    assert!(
+                        (before + delay..=after + delay).contains(&item.run_after),
+                        "attempt={attempt}, expected {expected_ms} ms, wrapped={wrapped}: {before} <= start <= {after}, deadline={}",
+                        item.run_after,
+                    );
+                });
+            }
+        }
+    }
+    futures::future::join_all(scenarios).await;
 }
 
 #[tokio::test]

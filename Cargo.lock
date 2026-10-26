@@ -1440,7 +1440,9 @@ dependencies = [
 name = "symbiotic-core"
 version = "0.2.0"
 dependencies = [
+ "httpdate",
  "serde",
+ "thiserror",
  "uuid",
 ]
 
@@ -1502,7 +1504,6 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "httpdate",
  "libc",
  "reqwest",
  "rusqlite",
