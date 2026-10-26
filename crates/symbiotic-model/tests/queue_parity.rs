@@ -3514,6 +3514,7 @@ struct ReferenceIds {
     refusal: Mutex<Option<Failure>>,
     advertise_at_enqueue: bool,
     fail_settlement: bool,
+    prior_attempts: u32,
 }
 
 impl ReferenceIds {
@@ -3525,6 +3526,7 @@ impl ReferenceIds {
             refusal: Mutex::new(None),
             advertise_at_enqueue,
             fail_settlement,
+            prior_attempts: 0,
         }
     }
 
@@ -3541,6 +3543,28 @@ impl ReferenceIds {
 impl QueueBackend for ReferenceIds {
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         let mut outcome = self.inner.enqueue(request).await?;
+        if self.prior_attempts > 0 {
+            // Seed failed attempts through the real backend, with deadlines already
+            // elapsed so only the target provider attempt needs to run.
+            for _ in 0..self.prior_attempts {
+                self.inner
+                    .claim_item(&outcome.item.item_id, "fixture", 60, Some(1))
+                    .await?
+                    .expect("prior attempt is ready");
+                self.inner
+                    .fail_with(
+                        &outcome.item.item_id,
+                        "fixture",
+                        Failure {
+                            error: symbiotic_core::DiagnosticCode::HttpUnavailable,
+                            error_class: Some(symbiotic_core::FailureClass::Provider),
+                            run_after: Some(Utc::now() - chrono::Duration::seconds(1)),
+                        },
+                    )
+                    .await?;
+            }
+            outcome.item = self.inner.get_item(&outcome.item.item_id).await?.unwrap();
+        }
         *self.original_id.lock().unwrap() = Some(outcome.item.item_id.clone());
         if self.advertise_at_enqueue {
             outcome.item.item_id = self.reference_id.clone();
@@ -3636,6 +3660,7 @@ impl QueueBackend for ReferenceIds {
 #[tokio::test]
 async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
     use symbiotic_core::DiagnosticCode;
+    use symbiotic_model::{SpendLedger, SpendReceiptRef, SpendReservation, SpendState};
 
     // Apply the pre-extraction policy (90d3c27, lib.rs:6290-6337) to
     // item-a and the serialized request("retry compatibility"). Its request
@@ -3681,12 +3706,48 @@ async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
                     error.clone()
                 };
                 scenarios.push(async move {
-                    let backend = Arc::new(ReferenceIds::new("item-a".into(), true, false));
-                    let raw = Loopback::new(unique_identity())
-                        .failing_first(vec![error; attempt as usize]);
-                    let provider = queued(
+                    let mut backend = ReferenceIds::new("item-a".into(), true, false);
+                    backend.prior_attempts = attempt - 1;
+                    let backend = Arc::new(backend);
+                    let raw = Loopback::new(unique_identity()).failing_first(vec![error]);
+                    let spend = ObservedSpend::new(Duration::ZERO);
+                    // Match the queued runtime's implicit invocation identity.
+                    let input = request("retry compatibility");
+                    let request_hash = symbiotic_model::configuration_revision(&input).unwrap().0;
+                    let mut descriptor = raw.descriptor().clone();
+                    descriptor.metadata =
+                        json!({"configuration": descriptor.metadata, "binding": null});
+                    let binding = symbiotic_model::configuration_revision(&(
+                        "chat",
+                        &descriptor,
+                        Option::<symbiotic_core::BindingIdentity>::None,
+                        &request_hash,
+                    ))
+                    .unwrap()
+                    .0;
+                    for prior in 1..attempt {
+                        let reference =
+                            SpendReceiptRef::new(format!("runtime:item-a:{prior}")).unwrap();
+                        assert!(
+                            spend
+                                .reserve(&SpendReservation {
+                                    reference: reference.clone(),
+                                    account: descriptor.queue_id().0,
+                                    invocation: binding.clone(),
+                                    binding: binding.clone(),
+                                    request_limit: None,
+                                })
+                                .unwrap()
+                        );
+                        // A known-zero provider failure still consumes an attempt.
+                        spend
+                            .finish(&reference, SpendState::Released, None, None, None)
+                            .unwrap();
+                    }
+                    let provider = QueuedChatProvider::new(
                         raw.clone(),
                         backend.clone(),
+                        "worker",
                         ModelQueueConfig {
                             logical_retry_attempts: attempt,
                             retry_attempts: attempt,
@@ -3695,7 +3756,8 @@ async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
                             retry_provider_errors: true,
                             ..config()
                         },
-                    );
+                    )
+                    .with_spend_ledger(spend, None);
                     let before = Utc::now();
                     let started = Instant::now();
                     provider
@@ -3703,8 +3765,7 @@ async fn queued_retry_deadlines_preserve_pre_extraction_delays() {
                         .await
                         .unwrap_err();
                     let after = Utc::now();
-                    // Earlier retries wait for real deadlines. Bound the last
-                    // failure from its provider start, not the whole call's start.
+                    // Bound the target failure from its provider start.
                     let last_start = *raw.starts.lock().unwrap().last().unwrap();
                     let before = before
                         + chrono::Duration::from_std(last_start.duration_since(started)).unwrap();
