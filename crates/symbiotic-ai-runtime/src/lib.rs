@@ -966,6 +966,124 @@ impl Runtime {
     }
 }
 
+/// Access to the runtime's existing account slot, pacing and durable cooldown.
+/// No queue item, retry scheduler, cache or spend receipt is created by this handle.
+#[derive(Clone)]
+pub struct AccountAdmission {
+    runtime: Runtime,
+    queue_id: QueueId,
+    policy: ModelQueueConfig,
+}
+
+impl Runtime {
+    /// Register an undecoded transport with the same limits as typed account bindings.
+    /// Typed bindings sharing this account must leave input and provider-request limits unset.
+    pub fn account_admission(
+        &self,
+        identity: &BindingIdentity,
+        sharing: Option<&AccountSharingKey>,
+        policy: ModelQueueConfig,
+    ) -> Result<AccountAdmission, ModelError> {
+        policy.validate()?;
+        let queue_id = QueueId::new(account_scope(identity, sharing)?);
+        // Undecoded requests have no typed estimate or per-request spend limit.
+        // A shared typed binding must use the same supported account policy.
+        let existing = self
+            .inner
+            .limits
+            .lock()
+            .map_err(|_| {
+                ModelError::Queue(symbiotic_core::DiagnosticCode::RuntimePolicyLockPoisoned)
+            })?
+            .get(&queue_id.0)
+            .cloned();
+        if existing.as_ref().is_some_and(|limits| {
+            limits.input_units_per_minute.is_some() || limits.provider_request_limit.is_some()
+        }) || policy.input_units_per_minute.is_some()
+            || policy.provider_request_limit.is_some()
+        {
+            return Err(ModelError::InvalidRequest(
+                symbiotic_core::DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        self.register_limits(&queue_id, &policy)?;
+        Ok(AccountAdmission {
+            runtime: self.clone(),
+            queue_id,
+            policy,
+        })
+    }
+}
+
+impl AccountAdmission {
+    /// Observe cooldown writes in this runtime, including typed-provider writes.
+    /// Re-read durable account state after each notification.
+    pub fn subscribe_cooldowns(&self) -> tokio::sync::watch::Receiver<()> {
+        self.runtime.inner.rate_state.subscribe_cooldowns()
+    }
+
+    /// Wait in the runtime's FIFO slot gate. Cancellation removes this waiter.
+    pub async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ModelError> {
+        self.runtime
+            .inner
+            .admission
+            .acquire(&self.queue_id, self.policy.max_in_flight)
+            .await
+    }
+
+    /// Check cooldown and pacing under the runtime's existing account rate gate.
+    pub async fn request_admission(&self) -> Result<model::ModelRequestAdmission, ModelError> {
+        self.runtime
+            .inner
+            .rate_state
+            .request_admission(
+                self.runtime.inner.queue.as_ref(),
+                &self.queue_id,
+                &self.policy,
+            )
+            .await
+    }
+
+    /// Order a shared admission state change against typed and passthrough sends.
+    pub async fn send_gate(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, ModelError> {
+        self.runtime
+            .inner
+            .rate_state
+            .send_gate(&self.queue_id)
+            .await
+    }
+
+    /// Read the account deadline from the runtime queue backend, including after restart.
+    pub async fn cooldown_until(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ModelError> {
+        self.runtime
+            .inner
+            .queue
+            .cooldown_until(&self.queue_id)
+            .await
+            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+    }
+
+    /// Extend the account deadline in the same durable backend used by typed calls.
+    pub async fn note_cooldown(
+        &self,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ModelError> {
+        self.runtime
+            .inner
+            .rate_state
+            .note_cooldown(self.runtime.inner.queue.as_ref(), &self.queue_id, until)
+            .await
+            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))
+    }
+
+    /// Account retry backoff base, in milliseconds.
+    pub fn retry_base_delay_ms(&self) -> u64 {
+        self.policy.retry_base_delay_ms
+    }
+}
+
 struct Bound {
     queue: Arc<dyn QueueBackend>,
     worker_id: String,

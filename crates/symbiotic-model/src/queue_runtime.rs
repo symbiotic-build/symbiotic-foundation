@@ -57,7 +57,8 @@ impl ModelAdmission {
         self.gate(queue_id, max_in_flight).map(|_| ())
     }
 
-    pub(crate) async fn acquire(
+    /// Wait for a shared FIFO account slot; dropping the future cancels the wait.
+    pub async fn acquire(
         &self,
         queue_id: &QueueId,
         max_in_flight: usize,

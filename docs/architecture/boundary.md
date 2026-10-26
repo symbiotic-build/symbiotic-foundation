@@ -277,6 +277,8 @@ recovery deadline is defined by
 
 ## Supported modes and trusted channels
 
+Passthrough routes serve trusted same-UID hosts outside Memory's data authorization.
+
 Foundation supports embedded and service use, local and remote provider bindings,
 and keyless providers. Model execution does not require end-user login. Provider
 authentication (such as an API key) is distinct from gateway authentication of callers.

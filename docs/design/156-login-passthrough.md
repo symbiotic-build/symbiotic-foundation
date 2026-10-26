@@ -47,24 +47,33 @@ The lead decided on 2026-10-26:
   send against cooldown recording. First sends and resends take the gate, re-read
   the cooldown, charge pacing, start the send and release the gate. Recording a
   cooldown after a 429 takes the same gate (§Admission).
-- **Candidate-suffix retention:** after matching completed credentials in each
-  open delta field's decoded text, the unresolved tail is its longest suffix that
-  is a proper prefix of a protected encoded credential variant. It is empty when
-  no suffix qualifies. Its byte length is below `L`, the longest variant's byte
-  length. Only events with delta bytes in an unresolved tail hold later events
-  in arrival order; an empty tail holds nothing (§Scrubbing).
-  Implementation reworks the stream module from the scrubber PR to this design
-  and closes [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161).
-- **One hold limit, a provisional route setting:** `max_held_event_bytes` defaults
-  to 67 108 864 with a Serde default. It is a positive byte limit on held event
-  envelopes per stream. A field stalled inside a genuine credential prefix can
-  hold later events from interleaved fields. Matching text per field is bounded
-  by its actual unresolved tail, below `L` bytes, plus one delta (§Scrubbing).
-  The default is provisional under the
-  [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings),
-  not a measured maximum. Exceeding it ends the stream with a visible error.
-  `rate_burst_seconds` also defaults to 0 with `#[serde(default)]`, so existing
-  configurations stay valid.
+- **One item bound:** `max_held_event_bytes` defaults to 67 108 864 with a
+  Serde default. It bounds the events retained for one unfinished output item.
+  Exceeding it ends the stream with a visible error. `rate_burst_seconds` defaults
+  to zero. Both defaults preserve existing configurations.
+
+## Operator decisions on 2026-10-26
+
+These decisions replace resend-only retries and upstream hang-up behavior in the
+original record.
+
+- Adapters classify failures. One configurable policy table chooses retry, switch
+  or fail. One shared queue engine owns backoff before and during an answer.
+- Output-item events wait for `response.output_item.done`. Half-finished items
+  never reach the caller.
+- No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+  The corresponding Warden matching-filter removal is tracked by
+  [warden#493](https://github.com/symbiotic-build/warden/issues/493).
+- A handled mid-answer failure discards the partial item and continues with every
+  completed output item replayed exactly, including opaque encrypted reasoning.
+  Attempts join into one downstream answer. Completed interleaved items survive
+  discarding another partial item.
+- Waiting and handled retries appear in sanitized route health. Request identifiers
+  and policy selectors are local headers and never reach the provider.
+- Optional new-session holds isolate new-session refusals from traffic in sessions
+  already admitted. Reset timing always comes from Retry-After or shared backoff.
+- Recognized provider rate-limit headers are forwarded and recorded on every status,
+  including success. Promotional headers are excluded.
 
 ## Problem
 
@@ -135,9 +144,8 @@ account (two or three streams to start).
 - **Maximum cooldown wait:** `max_queue_wait_seconds`, an optional route setting, off
   by default. When set, a request that has waited that long for cooldowns gets 429
   with the remaining cooldown. Waiting for a free slot never counts against it.
-- **Stream dialect:** which provider event format a route streams, so the scrubber
-  and usage reader know where text and usage are. Two exist: OpenAI Responses and
-  OpenAI Chat Completions.
+- **Stream dialect:** which provider event format a route streams. Only OpenAI
+  Responses has an item-stream adapter in this step.
 
 ## Walkthrough
 
@@ -291,15 +299,14 @@ configured, the process publishes one entry per route and a top-level `updated_a
 in Unix seconds:
 
 ```json
-{"updated_at":1792000000,"routes":[{"name":"codex_responses","login":"ok","expires_at":1793000000,"cooldown_until":null}]}
+{"version":1,"state":"running","updated_at":1792000000,"routes":[{"name":"codex_responses","login":"ok","expires_at":1793000000,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null}]}
 ```
 
 `login` is `ok`, `expiring` (expires within two days), `renewal_failed` or
 `login_required`; static-key routes report `static` with `expires_at: null`.
-On a clean stop (SIGTERM or SIGINT), every route reports `stopping` before the
+On a clean stop (SIGTERM or SIGINT), the top-level `state` is `stopping` before the
 process closes its socket.
-The file contains only route names, these fixed login states, expiry and cooldown
-times, and `updated_at`. It contains no credential, path or provider text.
+The file contains route names, fixed login states, expiry, cooldown and new-session hold times, retry counters, waiting identifiers and safe rate-limit headers, and `updated_at`. It contains no credential, path or provider text.
 
 The process writes at startup, on every state change, and at least every 10 s.
 Each publication uses a temporary file in the destination directory, sync, rename,
@@ -336,6 +343,8 @@ pub struct PassthroughConfig {
     /// Maximum concurrent passthrough connections, including waiting ones.
     pub max_connections: usize,
     pub routes: Vec<PassthroughRoute>,
+    #[serde(default)]
+    pub retry_policies: HashMap<String, RetryPolicy>,
 }
 
 pub struct PassthroughRoute {
@@ -360,7 +369,7 @@ pub struct PassthroughRoute {
     pub return_headers: Vec<String>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
-    /// Provisional hard byte limit on held event envelopes per stream; positive.
+    /// Provisional hard byte limit on held event envelopes per item; positive.
     #[serde(default = "default_max_held_event_bytes")]
     pub max_held_event_bytes: usize,
     /// Existing account policy fields, shared with typed routes on the same account.
@@ -375,6 +384,14 @@ pub struct PassthroughRoute {
     pub max_queue_wait_seconds: Option<u64>,
     /// Longest silence between two upstream bytes; there is no total deadline.
     pub idle_timeout_seconds: u64,
+    #[serde(default)]
+    pub error_classes: HashMap<String, ErrorClass>,
+    #[serde(default)]
+    pub retry_policy: RetryPolicy,
+    #[serde(default)]
+    pub fallback_routes: Vec<String>,
+    #[serde(default)]
+    pub new_session: Option<NewSessionConfig>,
 }
 
 #[serde(rename_all = "snake_case")]
@@ -455,19 +472,17 @@ the answer. This extends the existing runtime mechanism; it adds no scheduler.
    credential headers and reserve one request in the spend ledger. Immediately
    charge pacing, send the body unchanged and release the gate.
    - Every send is charged, including resends after a 429 or a login's first 401.
-9. **On a 429 before any response byte reaches the caller:** take the rate gate and
-   record the cooldown, then release the gate, record a `rate_limited` receipt, and
-   return to step 4 with the same body and slot.
+9. **Classify a failure:** apply the adapter mapping and route extensions, then
+   the selected policy table. Retry returns to admission with the same slot;
+   new-session holds release the slot so established sessions can proceed.
 
-The slot is held until the response stream ends, fails or the caller disconnects.
-A caller disconnect cancels the upstream request. Requests remain concurrent up to
-`max_in_flight`; a limit of two permits two streams, without serialization.
-Requests already sent before the cooldown is recorded may also receive 429. Each
-such request follows step 9 and waits out the shared cooldown before being resent.
+The slot remains held through each ordinary retry and the complete answer. Caller
+disconnect cancels all work. Every send, including a continuation, repeats cooldown,
+credential and pacing admission. No waiting request creates a spend reservation.
 
 **Responses.**
 
-- **2xx:** streamed to the caller through the scrubber. The process sets
+- **2xx:** streamed to the caller. The process sets
   `Content-Type` to the validated format, `text/event-stream` or `application/json`;
   any other upstream type, or a compressed body, ends the response with an error.
   A family whose endpoint omits the type on its event stream (the ChatGPT Codex
@@ -479,13 +494,77 @@ such request follows step 9 and waits out the shared cooldown before being resen
   fresh import; later requests get 503 `credential_unavailable` at admission.
 - **401 on a static-key route:** returns a locally generated fixed 401, with no
   upstream header, renewal or resend.
-- **429:** sets the account cooldown, and the request waits and is resent (step 9).
-  This also applies to every request already in flight when the cooldown is recorded.
-  After the cooldown is recorded, no new request is sent until it ends.
-  The caller receives 429 only when its `max_queue_wait_seconds` is reached; then it
-  has a fixed body and the locally computed `Retry-After` (§Returned headers).
-- **Other non-2xx:** the status is forwarded with a fixed body. The upstream body is
-  discarded because it can echo tokens. All headers follow §Returned headers.
+- **Other failures:** classification and the policy below determine whether to
+  retry, switch or return the fixed status/body. A mid-answer fail action ends the
+  downstream stream with the original error event.
+
+**Retry policy.** The Responses adapter maps 429 and `server_is_overloaded`,
+`rate_limit_exceeded` and `slow_down` to `throttle`. DNS, connect, TLS, reset and EOF
+failures map to `network`. Other 5xx map to `server`. Authentication, invalid input,
+context length, content refusal and exhausted quota map to `final`.
+`error_classes` extends this mapping by provider code.
+
+The default table is:
+
+| Class | Action | Maximum attempts |
+|---|---|---|
+| `throttle` | `retry_same` | unlimited |
+| `network` | `retry_same` | unlimited |
+| `server` | `retry_same` | 3 |
+| `final` | `fail` | not applicable |
+
+`retry_policy` supplies per-class overrides. Each rule has `action`, optional
+`max_attempts` (absent means unlimited), and `backoff`. `backoff.base_delay_ms`,
+when absent, uses the account's runtime base. Backoff always uses
+`symbiotic_core::retry`; it has no independent retry implementation. A usable
+HTTP Retry-After takes precedence. Failure increments the shared account's
+consecutive-failure count; the next successful completion resets it.
+`max_queue_wait_seconds` still bounds cumulative cooldown waits.
+
+`switch` tries the next name in `fallback_routes` through that route's normal
+admission. The default list is empty; exhaustion acts as `fail`.
+`PassthroughConfig.retry_policies` defaults to an empty map. The caller can select
+one named table through `x-symbiotic-retry-policy`. An unknown name receives 400.
+The header is never forwarded. A selected named rule overrides the route's rule
+for that class. Embedded users may supply one nonserializable hook:
+
+```rust
+pub type RetryHook = Arc<dyn Fn(&RetryContext) -> Option<RetryDecision> + Send + Sync>;
+```
+
+`RetryContext` carries class, provider code, attempt number, whether bytes reached
+the caller and route name. `None` delegates to the table. Hook decisions use the
+same attempt limit, cooldown and backoff engine.
+
+**Waiting visibility.** A caller may supply `x-symbiotic-request-id`, containing
+1–64 printable ASCII bytes. It never reaches the provider. While that request
+waits, route health lists `{request_id, reason, since}`. `reason` is `slot`,
+`cooldown` or `new_session`; `since` is Unix seconds. Requests without an identifier
+are not listed. Cancellation removes the entry. Responses carry the local
+`x-symbiotic-queue-waited-ms` total before their first byte.
+
+**New-session admission.** `new_session`, absent by default, contains
+`session_headers`. Their value tuple identifies the session; missing members keep
+their position. A tuple absent from the route's seen set is new. Missing every
+configured header disables new-session treatment. A first 2xx marks a tuple seen.
+The in-memory set retains at most 100 000 tuples, evicts the oldest first and
+forgets tuples after 24 h. The Codex Responses route sets this fragment:
+
+```json
+{"new_session":{"session_headers":["session-id"]}}
+```
+
+It lists `session-id` alone. A host that runs several agent threads in one session,
+as the tool does for its own sub-agents, shares one `session-id` across them while each
+keeps its own `thread-id`. Counting threads would make every one of them a new session.
+
+Without a hold, all new-session calls proceed freely under ordinary account limits.
+A new-session 429 with retry action sets a login-wide new-session hold from
+Retry-After or shared backoff. It does not set the account cooldown. New-session
+requests release their slots and wait; seen-session traffic continues normally.
+After the hold, one new-session probe is in flight until a new session gets 2xx.
+That success opens admission; another 429 extends the hold. Health reports
+`new_session_hold_until` as Unix seconds or null. Restart clears this memory-only state.
 
 **Forwarded request headers.** The route copies the caller headers named in
 `forward_headers`, with their values unchanged, and drops all others. Agent tools put
@@ -502,18 +581,16 @@ Configuration validation refuses `authorization`, `cookie`, `host`, `content-len
 `forward_headers`; the credential process owns those credential or transport headers.
 
 **Returned headers.** A response carrying a provider answer, of any status, carries
-only the route's `return_headers` that the provider sent, plus the rate-limit
-allowlist below on 429 and 503. No other upstream header is relayed. Non-2xx bodies
+only the route's `return_headers` that the provider sent, plus recognized provider rate-limit headers on every status. No other upstream header is relayed. Non-2xx bodies
 are fixed. Agent tools read some of them back on their next request; for example the
 Codex CLI keeps `x-codex-turn-state` and sends it again, so later requests of a turn
 reach the same provider state. Each value must be 1 to 8 192 bytes of printable
-ASCII and must not contain a credential the scrubber knows; otherwise that header
+ASCII and must not contain a known credential; otherwise that header
 is dropped. The
 response to a request that waited and was resent after a 429 carries the headers of
 the final provider answer.
 
-Allowlisted headers on 429 and 503 are `retry-after`, `x-ratelimit-*`, and the
-family's documented rate-limit headers. Their values must be ASCII without control
+On 429 and 503, `retry-after` and `x-ratelimit-*` are also allowed. On every status, the Responses adapter recognizes `x-<family>-limit-name` and the primary/secondary used-percent, window-minutes and reset-at fields, with hyphenated family names. It also recognizes `x-codex-credits-has-credits`, `x-codex-credits-unlimited`, `x-codex-credits-balance` and `x-codex-rate-limit-reached-type`. It excludes `x-codex-promo-message` and every other unsupported field. Their values must be ASCII without control
 characters and at most 256 bytes each, or they are dropped.
 
 Locally generated responses carry no upstream header: 404 `route_not_found`,
@@ -543,59 +620,55 @@ without a usable `Retry-After` uses the account's existing retry backoff
 (`retry_base_delay_ms`, doubling, 120 s clamp). Response bodies are never parsed for
 reset hints. The cooldown only moves forward, as today.
 
-**Scrubbing.** Every response byte passes a scrubber before it reaches the caller.
-The scrubber redacts, rather than refuses, every value the login has held in this
-process (current and rotated tokens, account ID) and the static key. It matches the
-encodings the existing credential boundary checks: exact bytes, JSON-escaped UTF-8,
-percent-encoded UTF-8 (both hex cases), standard and URL-safe Base64 (padded and
-unpadded). Let `L` be the byte length of the longest of these encoded credential
-variants.
+No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
 
-For event streams, matching spans each open delta field's accumulated decoded text:
-output text, reasoning text, tool-call arguments, names and IDs. Each field has its
-own matching state; interleaved fields are never concatenated. After matching
-completed credentials, a field's **unresolved tail** is the longest suffix of its
-decoded text that is a proper prefix of some protected encoded credential variant.
-It is empty when no suffix qualifies, and its byte length is below `L`. This is
-the standard multi-pattern matcher state, as in Aho–Corasick. Only actual incomplete
-credential candidates determine retention.
+All item events wait until the done event, then leave in arrival order.
+`max_held_event_bytes` bounds the events retained for one unfinished item.
+Exceeding it emits a visible static error without releasing the partial item.
 
-**Procedure: scrub and release stream events**
+### Internal item stream
 
-1. **Match the next delta:** extend its field's decoded text and find completed
-   credential matches before releasing any event.
-2. **Redact completed matches:** replace the matched bytes inside the still-held
-   events that carry them, including the new event. Retaining incomplete credential
-   candidates ensures every byte of a match is still available when it completes.
-3. **Release resolved events:** hold an event while any of its delta bytes, in any
-   field, lies within that field's unresolved tail. A field with an empty tail holds
-   nothing. Release eligible events strictly in arrival order; a held event also
-   holds every later event.
-4. **Resolve completed fields:** at item completion, resolve all of that item's
-   remaining fields; at stream end, resolve every remaining field. Release events
-   in arrival order once no unresolved earlier event holds them. Stream end
-   releases all held events.
+`symbiotic-model::item_stream` defines the provider-neutral enum `ItemEvent`:
+`ItemStarted`, `ItemDelta`, `ItemDone`, `Usage`, `Error`, and opaque `Other` events.
+`ItemDone` carries complete provider JSON for exact replay. `Usage` carries
+`symbiotic_trace::UsageTrace`. Error events carry provider code and class. Event
+metadata carries item identity, output index and provider sequence number. Unknown
+provider fields remain opaque. Public Rust names use the naming conventions above.
 
-Matching text retained per field is its actual unresolved tail, below `L` bytes,
-plus one delta, independent of item length. Event envelopes are retained separately
-until release. A benign tool-call argument ending in `{"x":"~` holds nothing when
-no suffix is a proper credential prefix; pausing that field does not hold later
-output. A field paused inside a genuine credential prefix holds later events until
-its next delta resolves the candidate or the item ends. Held event envelopes can
-therefore accumulate across interleaved fields despite the bound on matching text.
+One Responses SSE adapter decodes provider events and re-encodes them. Unchanged
+events round-trip byte-for-byte. Modified events preserve every JSON field except
+explicit join edits. The credential process implements holding and joining once
+against the neutral enum. No Chat Completions,
+Anthropic Messages or Gemini adapter is built in this step.
 
-The one provisional route setting `max_held_event_bytes` defaults to 67 108 864
-bytes of held event envelopes per stream. This default comes from the predecessor
-agent proxy, not a measured maximum. It must be positive; configuration validation
-refuses zero. Before retaining an event envelope that would exceed this total,
-the scrubber ends the stream with a visible error, without releasing unresolved
-events. There is no separate text limit. The setting follows the
-[boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings).
-Implementation reworks the stream module from the scrubber PR to this design and
-closes [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161).
+### Continue and join
 
-Redaction, not refusal, is the rule here because the stream has already reached
-the caller in part. Refusal would cut every stream that quotes a token-shaped value.
+After bytes reach the caller, a retryable `response.failed` or a disconnect before
+`response.completed` is handled inside the shared queue. The failed event is held
+back, partial output is discarded, failure count rises and shared cooldown applies.
+The continuation uses the original body with `input` extended by every completed
+output item exactly as received in its done event, including reasoning items and
+`encrypted_content`.
+
+Before retrying, the process releases any complete items held behind the discarded
+partial item. Logical output positions follow forwarded item order; gaps left by
+discarded partial items are compacted.
+
+The next attempt suppresses `response.created` and `response.in_progress`, rewrites
+response IDs to the first answer's ID, continues sequence numbers, and offsets
+output indexes by the number of items already forwarded. One final completed event
+contains all forwarded items in order. Its usage sums provider-reported usage from
+all attempts; absent usage is never inferred. Further handled failures repeat this
+procedure. The caller receives no handled error event. A fail decision forwards the
+original error event. A local protocol or hold-limit error remains visible.
+
+Health adds `retried_events` (provider code, `network` or `upstream_disconnect` to
+handled count), `waiting`, `rate_limits`, `rate_limits_seen_at` and
+`new_session_hold_until`. Empty collections and null timestamps are their defaults.
+Each response with recognized safe headers replaces the route's latest
+`rate_limits` and records Unix seconds in `rate_limits_seen_at`. Responses without
+recognized headers leave the previous values. This health file is a rebuildable
+view; counters and waiting/session state remain in memory.
 
 **Usage.** At the end of a 2xx stream the process records the spend receipt:
 
@@ -621,6 +694,11 @@ A host can then count usage per job, or per anything it knows and Foundation doe
 without parsing the stream. A stream without a usage event gets no trailer. The
 process keeps no per-caller totals and enforces no per-caller ceiling.
 
+**Deferred (operator decision, 2026-10-26).** The first implementation ships without
+both the spend receipts and the usage trailer above. Nothing consumes them yet: a login
+account has no per-request price, and no host enforces per-request usage yet.
+[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
+
 ### What passthrough does not reuse
 
 Passthrough requests have no invocation identity and no Memory data authorization.
@@ -631,11 +709,8 @@ The process therefore does not apply these typed-route mechanisms to them:
 - the request failure budget and the unresolved-request block. An `Unknown`
   passthrough receipt does not block the next passthrough request;
 - the response cache and request deduplication;
-- the known-zero rule for automatic retry. A passthrough request is resent after a
-  429 (step 9) and once after a login route's first 401. A provider that answers 429
-  before any response byte reaches the caller has refused the request, and
-  `Retry-After` is its instruction to send it again later; the receipt of the refused
-  attempt still stays `Unknown`.
+- the known-zero rule for automatic retry. The shared queue's configurable retry
+  policy owns resends and continuations for this trusted-host channel.
 
 This extends the boundary contract: passthrough routes serve trusted same-UID hosts
 outside Memory's data authorization. Approval of this record includes adding that
@@ -664,14 +739,13 @@ renewal or resend.
   and imports to restore admission.
 - **Restart during a stream:** the caller's stream ends without its final chunk. The
   receipt stays `Unknown`; the cooldown survives in the durable queue backend; slots
-  start empty. The tool's own stream retry resends that step.
+  start empty. Recovery from a dropped local link belongs to the client; provider retry policy never relies on it.
 - **Restart during a renewal:** the fence stays set and the account is
   `login_required` until a fresh import.
 - **Long cooldown:** callers wait without a deadline of their own. A host's job
   deadline, which disconnects the caller, bounds the wait; a host that needs a shorter
   bound sets `max_queue_wait_seconds`.
-- **Upstream silence:** a gap longer than `idle_timeout_seconds` ends the stream with
-  an error and an `Unknown` receipt.
+- **Upstream silence:** a gap longer than `idle_timeout_seconds` is a network failure handled by the selected retry policy. It retains unknown accounting where usage was not reported.
 
 ## Key decisions
 
@@ -702,14 +776,15 @@ renewal or resend.
      cooldown would still end the tool's run and make the host reschedule it.
    - *Rejected:* bounding slot waits. With the two or three streams a login allows,
      waiting for a slot is routine.
-5. **Foundation resends a request that got 429, after the cooldown.** The request has
-   not reached the caller yet, its body is buffered within `max_request_bytes`, and the
-   provider's `Retry-After` asks for exactly that.
-   - *Rejected:* returning the first 429 and holding only later callers. That tool
-     would still see a 429 and fail as above.
-6. **Redaction on streams, with the credential boundary's encoding set.** See
-   §Scrubbing for why refusal does not fit a stream.
-7. **Login families are a closed list in code.** The injected headers decide where a
+5. **All model-traffic retry lives in the shared queue (operator, 2026-10-26).**
+   Adapters classify, the policy table decides, and one engine applies one backoff.
+   Behavior never depends on a client tool's or library's retry logic or quirks.
+   Client retry settings only keep a dropped local client-to-host link recoverable.
+   - *Rejected:* closing the downstream connection to make the client reconnect
+     through the queue. It depends on client reconnect behavior and retry budget.
+   - *Rejected:* resuming the agent session from its host. Every host would
+     duplicate recovery and restart work the provider had already produced.
+6. **Login families are a closed list in code.** The injected headers decide where a
    token goes, so they are not free configuration, as with the existing provider list.
 
 ## Simplification pass
@@ -730,9 +805,8 @@ Each mechanism this design adds, and the requirement it serves:
 | Resend after 429 | no 429 reaches the caller (decision 5) |
 | `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
-| Scrubber | credentials must not reach the caller, which may be untrusted |
-| Candidate-suffix retention | holds only actual incomplete credential candidates; benign pauses hold nothing |
-| `max_held_event_bytes` | limits event envelopes held behind a stalled genuine credential prefix |
+| Complete-item holding | prevents partial items reaching callers and enables exact continuation replay |
+| `max_held_event_bytes` | bounds retained events of one unfinished item |
 | Usage reader | usage receipts (#156 item 3) |
 | `symbiotic-usage` trailer | hosts that enforce their own per-job token ceilings need each response's usage; without it they would parse the stream a second time |
 | 401 renewal and one resend | a token revoked before its expiry would otherwise fail every request until restart |
@@ -744,8 +818,6 @@ Removed while designing:
 - parsing response bodies for reset hints; headers only;
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
-- whole-item retention, its separate text limit and fixed-length suffix retention;
-  only actual incomplete credential candidates hold events (§Scrubbing);
 - a total request deadline; the idle timeout fails on lack of progress instead.
 - a bound on slot waits, and the invented `Retry-After: 1` it would have needed;
 - a default cooldown bound; the setting stays, off by default;
@@ -855,41 +927,24 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Cooldown recorded before dispatch:** pause a sender after its slot grant and
   before it takes the rate gate. Another caller's 429 records a cooldown under that
   gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
-- **Scrubbing:** for each listed encoding, split a synthetic credential at every
-  byte boundary across transport chunks and across Responses and Chat Completions
-  deltas. Repeat for output text, reasoning text, tool-call arguments, names and
-  IDs. The caller receives the complete stream with every credential redacted.
-- **Interleaved field scrubbing:** split an encoded synthetic credential in each
-  of two fields, then alternate their prefix and suffix deltas. Repeat for every
-  encoding and split boundary. Each credential is redacted within its own field;
-  matching never joins bytes from different fields.
-- **Long single-field stream:** 65 537 deltas of 64 bytes in one field complete
-  within default limits. Matching text retained is the actual unresolved tail,
-  below `L` bytes, plus one 64-byte delta, independent of total item length. The
-  caller receives the complete stream in arrival order without a hold-limit error.
-- **Paused benign field:** a tool-call argument field pauses at `{"x":"~` with
-  no suffix that is a proper prefix of a protected credential variant. Then
-  65 536 benign output events of 1 024 bytes pass within the default limit.
-  No events remain held after processing each event; the caller receives them
-  in arrival order while the argument field stays paused. Repeat for every
-  supported credential encoding and both stream dialects.
-- **Paused credential prefix:** a tool-call argument field pauses inside a genuine
-  credential prefix while benign output events arrive. The prefix event and later
-  events remain held. The next argument delta rules out the candidate and leaves
-  an empty tail; all eligible events reach the caller in arrival order. Repeat
-  for every supported credential encoding and both stream dialects.
-- **Release order:** two interleaved fields pause inside genuine credential
-  prefixes while output-text events arrive. Resolving only the later field's
-  candidate releases nothing past the earlier held event. Resolving the earlier
-  candidate releases eligible events in arrival order. Repeat for every encoding
-  and both dialects. Item completion resolves its remaining fields; stream end
-  resolves all remaining fields and releases every held event in order.
-- **Interleaved stall limit:** a tool-call argument field stops inside a genuine
-  credential prefix while output-text events keep streaming. Repeat for every
-  encoding and both dialects. Held event envelopes may total exactly
-  `max_held_event_bytes`. The next envelope that would exceed it ends the stream
-  with a visible error before retention or release; no unresolved credential bytes
-  reach the caller.
+- **Complete-item release:** no event of a half-finished item reaches the caller.
+  Item events release in arrival order only after the done event.
+- **Held-item bound:** an item exceeding `max_held_event_bytes` yields a visible error.
+- **Continue and join:** listed failed events and premature disconnects replay every
+  complete item exactly, including encrypted reasoning. Partial items are discarded.
+  Output uses one response ID, contiguous sequences, offset indexes and one final
+  completion with all items and summed reported usage. No handled error is forwarded.
+- **Retry table:** test all defaults, route and named overrides, unknown names, hook
+  decisions, the three-attempt server limit and empty fallback behavior.
+- **Waiting health:** identified slot, cooldown and new-session waits have the correct
+  reason and Unix `since`; completed responses report pre-byte wait milliseconds.
+  Cancellation removes waiting entries. Handled codes increment retry counts.
+- **New sessions:** three sessions dispatch together without a hold. A new-session
+  429 holds new sessions while seen traffic flows. After reset one probe dispatches;
+  2xx opens admission, and another 429 resets the hold.
+- **Rate-limit headers:** a recognized header on 200 appears downstream and in health.
+  A promotional header appears in neither. Missing headers preserve the observation.
+- **Adapter fidelity:** recorded event sequences round-trip unchanged with no edits.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
   counts; a cut stream produces an `Unknown` receipt.
 - **Usage trailer:** with `TE: trailers`, the same stream ends with a
@@ -910,9 +965,8 @@ All use loopback provider fixtures with synthetic tokens, in
 
 ## Implementation size
 
-`ESTIMATE`, from the closest existing code: about 3 500 lines in
-`symbiotic-credential-process`. Login source, store and import about 700; passthrough
-socket, parser and admission about 700; scrubber and dialects about 500; usage reader
+`ESTIMATE`, from the closest existing code: login source, store and import about
+700; passthrough socket, parser and admission about 700; usage reader
 about 150; configuration and validation about 150; tests about 1 300. Plus one
 sentence in `boundary.md` and a new architecture section at closeout.
 

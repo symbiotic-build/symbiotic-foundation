@@ -65,6 +65,7 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
         assert!(diagnostic.contains("unknown variant `macos_keychain`"));
         assert!(diagnostic.contains("`none`"));
         assert!(diagnostic.contains("`owner_only_file`"));
+        assert!(diagnostic.contains("`login_file`"));
 
         let path = fixture.dir.path().join("config.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -76,7 +77,7 @@ async fn configuration_refuses_removed_secret_backend_before_startup() {
         assert!(!output.status.success());
         assert_eq!(
             String::from_utf8(output.stderr).unwrap().trim(),
-            "invalid configuration: supported secret backends are `none` and `owner_only_file`"
+            "invalid configuration: supported secret backends are `none`, `owner_only_file`, and `login_file`"
         );
         assert!(!fixture.config.state_dir.exists());
         assert!(!fixture.config.socket_path.exists());
@@ -397,6 +398,7 @@ impl Fixture {
             clock_rollback_warning_tolerance_seconds: 5,
             jobs: Default::default(),
             job_runner: Default::default(),
+            passthrough: None,
             routes: vec![RouteConfig {
                 answer_recovery: Default::default(),
                 tenant: "tenant".into(),
@@ -5859,7 +5861,7 @@ async fn regression_jobs_share_unresolved_request_admission_and_completion() {
                 Duration::ZERO, "null", true, false).await;
             configure_request_budget(&mut fixture, 3, None);
             let process = fixture.process().await;
-            let conn = rusqlite::Connection::open(fixture.config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
+            let mut conn = rusqlite::Connection::open(fixture.config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE)).unwrap();
             let (original, reference) = if original_job {
                 conn.execute_batch("CREATE TRIGGER reject_completion BEFORE UPDATE OF state ON spend_receipts BEGIN SELECT RAISE(ABORT, 'synthetic completion failure'); END;").unwrap();
                 let input = queued(&fixture, "unfinished-job");
@@ -5907,7 +5909,9 @@ async fn regression_jobs_share_unresolved_request_admission_and_completion() {
             different.admission = AdmissionKey::new(KEY.to_vec()).unwrap().sign_attempt(different.admission.attempt).unwrap();
             let different_id = enqueue_id(&client, different).await;
             wait_job(&client, &different_id, JobState::Succeeded).await;
-            let tx = conn.unchecked_transaction().unwrap();
+            // Reconciliation writes after reading the receipt; take the writer first,
+            // as production does, so a concurrent runner cannot invalidate the snapshot.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             symbiotic_ai_runtime::spend::SqliteSpendLedger::finish_in(&tx, &reference, SpendState::Settled, Some(symbiotic_trace::UsageTrace { input_tokens: Some(7), ..Default::default() }), None).unwrap();
             tx.commit().unwrap();
             let id = enqueue_id(&client, queued(&fixture, "resolved-job")).await;
@@ -8380,7 +8384,7 @@ async fn regression_unresolved_request_different_input_proceeds_until_reconcilia
                 configure_request_budget(&mut fixture, 3, renewal);
             }
             let process = fixture.process().await;
-            let conn = rusqlite::Connection::open(
+            let mut conn = rusqlite::Connection::open(
                 fixture
                     .config
                     .state_dir
@@ -8406,7 +8410,11 @@ async fn regression_unresolved_request_different_input_proceeds_until_reconcilia
             );
             assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
             // Existing canonical reconciliation resolves the original reservation.
-            let tx = conn.unchecked_transaction().unwrap();
+            // Reconciliation writes after reading the receipt; take the writer first,
+            // as production does, so a concurrent runner cannot invalidate the snapshot.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             symbiotic_ai_runtime::spend::SqliteSpendLedger::finish_in(
                 &tx,
                 &original.receipt.reference,
