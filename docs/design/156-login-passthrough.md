@@ -47,17 +47,20 @@ The lead decided on 2026-10-26:
   send against cooldown recording. First sends and resends take the gate, re-read
   the cooldown, charge pacing, start the send and release the gate. Recording a
   cooldown after a 429 takes the same gate (§Admission).
-- **Candidate-suffix retention:** the scrubber matches each open delta field's
-  accumulated decoded text. It holds events whose delta bytes intersect that
-  field's unresolved last `L − 1` bytes, where `L` is the longest encoded credential
-  variant. A held event holds every later event in arrival order (§Scrubbing).
+- **Candidate-suffix retention:** after matching completed credentials in each
+  open delta field's decoded text, the unresolved tail is its longest suffix that
+  is a proper prefix of a protected encoded credential variant. It is empty when
+  no suffix qualifies. Its byte length is below `L`, the longest variant's byte
+  length. Only events with delta bytes in an unresolved tail hold later events
+  in arrival order; an empty tail holds nothing (§Scrubbing).
   Implementation reworks the stream module from the scrubber PR to this design
   and closes [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161).
 - **One hold limit, a provisional route setting:** `max_held_event_bytes` defaults
   to 67 108 864 with a Serde default. It is a positive byte limit on held event
-  envelopes per stream. Interleaved fields can hold later events behind a stalled
-  field's unresolved tail, even though matching text per field is bounded by
-  `L − 1` bytes plus one delta (§Scrubbing). The default is provisional under the
+  envelopes per stream. A field stalled inside a genuine credential prefix can
+  hold later events from interleaved fields. Matching text per field is bounded
+  by its actual unresolved tail, below `L` bytes, plus one delta (§Scrubbing).
+  The default is provisional under the
   [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings),
   not a measured maximum. Exceeding it ends the stream with a visible error.
   `rate_burst_seconds` also defaults to 0 with `#[serde(default)]`, so existing
@@ -550,31 +553,36 @@ variants.
 
 For event streams, matching spans each open delta field's accumulated decoded text:
 output text, reasoning text, tool-call arguments, names and IDs. Each field has its
-own matching state; interleaved fields are never concatenated. A delta byte can be
-part of a still-incomplete match only within the last `L − 1` bytes of its field's
-text. This unresolved suffix, rather than the whole item, determines retention.
+own matching state; interleaved fields are never concatenated. After matching
+completed credentials, a field's **unresolved tail** is the longest suffix of its
+decoded text that is a proper prefix of some protected encoded credential variant.
+It is empty when no suffix qualifies, and its byte length is below `L`. This is
+the standard multi-pattern matcher state, as in Aho–Corasick. Only actual incomplete
+credential candidates determine retention.
 
 **Procedure: scrub and release stream events**
 
 1. **Match the next delta:** extend its field's decoded text and find completed
    credential matches before releasing any event.
 2. **Redact completed matches:** replace the matched bytes inside the still-held
-   events that carry them, including the new event. The `L − 1` window ensures
-   every byte of a match is in a held event when that match completes.
+   events that carry them, including the new event. Retaining incomplete credential
+   candidates ensures every byte of a match is still available when it completes.
 3. **Release resolved events:** hold an event while any of its delta bytes, in any
-   field, lies within that field's unresolved last `L − 1` bytes. Otherwise release
-   it, strictly in arrival order; a held event also holds every later event.
+   field, lies within that field's unresolved tail. A field with an empty tail holds
+   nothing. Release eligible events strictly in arrival order; a held event also
+   holds every later event.
 4. **Resolve completed fields:** at item completion, resolve all of that item's
    remaining fields; at stream end, resolve every remaining field. Release events
    in arrival order once no unresolved earlier event holds them. Stream end
    releases all held events.
 
-Matching text retained per field is at most `L − 1` bytes plus one delta,
-independent of item length. Event envelopes are retained separately until release.
-For example, a tool-call argument field can stop mid-token while output-text events
-keep arriving. Its unresolved tail holds those later events until its next delta
-resolves the tail or the item ends. Held event envelopes can therefore accumulate
-across interleaved fields despite the bound on matching text.
+Matching text retained per field is its actual unresolved tail, below `L` bytes,
+plus one delta, independent of item length. Event envelopes are retained separately
+until release. A benign tool-call argument ending in `{"x":"~` holds nothing when
+no suffix is a proper credential prefix; pausing that field does not hold later
+output. A field paused inside a genuine credential prefix holds later events until
+its next delta resolves the candidate or the item ends. Held event envelopes can
+therefore accumulate across interleaved fields despite the bound on matching text.
 
 The one provisional route setting `max_held_event_bytes` defaults to 67 108 864
 bytes of held event envelopes per stream. This default comes from the predecessor
@@ -723,8 +731,8 @@ Each mechanism this design adds, and the requirement it serves:
 | `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
-| Candidate-suffix retention | redacts split credentials with matching text bounded independently of item length |
-| `max_held_event_bytes` | limits event envelopes accumulated behind an interleaved field's stalled tail |
+| Candidate-suffix retention | holds only actual incomplete credential candidates; benign pauses hold nothing |
+| `max_held_event_bytes` | limits event envelopes held behind a stalled genuine credential prefix |
 | Usage reader | usage receipts (#156 item 3) |
 | `symbiotic-usage` trailer | hosts that enforce their own per-job token ceilings need each response's usage; without it they would parse the stream a second time |
 | 401 renewal and one resend | a token revoked before its expiry would otherwise fail every request until restart |
@@ -736,8 +744,8 @@ Removed while designing:
 - parsing response bodies for reset hints; headers only;
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
-- whole-item retention and its separate text limit; candidate-suffix retention
-  bounds matching text independently of item length (§Scrubbing);
+- whole-item retention, its separate text limit and fixed-length suffix retention;
+  only actual incomplete credential candidates hold events (§Scrubbing);
 - a total request deadline; the idle timeout fails on lack of progress instead.
 - a bound on slot waits, and the invented `Retry-After: 1` it would have needed;
 - a default cooldown bound; the setting stays, off by default;
@@ -856,16 +864,29 @@ All use loopback provider fixtures with synthetic tokens, in
   encoding and split boundary. Each credential is redacted within its own field;
   matching never joins bytes from different fields.
 - **Long single-field stream:** 65 537 deltas of 64 bytes in one field complete
-  within default limits. Matching text retained is at most `L − 1` bytes plus
-  one 64-byte delta, about `L` bytes, independent of total item length. The caller
-  receives the complete stream in arrival order without a hold-limit error.
-- **Release order:** a tool-call argument field pauses with an unresolved suffix
-  while output-text events arrive. No later event reaches the caller before the
-  held event. Advancing the argument field until its old suffix is resolved releases
-  eligible events in arrival order. Item completion resolves its remaining fields;
-  stream end resolves all remaining fields and releases every held event in order.
-- **Interleaved stall limit:** a tool-call argument field stops mid-token while
-  output-text events keep streaming. Held event envelopes may total exactly
+  within default limits. Matching text retained is the actual unresolved tail,
+  below `L` bytes, plus one 64-byte delta, independent of total item length. The
+  caller receives the complete stream in arrival order without a hold-limit error.
+- **Paused benign field:** a tool-call argument field pauses at `{"x":"~` with
+  no suffix that is a proper prefix of a protected credential variant. Then
+  65 536 benign output events of 1 024 bytes pass within the default limit.
+  No events remain held after processing each event; the caller receives them
+  in arrival order while the argument field stays paused. Repeat for every
+  supported credential encoding and both stream dialects.
+- **Paused credential prefix:** a tool-call argument field pauses inside a genuine
+  credential prefix while benign output events arrive. The prefix event and later
+  events remain held. The next argument delta rules out the candidate and leaves
+  an empty tail; all eligible events reach the caller in arrival order. Repeat
+  for every supported credential encoding and both stream dialects.
+- **Release order:** two interleaved fields pause inside genuine credential
+  prefixes while output-text events arrive. Resolving only the later field's
+  candidate releases nothing past the earlier held event. Resolving the earlier
+  candidate releases eligible events in arrival order. Repeat for every encoding
+  and both dialects. Item completion resolves its remaining fields; stream end
+  resolves all remaining fields and releases every held event in order.
+- **Interleaved stall limit:** a tool-call argument field stops inside a genuine
+  credential prefix while output-text events keep streaming. Repeat for every
+  encoding and both dialects. Held event envelopes may total exactly
   `max_held_event_bytes`. The next envelope that would exceed it ends the stream
   with a visible error before retention or release; no unresolved credential bytes
   reach the caller.
