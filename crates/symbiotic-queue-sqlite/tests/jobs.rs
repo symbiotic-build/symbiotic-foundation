@@ -1,5 +1,7 @@
 //! SQLite job-store acceptance cases; clocks advance deterministically.
 
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use symbiotic_queue::jobs::*;
@@ -66,6 +68,9 @@ impl<F> QueueBackend for InterceptJobs<F>
 where
     F: Fn(&JobRequest) -> futures::future::BoxFuture<'static, Result<(), JobError>> + Send + Sync,
 {
+    fn now(&self) -> DateTime<Utc> {
+        self.backend.now()
+    }
     async fn jobs(
         &self,
         scope: &JobScope,
@@ -171,7 +176,8 @@ impl Suite {
             backend,
             RunnerConfig {
                 worker_count: workers,
-                poll_interval_ms: 10,
+                heartbeat_interval_ms: Some(10),
+                poll_interval_ms: 1,
                 ..RunnerConfig::default()
             },
             handler,
@@ -480,10 +486,10 @@ async fn runner_first_heartbeat_storage_error_before_entry_does_not_cancel() {
     assert_eq!(row.output, Some(s.spec("pre-entry-storage-error").payload));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     let mut s = Suite::new();
-    s.now = Utc::now();
+    s.now = s.backend.now();
     s.config.claim_lease_seconds = 1;
     let id = s.insert(s.spec("draining-lease")).await;
     let started = Arc::new(AtomicBool::new(false));
@@ -539,7 +545,7 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     .await
     .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    s.now = Utc::now();
+    s.now = s.backend.now();
     assert!(
         matches!(
             s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
@@ -562,10 +568,10 @@ async fn runner_monitoring_storage_error_renews_lease_until_handler_finishes() {
     assert_eq!(row.output, Some(s.spec("draining-lease").payload));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn runner_no_lookup_between_claim_and_completion() {
     let mut s = Suite::new();
-    s.now = Utc::now();
+    s.now = s.backend.now();
     s.config.claim_lease_seconds = 1;
     let id = s.insert(s.spec("no-running-lookup")).await;
     let started = Arc::new(AtomicBool::new(false));
@@ -618,7 +624,7 @@ async fn runner_no_lookup_between_claim_and_completion() {
         renewals.load(Ordering::SeqCst) >= 2,
         "lookup blocked renewal"
     );
-    s.now = Utc::now();
+    s.now = s.backend.now();
     assert!(matches!(
         s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
         JobResponse::Job(None)
@@ -964,10 +970,10 @@ async fn monitoring_error_completion_case(state: JobState, fence: CompletionFenc
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn runner_renews_lease_while_handler_runs() {
     let mut s = Suite::new();
-    s.now = Utc::now();
+    s.now = s.backend.now();
     s.config.claim_lease_seconds = 1;
     let id = s.insert(s.spec("renew")).await;
     let permits = Arc::new(tokio::sync::Semaphore::new(0));
@@ -986,7 +992,7 @@ async fn runner_renews_lease_while_handler_runs() {
     rx.recv().await.unwrap();
     let initial = s.get(&id).await.lease_until.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    s.now = Utc::now();
+    s.now = s.backend.now();
     assert!(s.get(&id).await.lease_until.unwrap() > initial);
     assert!(matches!(
         s.op(JobRequest::ClaimJob(id.clone())).await.unwrap(),
@@ -1556,7 +1562,11 @@ struct Suite {
 }
 impl Suite {
     fn new() -> Self {
-        let backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::in_memory().unwrap());
+        let backend = Arc::new(
+            symbiotic_queue_sqlite::SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         Self {
             backend,
             scope: JobScope {
@@ -2841,9 +2851,18 @@ async fn jobs_result_kept_only_when_one_delivery_page_carries_it() {
                     serde_json::to_vec(&vec![delivery.clone()]).unwrap().len()
                         <= s.config.max_page_bytes
                 );
+                // A retained result must still fit after any legal redelivery.
+                let mut widest = delivery.clone();
+                widest.completion.delivery_generation = u64::MAX;
+                widest.completion.delivery_until = Some(DateTime::<Utc>::MAX_UTC);
+                widest.token.generation = u64::MAX;
+                let page_bytes = serde_json::to_vec(&vec![widest]).unwrap().len();
+                assert!(page_bytes <= s.config.max_page_bytes);
                 s.ack(delivery.token, Disposition::Accepted).await;
                 largest = Some(len);
-                len += 1;
+                // Each extra 255 adds four JSON bytes. Jump to the largest fit,
+                // then exercise its immediately larger successor.
+                len += ((s.config.max_page_bytes - page_bytes) / 4).max(1);
             }
             JobResponse::ResultRefused { bytes } => {
                 assert!(bytes > s.config.max_page_bytes);
@@ -3251,11 +3270,14 @@ async fn regression_runner_sqlite_lock_leaves_other_database_live() {
     let runner_b = b.runner(1, |_, bytes| async { Ok(bytes) }).await;
     let (entered, entry) = tokio::sync::oneshot::channel();
     let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let gate = finish.clone();
     let runner_a = a
         .runner(1, move |_, bytes| {
+            let gate = gate.clone();
             entered.lock().unwrap().take().unwrap().send(()).unwrap();
             async move {
-                tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+                gate.notified().await;
                 Ok(bytes)
             }
         })
@@ -3263,21 +3285,34 @@ async fn regression_runner_sqlite_lock_leaves_other_database_live() {
     entry.await.unwrap();
     let initial = a.get(&id).await.lease_until.unwrap();
     let (locked, lock_ready) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
     let lock = std::thread::spawn(move || {
         let mut conn = rusqlite::Connection::open(path_b).unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         locked.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        released
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         tx.commit().unwrap();
     });
     lock_ready.recv().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let renewed = a.get(&id).await.lease_until.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let row = a.get(&id).await;
+    let renewed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let renewed = a.get(&id).await.lease_until.unwrap();
+            if renewed > initial {
+                break renewed;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    finish.notify_one();
+    let row = a.final_row(&id).await;
     let stopped_a = runner_a.shutdown().await;
+    release.send(()).unwrap();
     runner_b.shutdown().await.unwrap();
     lock.join().unwrap();
     assert!(
@@ -3304,37 +3339,48 @@ async fn regression_sqlite_completion_lock_wait_cannot_revive_expired_claim() {
     let id = s.insert(s.spec("expired-completion")).await;
     let claim = s.claim().await;
     let (locked, lock_ready) = std::sync::mpsc::channel();
-    let release = std::thread::spawn(move || {
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
         let mut conn = rusqlite::Connection::open(path).unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         locked.send(()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        released
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         tx.commit().unwrap();
     });
     lock_ready.recv().unwrap();
     let started = Utc::now();
     assert!(started < claim.lease_until.unwrap());
-    let result = s
-        .backend
-        .jobs(
-            &s.scope,
-            &s.config,
-            Arc::new(Utc::now),
-            JobRequest::Complete {
-                job: id.clone(),
-                generation: claim.generation,
-                state: JobState::Succeeded,
-                origin: ResultOrigin::Handler,
-                output: Some(b"late".to_vec()),
-                receipt: None,
-                diagnostic: None,
-            },
-        )
-        .await;
-    release.join().unwrap();
-    assert!(Utc::now() > claim.lease_until.unwrap());
+    let time = Arc::new(std::sync::atomic::AtomicI64::new(
+        started.timestamp_millis(),
+    ));
+    let observed = time.clone();
+    let operation = s.backend.jobs(
+        &s.scope,
+        &s.config,
+        Arc::new(move || DateTime::from_timestamp_millis(observed.load(Ordering::SeqCst)).unwrap()),
+        JobRequest::Complete {
+            job: id.clone(),
+            generation: claim.generation,
+            state: JobState::Succeeded,
+            origin: ResultOrigin::Handler,
+            output: Some(b"late".to_vec()),
+            receipt: None,
+            diagnostic: None,
+        },
+    );
+    tokio::pin!(operation);
+    assert!(futures::poll!(&mut operation).is_pending());
+    time.store(
+        (claim.lease_until.unwrap() + Duration::milliseconds(1)).timestamp_millis(),
+        Ordering::SeqCst,
+    );
+    release.send(()).unwrap();
+    let result = operation.await;
+    holder.join().unwrap();
     assert!(
         matches!(result, Err(JobError::StaleClaim)),
         "late completion accepted: {result:?}"

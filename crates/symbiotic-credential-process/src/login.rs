@@ -239,12 +239,12 @@ impl Login {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_transport(&mut self, base: &str) {
+    pub(crate) fn test_transport(&mut self, base: &str, timeout: Duration) {
         self.http.client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(2))
+            .timeout(timeout)
             .build()
             .expect("fixture client");
         self.http.wire_base = Some(base.into());

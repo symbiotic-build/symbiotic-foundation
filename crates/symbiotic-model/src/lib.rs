@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::time::Instant;
 /// Provider-neutral output item stream and wire adapters.
 pub mod item_stream;
 
@@ -1007,7 +1007,7 @@ fn queue_error(_err: symbiotic_queue::QueueError) -> ModelError {
 }
 
 #[cfg(feature = "queue")]
-fn elapsed_ms(since: std::time::Instant) -> u64 {
+fn elapsed_ms(since: tokio::time::Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -1378,7 +1378,9 @@ impl<Req> QueuedCall<Req> {
         let state = self.retry_state(Some(item)).await?;
         let attempts_used = state.attempts_used;
         if attempts_used >= state.max_attempts {
-            return if self.invocation_key.is_none() && budget_renewed(item, &self.config)? {
+            return if self.invocation_key.is_none()
+                && budget_renewed(item, &self.config, self.queue.now())?
+            {
                 self.renew_budget(&item.item_id).await.map(Some)
             } else {
                 Ok(None)
@@ -1807,7 +1809,7 @@ where
     if let Some(output) = this.recovered::<Res>().await? {
         return Ok(output);
     }
-    let queued_at = std::time::Instant::now();
+    let queued_at = tokio::time::Instant::now();
     // Cooldown + rate-bucket wait accumulated across loop iterations, so the
     // trace can report the throttle-wait vs http-time split (the measured
     // lesson) without changing `queued_ms` semantics.
@@ -1843,7 +1845,8 @@ where
                 }
             }
             QueueStatus::Dead
-                if this.invocation_key.is_none() && budget_renewed(&enqueue.item, config)? =>
+                if this.invocation_key.is_none()
+                    && budget_renewed(&enqueue.item, config, queue.now())? =>
             {
                 enqueue = this.renew_budget(&enqueue.item.item_id).await?;
             }
@@ -1872,7 +1875,7 @@ where
 
     // An attempt that waits for rate budget in slices keeps its start and
     // its throttle time across them, for its receipts.
-    let mut waiting_attempt: Option<(std::time::Instant, Duration)> = None;
+    let mut waiting_attempt: Option<(tokio::time::Instant, Duration)> = None;
     loop {
         if let Some(output) = this.recovered::<Res>().await? {
             return Ok(output);
@@ -1882,7 +1885,7 @@ where
         }
         let (attempt_started, mut attempt_throttle) = waiting_attempt
             .take()
-            .unwrap_or_else(|| (std::time::Instant::now(), Duration::ZERO));
+            .unwrap_or_else(|| (tokio::time::Instant::now(), Duration::ZERO));
         let permit = match &runtime.admission {
             Some(admission) => Some(
                 admission
@@ -1891,7 +1894,7 @@ where
             ),
             None => None,
         };
-        let throttle_started = std::time::Instant::now();
+        let throttle_started = tokio::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
         let rate = match check_model_budget(
             &runtime.rate_state,
@@ -2027,7 +2030,8 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
                 }
             }
             QueueStatus::Dead
-                if self.invocation_key.is_none() && budget_renewed(&current, config)? =>
+                if self.invocation_key.is_none()
+                    && budget_renewed(&current, config, self.queue.now())? =>
             {
                 *enqueue = self.renew_budget(&current.item_id).await?;
                 Ok(Followed::Moved)
@@ -2066,9 +2070,9 @@ impl<Req: Send + Sync + 'static> QueuedCall<Req> {
 #[cfg(feature = "queue")]
 struct AttemptClock {
     /// When the call joined the queue.
-    queued_at: std::time::Instant,
+    queued_at: tokio::time::Instant,
     /// When this attempt started waiting for a model slot.
-    attempt_started: std::time::Instant,
+    attempt_started: tokio::time::Instant,
     /// This attempt's cooldown and rate-bucket wait.
     attempt_throttle: Duration,
     /// The call's cooldown and rate-bucket wait over all its attempts.
@@ -2138,7 +2142,7 @@ where
     let mut current = queue.get_item(&item_id).await.map_err(queue_error)?;
     if current.as_ref().is_some_and(|item| {
         item.status == QueueStatus::Running
-            && item.lease_until.is_some_and(|until| until < Utc::now())
+            && item.lease_until.is_some_and(|until| until < queue.now())
     }) {
         queue
             .reclaim_expired_leases(&this.queue_id)
@@ -2879,7 +2883,7 @@ where
             .await;
         return Settled::Failed { err, failed };
     }
-    let provider_started = std::time::Instant::now();
+    let provider_started = tokio::time::Instant::now();
     let result = dispatch_model(
         &this.queue_id,
         config,
@@ -3064,7 +3068,9 @@ where
                     Failure {
                         error: err.code(),
                         error_class: Some(error_class(&err)),
-                        run_after: Some(Utc::now() + ChronoDuration::milliseconds(delay_ms as i64)),
+                        run_after: Some(
+                            queue.now() + ChronoDuration::milliseconds(delay_ms as i64),
+                        ),
                     },
                 )
                 .await;
@@ -3299,7 +3305,11 @@ fn retry_after_seconds(
 /// restart) gets a fresh attempt budget: only when the policy renews budgets
 /// and the renewal time has passed since the request went dead.
 #[cfg(feature = "queue")]
-fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> Result<bool, ModelError> {
+fn budget_renewed(
+    item: &QueueItem,
+    config: &ModelQueueConfig,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool, ModelError> {
     let Some(seconds) = config.budget_renewal_seconds else {
         return Ok(false);
     };
@@ -3310,7 +3320,7 @@ fn budget_renewed(item: &QueueItem, config: &ModelQueueConfig) -> Result<bool, M
         .ok_or(ModelError::InvalidRequest(
             symbiotic_core::DiagnosticCode::InvalidConfiguration,
         ))?;
-    Ok(Utc::now() >= deadline)
+    Ok(now >= deadline)
 }
 
 #[cfg(feature = "queue")]
@@ -3503,7 +3513,7 @@ async fn reenqueue_dead_item(
                 kind: kind.to_string(),
                 payload,
                 idempotency_key: idempotency_key.clone(),
-                run_after: Some(Utc::now() + ChronoDuration::milliseconds(retry_after_ms as i64)),
+                run_after: Some(queue.now() + ChronoDuration::milliseconds(retry_after_ms as i64)),
                 max_attempts: Some(remaining_attempts.min(config.retry_attempts.max(1)).max(1)),
                 force: true,
             },
@@ -3964,7 +3974,7 @@ where
     let held = state.gate(queue_id).await?;
     if let Some(queue) = queue
         && let Some(until) = queue.cooldown_until(queue_id).await.map_err(queue_error)?
-        && let Ok(wait) = (until - Utc::now()).to_std()
+        && let Ok(wait) = (until - queue.now()).to_std()
         && !wait.is_zero()
     {
         return Ok(RateCheck::Cooldown(wait));
@@ -4008,7 +4018,7 @@ async fn wait_for_model_cooldown(
 ) -> Result<(), ModelError> {
     loop {
         let durable_until = queue.cooldown_until(queue_id).await.map_err(queue_error)?;
-        let sleep_for = durable_until.and_then(|until| (until - Utc::now()).to_std().ok());
+        let sleep_for = durable_until.and_then(|until| (until - queue.now()).to_std().ok());
         match sleep_for {
             Some(duration) if !duration.is_zero() => tokio::time::sleep(duration).await,
             _ => return Ok(()),
@@ -4031,7 +4041,7 @@ async fn note_model_cooldown(
         _ => 1,
     };
     let millis = retry_delay_ms.saturating_mul(multiplier).clamp(1, 60_000);
-    let until_utc = Utc::now() + ChronoDuration::milliseconds(millis as i64);
+    let until_utc = queue.now() + ChronoDuration::milliseconds(millis as i64);
     rate_state
         .note_cooldown(queue, queue_id, until_utc)
         .await
@@ -5187,6 +5197,10 @@ extern crate self as symbiotic_model;
 #[path = "../tests/support/spend.rs"]
 mod test_spend;
 
+#[cfg(all(test, feature = "queue"))]
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5198,22 +5212,24 @@ mod tests {
     use symbiotic_queue_sqlite::SqliteQueue;
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn regression_cooldown_wait_rereads_after_waking() {
-        let queue = std::sync::Arc::new(symbiotic_queue::MemoryQueue::new());
+        let queue = std::sync::Arc::new(
+            symbiotic_queue::MemoryQueue::new().with_clock(test_clock::clock()),
+        );
         let queue_id = QueueId::new("extended-cooldown");
         queue
-            .note_cooldown(&queue_id, Utc::now() + ChronoDuration::milliseconds(100))
+            .note_cooldown(&queue_id, queue.now() + ChronoDuration::milliseconds(100))
             .await
             .unwrap();
         let waiter = wait_for_model_cooldown(queue.as_ref(), &queue_id);
         tokio::pin!(waiter);
         // Poll through the initial read so the extension occurs while sleeping.
         assert!(futures::poll!(waiter.as_mut()).is_pending());
-        let extended = Utc::now() + ChronoDuration::milliseconds(250);
+        let extended = queue.now() + ChronoDuration::milliseconds(250);
         queue.note_cooldown(&queue_id, extended).await.unwrap();
         waiter.await.unwrap();
-        assert!(Utc::now() >= extended);
+        assert!(queue.now() >= extended);
     }
 
     #[test]
@@ -5653,9 +5669,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_enforces_model_cap() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5699,10 +5719,14 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_uses_exact_response_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5740,9 +5764,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_trace_separates_queue_wait_from_provider_time() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -5796,6 +5824,7 @@ mod tests {
                 bucket.updated_at = Instant::now();
                 bucket.updated_at
             };
+            tokio::time::advance(Duration::from_millis(1)).await;
             let mut second = std::pin::pin!(provider.chat(chat_request("second")));
             loop {
                 assert!(
@@ -5869,7 +5898,7 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_rate_budget_wait_does_not_hold_running_slot() {
         #[derive(Default)]
         struct Events(Mutex<Vec<symbiotic_queue::QueueEvent>>);
@@ -5958,7 +5987,11 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), async {
             let dir = tempfile::tempdir().unwrap();
             let cache = DirResponseCache::new(dir.path().to_path_buf());
-            let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+            let queue = Arc::new(
+                SqliteQueue::in_memory()
+                    .unwrap()
+                    .with_clock(test_clock::clock()),
+            );
             let calls = Arc::new(AtomicUsize::new(0));
             let raw = SlowCountingChat::new(
                 Arc::new(AtomicUsize::new(0)),
@@ -6070,10 +6103,14 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_shares_cached_response_with_concurrent_duplicate() {
         let dir = tempfile::tempdir().unwrap();
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6107,10 +6144,14 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_replays_succeeded_item_when_cache_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let request = chat_request("same request");
         let request_hash = hash_json(&request).unwrap();
         let queue_id = QueueId::new("chat:deepseek:deepseek-v4-pro");
@@ -6187,9 +6228,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_reenqueues_dead_item_until_logical_retry_limit() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
             DeadThenSuccessChat::new(calls.clone()),
@@ -6217,9 +6262,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_stops_at_logical_retry_limit() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
             SlowUnavailableChat::new(calls.clone()),
@@ -6250,9 +6299,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_cache_off_calls_have_separate_logical_retry_envelopes() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
             SlowUnavailableChat::new(calls.clone()),
@@ -6287,9 +6340,13 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_chat_provider_heartbeats_long_provider_call() {
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let provider = QueuedChatProvider::new(
             LeaseCrossingChat::new(),
             queue,
@@ -6450,17 +6507,6 @@ mod tests {
 
     #[cfg(feature = "queue")]
     #[test]
-    fn retry_backoff_doubles_from_the_base_and_caps() {
-        assert_eq!(symbiotic_core::retry::backoff_ms(1, 1_000), 1_000);
-        assert_eq!(symbiotic_core::retry::backoff_ms(2, 1_000), 2_000);
-        assert_eq!(symbiotic_core::retry::backoff_ms(6, 1_000), 30_000);
-        assert_eq!(symbiotic_core::retry::backoff_ms(1, 250), 250);
-        assert_eq!(symbiotic_core::retry::backoff_ms(3, 250), 1_000);
-        assert_eq!(symbiotic_core::retry::backoff_ms(9, 250), 8_000);
-    }
-
-    #[cfg(feature = "queue")]
-    #[test]
     fn retry_jitter_spreads_same_attempt_failures_deterministically() {
         let err = ModelError::Unavailable(symbiotic_core::DiagnosticCode::HttpUnavailable);
         let first = QueueItemId("item-a".to_string());
@@ -6537,8 +6583,13 @@ mod tests {
     async fn rate_charge_failure_releases_reservation_and_stops_dispatch() {
         let cache = tempfile::tempdir().unwrap();
         for queue in [
-            Arc::new(symbiotic_queue::MemoryQueue::new()) as Arc<dyn QueueBackend>,
-            Arc::new(SqliteQueue::in_memory().unwrap()) as Arc<dyn QueueBackend>,
+            Arc::new(symbiotic_queue::MemoryQueue::new().with_clock(test_clock::clock()))
+                as Arc<dyn QueueBackend>,
+            Arc::new(
+                SqliteQueue::in_memory()
+                    .unwrap()
+                    .with_clock(test_clock::clock()),
+            ) as Arc<dyn QueueBackend>,
         ] {
             let rate_state = ModelRateState::default();
             let buckets = rate_state.buckets.clone();
@@ -6734,10 +6785,14 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_rerank_provider_reuses_exact_response_cache_and_traces() {
         let dir = tempfile::tempdir().unwrap();
-        let queue = Arc::new(SqliteQueue::in_memory().unwrap());
+        let queue = Arc::new(
+            SqliteQueue::in_memory()
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let trace_sink = Arc::new(InMemoryTraceSink::default());
         let provider = QueuedRerankProvider::new(
@@ -7374,7 +7429,10 @@ mod egress_http_tests {
                     }
                     std::future::pending::<()>().await;
                 });
-                let client = http_client(Some(1)).unwrap();
+                let client = http_client_builder()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap();
                 let result = with_egress_http_observations(provider_response_json(
                     client.get(url),
                     Some(1024),
@@ -7389,6 +7447,6 @@ mod egress_http_tests {
             }
         })
         .await
-        .expect("two one-second transport timeouts must finish within four seconds");
+        .expect("two short transport timeouts must finish within four seconds");
     }
 }

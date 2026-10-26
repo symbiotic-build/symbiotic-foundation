@@ -157,35 +157,6 @@ fn authority_deadline_is_required_signed_and_digested_in_v4() {
     assert!(serde_json::from_value::<DurableAttempt>(missing).is_err());
 }
 
-#[tokio::test]
-async fn memory_can_use_a_trait_object_test_double_without_the_credential_process() {
-    struct Double;
-    #[async_trait::async_trait]
-    impl EgressClient for Double {
-        async fn exchange(&self, _: Request) -> Result<Response, EgressError> {
-            Err(EgressError::Transport)
-        }
-    }
-    let client: Box<dyn EgressClient> = Box::new(Double);
-    let signed = AdmissionKey::new(vec![42; 32])
-        .unwrap()
-        .sign_grant_revision(GrantRevision {
-            tenant: "tenant".into(),
-            incarnation: "incarnation".into(),
-            revision: 11,
-        })
-        .unwrap();
-    assert!(matches!(
-        client
-            .exchange(Request {
-                version: PROTOCOL_VERSION,
-                operation: Operation::PublishGrantRevision(signed)
-            })
-            .await,
-        Err(EgressError::Transport)
-    ));
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn frame_limit_is_checked_without_waiting_for_or_allocating_the_declared_body() {

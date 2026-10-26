@@ -2207,7 +2207,7 @@ mod tests {
             .unwrap();
             let mut store = SqlRows::new(&tx);
             let template = store.by_key(&scope(), "template").unwrap().unwrap();
-            for i in 0..retained + 8 {
+            for i in [0, 1, retained] {
                 let mut row = template.clone();
                 row.id.id = if i < retained && i % 2 == 1 {
                     format!("zz-tail-{i:08}")
@@ -2231,6 +2231,41 @@ mod tests {
                 row.delivery_until = (i >= retained).then_some(now + chrono::Duration::seconds(30));
                 store.save(row).unwrap();
             }
+            // Clone three canonical examples in native SQL. The population and selector
+            // assertions are unchanged; serializing and probing 10,000 fixture rows is setup.
+            let columns: Vec<String> = tx
+                .prepare("PRAGMA table_info(jobs)")
+                .unwrap()
+                .query_map([], |r| r.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let id = "CASE WHEN n < ?1 AND n % 2 = 1 THEN printf('zz-tail-%08d',n) ELSE printf('%08d',n) END";
+            let projection = columns
+                .iter()
+                .map(|column| {
+                    if column == "id" || column == "key" {
+                        id.to_owned()
+                    } else {
+                        format!("seed.{column}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(&format!(
+                "WITH RECURSIVE fixture(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM fixture WHERE n+1<?1+8)
+                 INSERT INTO jobs ({}) SELECT {projection} FROM fixture
+                 JOIN jobs seed ON seed.scope=?2 AND seed.id=CASE WHEN n>=?1 THEN printf('%08d',?1) WHEN n%2=1 THEN 'zz-tail-00000001' ELSE '00000000' END
+                 WHERE n NOT IN (0,1,?1)", columns.join(",")
+            ), params![retained, json(&scope()).unwrap()]).unwrap();
+            tx.execute("INSERT INTO job_owners(scope,owner,job_id)
+                SELECT j.scope,o.value,j.id FROM jobs j,json_each(j.owners) o
+                WHERE NOT EXISTS(SELECT 1 FROM job_owners WHERE scope=j.scope AND job_id=j.id AND owner=o.value)", []).unwrap();
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, usize>(0))
+                    .unwrap(),
+                retained as usize + 9
+            );
             let mut eligible = template.clone();
             eligible.id.id = "zz-eligible".into();
             eligible.key = "eligible".into();

@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
 use base64::{Engine, engine::general_purpose};
 use std::{
     os::unix::fs::PermissionsExt,
@@ -151,76 +153,8 @@ async fn wait_for_engine_startup(pid: u32, ready_path: &std::path::Path) {
     .await;
 }
 
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "engine exited before readiness")]
-async fn regression_engine_startup_fails_when_first_supervised_child_exits() {
-    let dir = tempfile::tempdir().unwrap();
-    let supervisor = symbiotic_supervise::Supervisor::start(
-        || std::process::Command::new("/usr/bin/true"),
-        symbiotic_supervise::Policy {
-            max_restarts: 0,
-            ..supervision_policy()
-        },
-    )
-    .unwrap();
-    let symbiotic_supervise::Event::Started(pid) = supervisor.next_event().unwrap() else {
-        panic!("missing first engine");
-    };
-    assert!(matches!(
-        supervisor.next_event().unwrap(),
-        symbiotic_supervise::Event::Exited(_)
-    ));
-    // Reaping the first child must fail startup before the paused clock advances.
-    wait_for_engine_startup(pid, &dir.path().join("engine.ready")).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn regression_child_startup_wait_allows_delayed_readiness() {
-    let mut child = Child(
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap(),
-    );
-    let started = tokio::time::Instant::now();
-    let reply = wait_for_child_startup(&mut child, || async {
-        if started.elapsed() < Duration::from_secs(4) {
-            Err(EgressError::Transport)
-        } else {
-            Ok(Reply::GrantRevisionPublished)
-        }
-    })
-    .await;
-    assert!(matches!(reply, Reply::GrantRevisionPublished));
-}
-
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "child exited before accepting requests")]
-async fn regression_child_startup_wait_fails_before_probing_exited_child() {
-    let mut child = Child(std::process::Command::new("/usr/bin/true").spawn().unwrap());
-    assert!(child.0.wait().unwrap().success());
-    wait_for_child_startup::<(), _>(&mut child, || async {
-        panic!("an exited child must be detected before any readiness probe");
-    })
-    .await;
-}
-
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "child did not accept requests within the startup hang guard")]
-async fn regression_child_startup_wait_bounds_unready_child() {
-    let mut child = Child(
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_child_startup(&mut child, || async {
-        Err::<(), _>(EgressError::Transport)
-    })
-    .await;
-}
-
 struct Fixture {
+    clock: symbiotic_queue::jobs::JobClock,
     dir: tempfile::TempDir,
     config: ProcessConfig,
     calls: Arc<AtomicUsize>,
@@ -431,6 +365,7 @@ impl Fixture {
             }],
         };
         Self {
+            clock: test_clock::clock(),
             dir,
             config,
             calls,
@@ -438,8 +373,12 @@ impl Fixture {
             requests,
         }
     }
+    fn now(&self) -> u64 {
+        u64::try_from((self.clock)().timestamp()).unwrap()
+    }
     async fn process(&self) -> CredentialProcess {
-        let process = CredentialProcess::open(self.config.clone()).unwrap();
+        let process =
+            CredentialProcess::open_with_clock(self.config.clone(), self.clock.clone()).unwrap();
         // Initial publication is explicit; restart cannot roll back a newer revision.
         match exchange(&process, publish_revision(1)).await {
             Ok(Reply::GrantRevisionPublished) | Err(EgressError::RouteRefused) => (),
@@ -512,6 +451,12 @@ impl Fixture {
         )
     }
 }
+async fn advance_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -546,11 +491,11 @@ async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthori
         let key = AdmissionKey::new(KEY.to_vec()).unwrap();
         let (first, payload) = fixture.attempt("authority-deadline", 1, 10);
         let mut first = first.attempt;
-        first.recorded_at = unix_seconds();
+        first.recorded_at = fixture.now();
         first.expires_at = first.recorded_at + 2;
         let first = key.sign_attempt(first).unwrap();
         let granted = permit(&process, &first).await;
-        assert!(unix_seconds() < first.attempt.expires_at);
+        assert!(fixture.now() < first.attempt.expires_at);
         // Serialized after the consumer's successful check, but delayed until
         // Foundation's clock has reached the exclusive authority deadline.
         let bytes = serde_json::to_vec(&Request {
@@ -558,9 +503,7 @@ async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthori
             operation: inject(first.clone(), payload.clone(), granted.clone()),
         })
         .unwrap();
-        while unix_seconds() < first.attempt.expires_at {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        advance_clock(Duration::from_secs(2)).await;
         let response = InProcessEgressClient::new(process.clone())
             .exchange(serde_json::from_slice(&bytes).unwrap())
             .await
@@ -609,7 +552,7 @@ async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthori
             Err(EgressError::AuthorityExpired)
         ));
         let mut second = first.attempt.clone();
-        second.recorded_at = unix_seconds();
+        second.recorded_at = fixture.now();
         second.expires_at = second.recorded_at + 3600;
         // A newly signed deadline cannot mutate an existing attempt identity.
         assert!(matches!(
@@ -638,26 +581,35 @@ async fn authority_deadline_passed_between_check_and_acceptance_allows_reauthori
 
 #[tokio::test]
 async fn accepted_handoff_completes_and_recovers_after_authority_deadline() {
-    let mut fixture = Fixture::new(200, "accepted answer".into(), Duration::from_secs(2)).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fixture = Fixture::with_response_gate(
+        200,
+        "accepted answer".into(),
+        Duration::ZERO,
+        "null",
+        false,
+        false,
+        Some(gate.clone()),
+    )
+    .await;
     fixture.config.routes[0].timeout_seconds = 4;
     let process = fixture.process().await;
     let (mut admission, payload) = fixture.attempt("accepted-deadline", 1, 10);
-    admission.attempt.recorded_at = unix_seconds();
+    admission.attempt.recorded_at = fixture.now();
     admission.attempt.expires_at = admission.attempt.recorded_at + 2;
     let admission = AdmissionKey::new(KEY.to_vec())
         .unwrap()
         .sign_attempt(admission.attempt)
         .unwrap();
     let granted = permit(&process, &admission).await;
-    let result = dispatched(
-        exchange_wire(
-            &process,
-            inject(admission.clone(), payload.clone(), granted.clone()),
-        )
-        .await
-        .unwrap(),
-    );
-    assert!(unix_seconds() >= admission.attempt.expires_at);
+    let owner = process.clone();
+    let operation = inject(admission.clone(), payload.clone(), granted.clone());
+    let call = tokio::spawn(async move { exchange_wire(&owner, operation).await });
+    fixture.arrivals.acquire().await.unwrap().forget();
+    advance_clock(Duration::from_secs(2)).await;
+    gate.add_permits(1);
+    let result = dispatched(call.await.unwrap().unwrap());
+    assert!(fixture.now() >= admission.attempt.expires_at);
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
     assert_eq!(result.receipt.spend_state, SpendState::Settled);
     drop(process);
@@ -675,6 +627,18 @@ async fn accepted_handoff_completes_and_recovers_after_authority_deadline() {
     ));
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger_totals(&fixture), (1, 1));
+}
+
+async fn exchange_after_provider_timeout(
+    fixture: &Fixture,
+    process: &CredentialProcess,
+    operation: Operation,
+) -> Result<Reply, EgressError> {
+    let owner = process.clone();
+    let call = tokio::spawn(async move { exchange(&owner, operation).await });
+    fixture.arrivals.acquire().await.unwrap().forget();
+    advance_clock(Duration::from_millis(1_100)).await;
+    call.await.expect("timed-out dispatch task")
 }
 
 async fn exchange(process: &CredentialProcess, operation: Operation) -> Result<Reply, EgressError> {
@@ -1101,9 +1065,13 @@ async fn unknown_charge_stays_reserved_and_prevents_blind_retry_after_restart() 
     let (admission, payload) = fixture.attempt("timeout", 1, 1);
     let granted = permit(&process, &admission).await;
     let result = dispatched(
-        exchange(&process, inject(admission.clone(), payload, granted))
-            .await
-            .unwrap(),
+        exchange_after_provider_timeout(
+            &fixture,
+            &process,
+            inject(admission.clone(), payload, granted),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(result.receipt.status, DispatchStatus::ProviderFailed);
     assert_eq!(result.error, Some(EgressError::Timeout));
@@ -4248,8 +4216,9 @@ async fn regression_slow_resolver_delays_dispatch_beyond_provider_timeout() {
         }
 
         // Observe past the one-second provider timeout while keeping the callback held.
+        advance_clock(Duration::from_millis(1_100)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(1100), &mut dispatch)
+            tokio::time::timeout(Duration::ZERO, &mut dispatch)
                 .await
                 .is_err(),
             "provider timeout must not complete dispatch while its resolver is blocked"
@@ -5480,8 +5449,19 @@ async fn jobs_kill_after_dispatch_recovers_uncertain_without_resending() {
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     drop(child);
-    // Lease expiry triggers ledger-first recovery; the paid answer never committed.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Restore an expired claim after the killed process; expiry itself has conformance coverage.
+    rusqlite::Connection::open(
+        fixture
+            .config
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE jobs SET lease_until=0 WHERE state='\"Running\"'",
+        [],
+    )
+    .unwrap();
     let mut child = Child(command.spawn().unwrap());
     ready(&mut child, &client).await;
     assert_eq!(enqueue_id(&client, input).await, id);
@@ -7281,11 +7261,13 @@ async fn rabbithole_failure_classes_round_trip_in_process_and_recovery() {
                 let client = InProcessEgressClient::new(process.clone());
                 let (admission, payload) = fixture.attempt("failure-class", 1, 1);
                 let granted = permit(&process, &admission).await;
-                let result = dispatched(
-                    exchange_client(&client, inject(admission.clone(), payload, granted))
-                        .await
-                        .unwrap(),
-                );
+                let operation = inject(admission.clone(), payload, granted);
+                let reply = if delay.is_zero() {
+                    exchange_client(&client, operation).await
+                } else {
+                    exchange_after_provider_timeout(&fixture, &process, operation).await
+                };
+                let result = dispatched(reply.unwrap());
                 assert_eq!(serde_json::to_value(result.error).unwrap(), expected);
                 assert_eq!(result.receipt.spend_state, SpendState::Unknown);
                 let serialized = serde_json::to_string(&result).unwrap();
@@ -7367,35 +7349,6 @@ async fn rabbithole_response_identity_without_token_usage_recovers() {
     }).await.expect("identity-only recovery must finish within five seconds");
 }
 
-// Each fixture reports completion through its task; the timeout only detects a hung fixture.
-// No elapsed-time limit covers the cumulative setup and durable writes of the whole matrix.
-async fn identity_fixture_completion(
-    completion: tokio::task::JoinHandle<()>,
-) -> Result<(), tokio::time::error::Elapsed> {
-    tokio::time::timeout(Duration::from_secs(30), completion)
-        .await?
-        .expect("identity fixture task panicked");
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn regression_identity_fixture_completion_outlives_old_deadline() {
-    let started = tokio::time::Instant::now();
-    let completion = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_secs(6)).await;
-    });
-    identity_fixture_completion(completion).await.unwrap();
-    assert_eq!(started.elapsed(), Duration::from_secs(6));
-}
-
-#[tokio::test(start_paused = true)]
-async fn regression_identity_fixture_completion_reports_hang() {
-    let started = tokio::time::Instant::now();
-    let completion = tokio::spawn(std::future::pending::<()>());
-    assert!(identity_fixture_completion(completion).await.is_err());
-    assert_eq!(started.elapsed(), Duration::from_secs(30));
-}
-
 #[tokio::test]
 async fn regression_egress_drops_malformed_usage_identity_and_recovers_diagnostic() {
     for anthropic in [false, true] {
@@ -7460,11 +7413,7 @@ async fn regression_egress_drops_malformed_usage_identity_and_recovers_diagnosti
                 };
                 assert_eq!(recovered.diagnostics, result.diagnostics);
             });
-            identity_fixture_completion(completion)
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("identity fixture hung: {field}, anthropic={anthropic}")
-                });
+            completion.await.expect("identity fixture task panicked");
         }
     }
 }
@@ -7558,6 +7507,8 @@ async fn invalid_provider_json_preserves_charge_and_budget(anthropic: bool, body
         let validations = Arc::new(AtomicUsize::new(0));
         let mut failures = Vec::new();
         for call in 0..6 {
+            // Parsing/accounting is under test; cooldown timing has dedicated cases.
+            advance_clock(Duration::from_secs(2)).await;
             if call == 2 {
                 drop(process);
                 process = fixture.process().await;

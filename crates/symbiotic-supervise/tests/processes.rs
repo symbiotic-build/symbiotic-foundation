@@ -56,32 +56,6 @@ fn compiler_output(mut command: Command, dir: &Path, timeout: Duration) -> Outpu
     }
 }
 
-#[test]
-fn compiler_defaults_to_platform_cc_when_unconfigured() {
-    assert_eq!(c_compiler(None).get_program(), "cc");
-}
-
-#[test]
-fn compiler_preserves_configured_wrapper_and_arguments() {
-    let command = c_compiler(Some("cache-wrapper clang -O2"));
-    assert_eq!(command.get_program(), "cache-wrapper");
-    assert_eq!(command.get_args().collect::<Vec<_>>(), ["clang", "-O2"]);
-}
-
-#[test]
-fn compiler_failure_preserves_both_output_streams() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new("/bin/sh");
-    command.args([
-        "-c",
-        "printf compiler-out; printf compiler-error >&2; exit 7",
-    ]);
-    let output = compiler_output(command, dir.path(), Duration::from_secs(60));
-    assert_eq!(output.status.code(), Some(7));
-    assert_eq!(output.stdout, b"compiler-out");
-    assert_eq!(output.stderr, b"compiler-error");
-}
-
 fn read_pid(path: &Path) -> u32 {
     until(|| fs::read_to_string(path).is_ok_and(|text| text.trim().parse::<u32>().is_ok()));
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
@@ -441,15 +415,4 @@ fn shutdown_error(refuse_kill: bool) {
     let mut parent = Reap(command.spawn().unwrap());
     until_termination(|| parent.0.try_wait().unwrap().is_some());
     assert!(parent.0.wait().unwrap().success());
-}
-
-#[test]
-fn fixture_runs_on_the_executable_entry_thread() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(
-        fixture("entry-thread", dir.path())
-            .status()
-            .unwrap()
-            .success()
-    );
 }

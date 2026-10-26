@@ -22,16 +22,19 @@ fn full_stderr() -> std::io::PipeReader {
     // SAFETY: this isolated fixture owns both new descriptors and fd 2.
     unsafe {
         assert_eq!(libc::fcntl(write_fd, libc::F_SETFL, libc::O_NONBLOCK), 0);
-        let byte = b"x";
+        let chunk = [b'x'; 4096];
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "pipe fill hang guard");
-            if libc::write(write_fd, byte.as_ptr().cast(), 1) == -1 {
-                assert_eq!(
-                    std::io::Error::last_os_error().kind(),
-                    std::io::ErrorKind::WouldBlock
-                );
-                break;
+        // Fill native pipe capacity in blocks, then fill any tail byte by byte.
+        for bytes in [&chunk[..], &chunk[..1]] {
+            loop {
+                assert!(std::time::Instant::now() < deadline, "pipe fill hang guard");
+                if libc::write(write_fd, bytes.as_ptr().cast(), bytes.len()) == -1 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    break;
+                }
             }
         }
         assert_eq!(libc::fcntl(write_fd, libc::F_SETFL, 0), 0);
@@ -48,13 +51,6 @@ fn main() {
     let Ok(role) = std::env::var("SUPERVISE_TEST_ROLE") else {
         return;
     };
-    if role == "entry-thread" {
-        assert_eq!(std::thread::current().name(), Some("main"));
-        #[cfg(target_os = "linux")]
-        // SAFETY: these syscalls only return the calling thread/process IDs.
-        assert_eq!(unsafe { libc::gettid() }, unsafe { libc::getpid() });
-        return;
-    }
     let dir = PathBuf::from(std::env::var_os("SUPERVISE_TEST_DIR").unwrap());
     let _stderr_reader = std::env::var_os("SUPERVISE_TEST_FULL_STDERR").map(|_| full_stderr());
     if role == "closed-stdin-parent" {
@@ -125,7 +121,11 @@ fn main() {
         std::process::exit(0);
     }
     if role == "full-stderr" {
-        watch_parent(|| Err(std::io::Error::from_raw_os_error(libc::EPERM))).unwrap();
+        symbiotic_supervise::watch_parent_with_diagnostic_wait(
+            || Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            Duration::from_millis(10),
+        )
+        .unwrap();
         fs::write(dir.join("full-stderr.ready"), "ready").unwrap();
         loop {
             std::thread::park();

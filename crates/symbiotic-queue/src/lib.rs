@@ -177,6 +177,11 @@ impl QueueError {
 /// blocking-task dispatch in [`Self::jobs`].
 #[async_trait]
 pub trait QueueBackend: Send + Sync {
+    /// Current queue time. Schedulers use the same clock as lease and retry deadlines.
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
     /// Execute an atomic generic-job operation using the trusted host's clock
     /// and versioned configuration. Authority verification belongs to the host
     /// inside the acceptance transaction. Sample the clock once after acquiring

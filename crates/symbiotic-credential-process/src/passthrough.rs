@@ -29,7 +29,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::{Notify, Semaphore},
-    time::Instant,
 };
 
 #[path = "passthrough_retry.rs"]
@@ -43,6 +42,7 @@ mod session;
 pub use session::NewSessionConfig;
 use session::{AccountRetries, SeenSessions};
 use symbiotic_ai_runtime::model::item_stream::{ItemEvent, ResponsesAdapter};
+use tokio::time::Instant;
 
 type Result<T> = std::result::Result<T, EgressError>;
 

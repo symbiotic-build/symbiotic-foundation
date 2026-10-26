@@ -1,6 +1,8 @@
 //! The runtime facade: shared limits across bindings, persistence with a
 //! state directory, and cache scoping. Loopback providers only.
 
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -218,7 +220,7 @@ async fn spend_dispatch_requires_an_explicit_state_directory() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spend_timeout_never_uses_the_unused_attempt_allowance() {
     let raw = Loopback::new(unique_identity()).slow(Duration::from_secs(2));
     let sink = Arc::new(InMemoryReceiptSink::default());
@@ -615,13 +617,21 @@ fn leased() -> ModelQueueConfig {
 /// The reported defect: a job timeout gives up on the first call while the
 /// provider works, and the identical call behind it must still finish.
 async fn an_abandoned_call_does_not_block_the_identical_request_behind_it(runtime: Runtime) {
-    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_500));
+    let mut raw = Loopback::new(unique_identity()).slow(Duration::from_millis(60));
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    raw.start_gate = Some(entered.clone());
     let chat = runtime
         .chat(binding(raw.clone()).with_policy(leased()))
         .unwrap();
 
-    let first = tokio::time::timeout(Duration::from_millis(500), chat.chat(request("same"))).await;
-    assert!(first.is_err(), "the first caller stops waiting");
+    let caller = chat.clone();
+    let first = tokio::spawn(async move { caller.chat(request("same")).await });
+    entered.wait().await;
+    first.abort();
+    assert!(
+        first.await.unwrap_err().is_cancelled(),
+        "the first caller stops waiting"
+    );
 
     let second = tokio::time::timeout(Duration::from_secs(20), chat.chat(request("same")))
         .await
@@ -636,7 +646,9 @@ async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
     runtime: Runtime,
     cache: ResponseCacheMode,
 ) {
-    let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
+    let mut raw = Loopback::new(unique_identity()).slow(Duration::from_millis(60));
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    raw.start_gate = Some(entered.clone());
     let chat = runtime
         .chat(
             binding(raw.clone())
@@ -645,16 +657,16 @@ async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call(
         )
         .unwrap();
 
-    let waiter = tokio::spawn({
-        let chat = chat.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            chat.chat(request("shared")).await
-        }
-    });
-    let first =
-        tokio::time::timeout(Duration::from_millis(300), chat.chat(request("shared"))).await;
-    assert!(first.is_err(), "the first caller stops waiting");
+    let caller = chat.clone();
+    let first = tokio::spawn(async move { caller.chat(request("shared")).await });
+    entered.wait().await;
+    let caller = chat.clone();
+    let waiter = tokio::spawn(async move { caller.chat(request("shared")).await });
+    first.abort();
+    assert!(
+        first.await.unwrap_err().is_cancelled(),
+        "the first caller stops waiting"
+    );
 
     let waited = tokio::time::timeout(Duration::from_secs(5), waiter)
         .await
@@ -2366,7 +2378,7 @@ async fn execution_explicit_invocations_bypass_cache_and_recover_their_own_outpu
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spend_credential_rotation_cannot_bypass_an_unknown_timeout() {
     let dir = private_tempdir();
     let runtime = persistent(dir.path());
@@ -2535,9 +2547,10 @@ async fn execution_changed_inputs_after_release_reports_no_accepted_attempt() {
 async fn fdn_idle_runtime_deletes_expired_recovery_without_reopening() {
     let dir = private_tempdir();
     let runtime = Runtime::open(RuntimeConfig {
+        clock: test_clock::clock(),
         state_dir: Some(dir.path().to_path_buf()),
         retention: Duration::from_secs(2),
-        maintenance_interval: Duration::from_millis(10),
+        maintenance_interval: Duration::from_millis(100),
         ..RuntimeConfig::default()
     })
     .unwrap();
@@ -2561,6 +2574,9 @@ async fn fdn_idle_runtime_deletes_expired_recovery_without_reopening() {
         .unwrap()
     };
     assert_eq!(payload_count(), 1);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::time::resume();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while payload_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2631,9 +2647,10 @@ async fn fdn_idle_maintenance_failure_remains_visible_after_success() {
 async fn fdn_maintenance_lives_while_a_provider_survives_every_runtime() {
     let dir = private_tempdir();
     let runtime = Runtime::open(RuntimeConfig {
+        clock: test_clock::clock(),
         state_dir: Some(dir.path().to_path_buf()),
         retention: Duration::from_secs(1),
-        maintenance_interval: Duration::from_millis(10),
+        maintenance_interval: Duration::from_millis(100),
         ..RuntimeConfig::default()
     })
     .unwrap();
@@ -2658,6 +2675,9 @@ async fn fdn_maintenance_lives_while_a_provider_survives_every_runtime() {
         )
         .unwrap()
     };
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while payload_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;

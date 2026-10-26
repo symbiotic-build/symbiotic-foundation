@@ -24,6 +24,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { workspace = true, features = ["hooks"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 tempfile = "3"

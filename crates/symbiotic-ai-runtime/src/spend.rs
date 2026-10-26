@@ -105,7 +105,11 @@ pub(crate) fn constrain_job_recovery_in(
 }
 
 /// Ledger handle for the versioned queue database. Opens only current queue state.
-pub struct SqliteSpendLedger(pub(super) Mutex<Connection>, std::time::Duration);
+pub struct SqliteSpendLedger(
+    pub(super) Mutex<Connection>,
+    std::time::Duration,
+    symbiotic_queue::jobs::JobClock,
+);
 impl SqliteSpendLedger {
     /// Open an already initialized Foundation queue database.
     pub fn open(path: &Path) -> Result<Self, ModelError> {
@@ -123,13 +127,38 @@ impl SqliteSpendLedger {
         if version != symbiotic_queue_sqlite::QUEUE_SCHEMA_VERSION {
             return Err(storage(()));
         }
-        Ok(Self(Mutex::new(conn), symbiotic_model::DEFAULT_RETENTION))
+        Ok(Self(
+            Mutex::new(conn),
+            symbiotic_model::DEFAULT_RETENTION,
+            std::sync::Arc::new(chrono::Utc::now),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        let mut conn = Connection::open_in_memory().unwrap();
+        symbiotic_queue_sqlite::SqliteQueue::initialize_connection(&mut conn).unwrap();
+        Self(
+            Mutex::new(conn),
+            symbiotic_model::DEFAULT_RETENTION,
+            std::sync::Arc::new(chrono::Utc::now),
+        )
     }
 
     /// Use the runtime's existing retention window for saved answers.
     pub fn with_retention(mut self, retention: std::time::Duration) -> Self {
         self.1 = retention;
         self
+    }
+
+    /// Use a trusted host clock for spend and recovery deadlines.
+    pub fn with_clock(mut self, clock: symbiotic_queue::jobs::JobClock) -> Self {
+        self.2 = clock;
+        self
+    }
+
+    pub(crate) fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        (self.2)()
     }
 
     pub(crate) fn retention(&self) -> std::time::Duration {
@@ -140,7 +169,7 @@ impl SqliteSpendLedger {
         tx: &rusqlite::Transaction<'_>,
         reference: &SpendReceiptRef,
     ) -> Result<(), ModelError> {
-        let old = receipt_in(tx, reference)?.ok_or_else(conflict)?;
+        let old = receipt_in(tx, reference, chrono::Utc::now())?.ok_or_else(conflict)?;
         if old.state != SpendState::Unknown && !old.pre_dispatch_released {
             return Err(conflict());
         }
@@ -153,7 +182,7 @@ impl SqliteSpendLedger {
     /// Clear all expired answers in indexed batches of at most 64 rows.
     pub fn expire_recovery(&self) -> Result<usize, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = self.now().to_rfc3339();
         let mut removed = 0;
         loop {
             let batch = conn.execute(
@@ -186,14 +215,14 @@ impl SqliteSpendLedger {
     ) -> Result<bool, ModelError> {
         // The rowid order is acceptance order: each predecessor must be released
         // before another attempt is accepted. Carry the original ceiling and count.
-        let previous = invocation_in(conn, &r.account, &r.invocation)?;
+        let previous = invocation_in(conn, &r.account, &r.invocation, chrono::Utc::now())?;
         if previous
             .as_ref()
             .is_some_and(|p| p.reservation.binding != r.binding)
         {
             return Err(conflict());
         }
-        if let Some(old) = receipt_in(conn, &r.reference)? {
+        if let Some(old) = receipt_in(conn, &r.reference, chrono::Utc::now())? {
             return if old.reservation == *r {
                 Ok(false)
             } else {
@@ -304,7 +333,7 @@ impl SqliteSpendLedger {
         if output.as_ref() == Some(&serde_json::json!({"output_received": true})) {
             return Ok(());
         }
-        let old = receipt_in(tx, r)?.ok_or_else(conflict)?;
+        let old = receipt_in(tx, r, chrono::Utc::now())?.ok_or_else(conflict)?;
         let (erased, job_deadline) =
             job_recovery_policy(tx, invocation, &old.reservation.invocation)?;
         let deadline = match (deadline, job_deadline) {
@@ -353,7 +382,7 @@ impl SqliteSpendLedger {
         usage: Option<UsageTrace>,
         output: Option<serde_json::Value>,
     ) -> Result<(), ModelError> {
-        let old = receipt_in(conn, reference)?.ok_or_else(conflict)?;
+        let old = receipt_in(conn, reference, chrono::Utc::now())?.ok_or_else(conflict)?;
         if (state == SpendState::Settled
             && usage
                 .as_ref()
@@ -408,11 +437,12 @@ impl SqliteSpendLedger {
 pub(crate) fn receipt_in(
     conn: &Connection,
     reference: &SpendReceiptRef,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<SpendReceipt>, ModelError> {
     let row = conn
         .query_row(
             "SELECT reservation, state, usage, output, pre_dispatch_released, attempt_limit, attempts_used, CASE WHEN recovery_expires_at>?2 THEN recovery ELSE NULL END FROM spend_receipts WHERE reference=?1",
-            params![reference.as_str(), chrono::Utc::now().to_rfc3339()],
+            params![reference.as_str(), now.to_rfc3339()],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -482,9 +512,10 @@ pub(crate) fn invocation_in(
     conn: &Connection,
     account: &str,
     invocation: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<SpendReceipt>, ModelError> {
     invocation_reference_in(conn, account, invocation)?
-        .map(|reference| receipt_in(conn, &reference))
+        .map(|reference| receipt_in(conn, &reference, now))
         .transpose()
         .map(Option::flatten)
 }
@@ -568,7 +599,8 @@ impl SpendLedger for SqliteSpendLedger {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        let old = receipt_in(&tx, &handoff.reservation.reference)?.ok_or_else(conflict)?;
+        let old = receipt_in(&tx, &handoff.reservation.reference, chrono::Utc::now())?
+            .ok_or_else(conflict)?;
         if old.reservation != handoff.reservation
             || old.state != SpendState::Unknown
             || old.reservation.account != account
@@ -595,7 +627,7 @@ impl SpendLedger for SqliteSpendLedger {
     }
     fn receipt(&self, reference: &SpendReceiptRef) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
-        receipt_in(&conn, reference)
+        receipt_in(&conn, reference, self.now())
     }
     fn invocation(
         &self,
@@ -603,7 +635,7 @@ impl SpendLedger for SqliteSpendLedger {
         invocation: &str,
     ) -> Result<Option<SpendReceipt>, ModelError> {
         let conn = self.0.lock().map_err(storage)?;
-        invocation_in(&conn, account, invocation)
+        invocation_in(&conn, account, invocation, self.now())
     }
     fn finish(
         &self,
@@ -617,15 +649,7 @@ impl SpendLedger for SqliteSpendLedger {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage)?;
-        Self::save_recovery_in(
-            &tx,
-            r,
-            &output,
-            self.1,
-            None,
-            invocation,
-            chrono::Utc::now(),
-        )?;
+        Self::save_recovery_in(&tx, r, &output, self.1, None, invocation, self.now())?;
         Self::finish_in(&tx, r, state, usage, output)?;
         tx.commit().map_err(storage)
     }

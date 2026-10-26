@@ -83,6 +83,7 @@ impl ModelJobAdmission for Admission {
             &signed.attempt,
             &reservation.reference,
             route.max_attempts,
+            &process.inner.clock,
         )
         .map_err(|error| match error {
             EgressError::StateUnavailable => JobError::Storage,
@@ -115,6 +116,7 @@ impl ModelJobAdmission for Admission {
             &digest(&signed.attempt).map_err(storage)?,
             key,
             None,
+            &process.inner.clock,
         )
         .map(|_| ())
         .map_err(|error| match error {

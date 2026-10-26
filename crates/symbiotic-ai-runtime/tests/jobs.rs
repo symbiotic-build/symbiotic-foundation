@@ -1,4 +1,6 @@
 //! PR 3 acceptance cases against the real ledger/job transactions.
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
 use async_trait::async_trait;
 use std::{
     sync::{
@@ -154,6 +156,9 @@ fn request() -> ChatRequest {
     }
 }
 fn runtime(path: &std::path::Path) -> Runtime {
+    runtime_with_config(path, RuntimeConfig::default())
+}
+fn runtime_with_config(path: &std::path::Path, config: RuntimeConfig) -> Runtime {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -161,7 +166,7 @@ fn runtime(path: &std::path::Path) -> Runtime {
     }
     Runtime::open(RuntimeConfig {
         state_dir: Some(path.into()),
-        ..Default::default()
+        ..config
     })
     .unwrap()
 }
@@ -1399,23 +1404,25 @@ impl QueueReceiptSink for DelayedReceipt {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_receipt_sink_renews_lease_and_respects_cancellation() {
     for status in [ReceiptStatus::Queued, ReceiptStatus::Running] {
         for (cancel, expire) in [(false, false), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
-            drop(runtime(dir.path()));
             let sink = Arc::new(DelayedReceipt {
                 status,
                 entered: Notify::new(),
                 resume: Notify::new(),
             });
-            let r = Runtime::open(RuntimeConfig {
-                state_dir: Some(dir.path().into()),
-                receipt_sink: Some(sink.clone()),
-                ..Default::default()
-            })
-            .unwrap();
+            let clock = test_clock::clock();
+            let r = runtime_with_config(
+                dir.path(),
+                RuntimeConfig {
+                    clock: clock.clone(),
+                    receipt_sink: Some(sink.clone()),
+                    ..Default::default()
+                },
+            );
             let j = jobs(
                 &r,
                 JobConfig {
@@ -1425,7 +1432,18 @@ async fn slow_receipt_sink_renews_lease_and_respects_cancellation() {
             );
             let p = Provider::new();
             let id = enqueue(&j, spec("slow-receipt", &p)).await;
-            let runner = start(&j, p.clone()).await;
+            let runner = j
+                .start_chat(
+                    binding(p.clone()),
+                    RunnerConfig {
+                        heartbeat_interval_ms: Some(250),
+                        poll_interval_ms: 5,
+                        ..Default::default()
+                    },
+                    "chat".into(),
+                )
+                .await
+                .unwrap();
             tokio::time::timeout(Duration::from_secs(5), sink.entered.notified())
                 .await
                 .unwrap();
@@ -1433,7 +1451,7 @@ async fn slow_receipt_sink_renews_lease_and_respects_cancellation() {
             tokio::time::sleep(Duration::from_millis(1200)).await;
             let leased = row(&j, &id).await;
             assert_eq!(leased.state, JobState::Running);
-            assert!(leased.lease_until.unwrap() > chrono::Utc::now());
+            assert!(leased.lease_until.unwrap() > clock());
             assert_eq!(p.calls.load(Ordering::SeqCst), 0);
             if cancel {
                 j.request(JobRequest::Cancel(Selector::Ids(vec![id.clone()])))
@@ -2357,11 +2375,18 @@ async fn trial_purge_erases_cancelled_receiptless_direct_answer() {
     assert_eq!(p.calls.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn trial_enqueue_clamps_preexisting_answer_and_adoption_preserves_deadline() {
     for adopt in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let r = runtime(dir.path());
+        let clock = test_clock::clock();
+        let r = runtime_with_config(
+            dir.path(),
+            RuntimeConfig {
+                clock: clock.clone(),
+                ..Default::default()
+            },
+        );
         let j = jobs(&r, JobConfig::default());
         let p = Provider::new();
         let key = j.invocation_key("earlier-deadline").unwrap();
@@ -2369,7 +2394,7 @@ async fn trial_enqueue_clamps_preexisting_answer_and_adoption_preserves_deadline
             .await
             .unwrap();
         let mut s = spec("earlier-deadline", &p);
-        let until = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+        let until = clock() + chrono::Duration::milliseconds(500);
         s.recovery_until = Some(until);
         let id = enqueue(&j, s).await;
         if adopt {
@@ -2388,7 +2413,7 @@ async fn trial_enqueue_clamps_preexisting_answer_and_adoption_preserves_deadline
             assert_eq!(copies(dir.path()), 0);
         }
         tokio::time::sleep(
-            (until - chrono::Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(5),
+            (until - clock()).to_std().unwrap_or_default() + Duration::from_millis(5),
         )
         .await;
         assert!(
