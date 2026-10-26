@@ -24,6 +24,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+/// Provider-neutral output item stream and wire adapters.
+pub mod item_stream;
+
+pub use symbiotic_core::retry;
 pub use symbiotic_core::{
     DiagnosticCode, FailureClass, ModelIdentity, ProviderPrincipalId, TenantId,
 };
@@ -1080,6 +1084,7 @@ impl AnswerRecovery {
 struct QueuedCall<Req> {
     _maintenance: Option<Arc<dyn Send + Sync>>,
     queue: Arc<dyn QueueBackend>,
+    rate_state: ModelRateState,
     spend: Arc<dyn SpendLedger>,
     accepted_spend: Option<AcceptedSpendHandoff>,
     answer_recovery: AnswerRecovery,
@@ -1746,6 +1751,7 @@ where
     let call_state = Arc::new(QueuedCall {
         _maintenance: runtime.maintenance.clone(),
         queue: runtime.queue.clone(),
+        rate_state: runtime.rate_state.clone(),
         spend: runtime.spend.clone(),
         accepted_spend: runtime.accepted_spend.clone(),
         answer_recovery: runtime.answer_recovery,
@@ -1887,27 +1893,34 @@ where
         };
         let throttle_started = std::time::Instant::now();
         wait_for_model_cooldown(queue.as_ref(), queue_id).await?;
-        let rate =
-            match check_model_budget(&runtime.rate_state, queue_id, config, &this.request).await? {
-                RateCheck::Cleared(rate) => rate,
-                RateCheck::Wait(wait) => {
-                    // Wait for budget in short slices without holding a model
-                    // slot, and look at the item and the cache in between: a
-                    // duplicate whose answer arrives returns without spending.
-                    drop(permit);
-                    tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
-                    let slice = throttle_started.elapsed();
-                    throttle_wait += slice;
-                    waiting_attempt = Some((attempt_started, attempt_throttle + slice));
-                    if let Followed::Answer(answer) = this
-                        .waiting_on_item(&call_state, &mut enqueue, config)
-                        .await?
-                    {
-                        return Ok(answer);
-                    }
-                    continue;
+        let rate = match check_model_budget(
+            &runtime.rate_state,
+            queue_id,
+            config,
+            &this.request,
+            Some(queue.as_ref()),
+        )
+        .await?
+        {
+            RateCheck::Cleared(rate) => rate,
+            RateCheck::Wait(wait) | RateCheck::Cooldown(wait) => {
+                // Wait for budget in short slices without holding a model
+                // slot, and look at the item and the cache in between: a
+                // duplicate whose answer arrives returns without spending.
+                drop(permit);
+                tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
+                let slice = throttle_started.elapsed();
+                throttle_wait += slice;
+                waiting_attempt = Some((attempt_started, attempt_throttle + slice));
+                if let Followed::Answer(answer) = this
+                    .waiting_on_item(&call_state, &mut enqueue, config)
+                    .await?
+                {
+                    return Ok(answer);
                 }
-            };
+                continue;
+            }
+        };
         let throttled = throttle_started.elapsed();
         attempt_throttle += throttled;
         throttle_wait += throttled;
@@ -2097,7 +2110,7 @@ async fn run_attempt<P, Req, Res, F, Fut>(
     call_state: Arc<QueuedCall<Req>>,
     item_id: QueueItemId,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    rate: Option<RateGrant>,
+    rate: ModelRequestGrant,
     provider: P,
     call: F,
     clock: AttemptClock,
@@ -2276,16 +2289,17 @@ where
                 failed.map_err(queue_error)?;
                 return Err(err);
             }
-            // Only an attempt that reaches the provider spends rate budget.
-            if let Some(rate) = rate
-                && let Err(err) = rate.charge()
-            {
-                let (err, failed) = this
-                    .abort_before_dispatch(&item, Some(&reference), err)
-                    .await;
-                failed.map_err(queue_error)?;
-                return Err(err);
-            }
+            // Retain the native account gate through the first transport poll.
+            let dispatch = match rate.charge() {
+                Ok(dispatch) => dispatch,
+                Err(err) => {
+                    let (err, failed) = this
+                        .abort_before_dispatch(&item, Some(&reference), err)
+                        .await;
+                    failed.map_err(queue_error)?;
+                    return Err(err);
+                }
+            };
             Ok(settle(
                 &call_state,
                 &item,
@@ -2293,7 +2307,7 @@ where
                 call,
                 &clock,
                 &reference,
-                &ownership_lost,
+                (&ownership_lost, dispatch),
             )
             .await)
         },
@@ -2398,10 +2412,11 @@ async fn dispatch_model<
     answer_recovery: AnswerRecovery,
     provider: &P,
     call: impl std::future::Future<Output = Result<T, ModelError>>,
+    dispatch: ModelDispatch,
 ) -> Result<T, ModelError> {
     let mut response = secrets::composed_result(
         provider,
-        within_timeout(queue, config.request_timeout_seconds, call).await,
+        within_timeout(queue, config.request_timeout_seconds, dispatch.start(call)).await,
     )?;
     // Direct keyless adapters return raw JSON; runtime bookkeeping never retains it.
     response.discard_raw();
@@ -2467,11 +2482,12 @@ where
                     &this.queue_id,
                     &this.config,
                     &this.request,
+                    Some(this.queue.as_ref()),
                 )
                 .await?
                 {
                     RateCheck::Cleared(rate) => break Ok::<_, ModelError>((slot, rate)),
-                    RateCheck::Wait(wait) => {
+                    RateCheck::Wait(wait) | RateCheck::Cooldown(wait) => {
                         drop(slot);
                         tokio::time::sleep(wait.min(RATE_WAIT_SLICE)).await;
                     }
@@ -2536,18 +2552,16 @@ where
         if run_blocking(move || owner.heartbeat()).await? {
             return Err(ModelError::Queue(DiagnosticCode::InvocationCompleted));
         }
-        if let Some(rate) = rate {
-            rate.charge()?;
-        }
+        let dispatch = rate.charge()?;
         let fingerprint = provider.credential_fingerprint();
         let owner = job.clone();
         let admission = run_blocking(move || owner.admit_request(fingerprint)).await;
-        Ok::<_, ModelError>((provider, admission))
+        Ok::<_, ModelError>((provider, admission, dispatch))
     })
     .await;
-    let provider = match prepared {
-        Ok((provider, Ok(()))) => provider,
-        Ok((_, Err(error))) => {
+    let (provider, dispatch) = match prepared {
+        Ok((provider, Ok(()), dispatch)) => (provider, dispatch),
+        Ok((_, Err(error), _)) => {
             // Admission precedes every transport future, so its refusal is known
             // zero charge and remains visible in the canonical job result.
             let owner = job.clone();
@@ -2573,6 +2587,7 @@ where
         }
     };
     let provider_started = Instant::now();
+    let send_guard = dispatch;
     let dispatch = this.clone();
     let transport_provider = provider.clone();
     let mut task = tokio::task::JoinSet::new();
@@ -2583,6 +2598,7 @@ where
             dispatch.answer_recovery,
             &transport_provider,
             call(transport_provider.clone(), dispatch.request.clone()),
+            send_guard,
         )
         .await
     });
@@ -2616,10 +2632,15 @@ where
                     error,
                 )?;
                 if is_transient(error) {
-                    side_error =
-                        note_model_cooldown(this.queue.as_ref(), &this.queue_id, error, delay)
-                            .await
-                            .err();
+                    side_error = note_model_cooldown(
+                        &this.rate_state,
+                        this.queue.as_ref(),
+                        &this.queue_id,
+                        error,
+                        delay,
+                    )
+                    .await
+                    .err();
                 }
                 if side_error.is_none() {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -2800,7 +2821,7 @@ async fn settle<P, Req, Res, F, Fut>(
     call: F,
     clock: &AttemptClock,
     reference: &SpendReceiptRef,
-    ownership_lost: &std::sync::atomic::AtomicBool,
+    dispatch: (&std::sync::atomic::AtomicBool, ModelDispatch),
 ) -> Settled<Res>
 where
     P: ModelProvider + Clone,
@@ -2816,6 +2837,7 @@ where
     F: FnOnce(P, Req) -> Fut,
     Fut: std::future::Future<Output = Result<Res, ModelError>>,
 {
+    let (ownership_lost, dispatch) = dispatch;
     let queue = this.queue.as_ref();
     let config = &this.config;
     let worker_id = this.worker_id.as_str();
@@ -2864,6 +2886,7 @@ where
         this.answer_recovery,
         &provider,
         call(provider.clone(), this.request.clone()),
+        dispatch,
     )
     .await;
     let provider_ms = elapsed_ms(provider_started);
@@ -3013,7 +3036,8 @@ where
             // Failed limiter state refuses visibly and cannot admit a retry.
             if is_transient(&err)
                 && let Err(cooldown_err) =
-                    note_model_cooldown(queue, &this.queue_id, &err, delay_ms).await
+                    note_model_cooldown(&this.rate_state, queue, &this.queue_id, &err, delay_ms)
+                        .await
             {
                 let failed = queue
                     .fail_with(
@@ -3048,9 +3072,14 @@ where
         }
         Err(err) => {
             if is_transient(&err)
-                && let Err(failure) =
-                    note_model_cooldown(queue, &this.queue_id, &err, config.retry_base_delay_ms)
-                        .await
+                && let Err(failure) = note_model_cooldown(
+                    &this.rate_state,
+                    queue,
+                    &this.queue_id,
+                    &err,
+                    config.retry_base_delay_ms,
+                )
+                .await
             {
                 let failed = queue
                     .fail_with(
@@ -3575,10 +3604,107 @@ type RateGates = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 
 /// Rate state owned by a runtime and shared only through its account keys.
 #[cfg(feature = "queue")]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ModelRateState {
     buckets: Arc<Mutex<HashMap<String, RateBucket>>>,
     gates: Arc<Mutex<RateGates>>,
+    cooldown_changes: tokio::sync::watch::Sender<()>,
+}
+
+#[cfg(feature = "queue")]
+impl Default for ModelRateState {
+    fn default() -> Self {
+        Self {
+            buckets: Default::default(),
+            gates: Default::default(),
+            cooldown_changes: tokio::sync::watch::channel(()).0,
+        }
+    }
+}
+
+/// Whether an undecoded request may begin under the shared account gate.
+#[cfg(feature = "queue")]
+pub enum ModelRequestAdmission {
+    /// A durable cooldown is active. Release admission and re-read its deadline.
+    Cooldown,
+    /// Request pacing needs this duration; no budget was charged.
+    Wait(Duration),
+    /// Holds admission until the transport starts or this value is dropped.
+    Ready(ModelRequestGrant),
+}
+
+#[cfg(feature = "queue")]
+impl ModelRateState {
+    /// Observe durable cooldown writes for every account in this runtime.
+    /// Notifications contain no account data; consumers re-read the queue backend.
+    pub fn subscribe_cooldowns(&self) -> tokio::sync::watch::Receiver<()> {
+        self.cooldown_changes.subscribe()
+    }
+
+    async fn gate(
+        &self,
+        queue_id: &QueueId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ModelError> {
+        let gate = self
+            .gates
+            .lock()
+            .map_err(|_| ModelError::Queue(DiagnosticCode::RateGateLockPoisoned))?
+            .entry(queue_id.0.clone())
+            .or_default()
+            .clone();
+        Ok(gate.lock_owned().await)
+    }
+
+    /// Check durable cooldown and request pacing under the existing account gate.
+    /// Undecoded transports cannot use typed input or provider-request limits.
+    pub async fn request_admission(
+        &self,
+        queue: &dyn QueueBackend,
+        queue_id: &QueueId,
+        config: &ModelQueueConfig,
+    ) -> Result<ModelRequestAdmission, ModelError> {
+        if config.input_units_per_minute.is_some() || config.provider_request_limit.is_some() {
+            return Err(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ));
+        }
+        match check_model_budget(self, queue_id, config, &(), Some(queue)).await? {
+            RateCheck::Cleared(grant) => Ok(ModelRequestAdmission::Ready(grant)),
+            RateCheck::Wait(wait) => Ok(ModelRequestAdmission::Wait(wait)),
+            RateCheck::Cooldown(_) => Ok(ModelRequestAdmission::Cooldown),
+        }
+    }
+
+    /// Hold the existing send-order gate for an account admission state change.
+    pub async fn send_gate(
+        &self,
+        queue_id: &QueueId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ModelError> {
+        self.gate(queue_id).await
+    }
+
+    /// Record a durable deadline ordered against every typed and undecoded send.
+    pub async fn note_cooldown(
+        &self,
+        queue: &dyn QueueBackend,
+        queue_id: &QueueId,
+        until: chrono::DateTime<Utc>,
+    ) -> Result<(), ModelError> {
+        let _gate = self.gate(queue_id).await?;
+        queue
+            .note_cooldown(queue_id, until)
+            .await
+            .map_err(queue_error)?;
+        self.cooldown_changes.send_replace(());
+        Ok(())
+    }
+}
+
+#[cfg(feature = "queue")]
+impl BudgetedModelRequest for () {
+    fn input_budget_units(&self) -> Result<u64, ModelError> {
+        Ok(0)
+    }
 }
 
 #[cfg(feature = "queue")]
@@ -3689,23 +3815,22 @@ struct RateCharge {
     amount: f64,
 }
 
-/// Rate budget cleared for one attempt that is about to claim its item.
+/// Unspent pacing allowance held under the shared account rate gate.
 ///
-/// It holds the queue's rate gate from the budget check through the claim,
-/// so no other caller is cleared for the same budget meanwhile.
-/// [`RateGrant::charge`] spends it once the claim succeeded, just before
-/// the provider call. Dropping it, because the item was not claimable (a
-/// duplicate holds it, or its retry time has not come), spends nothing.
+/// Typed attempts retain the gate through their queue claim. Undecoded
+/// transports call [`Self::start`] directly, without creating a queue item.
+/// Dropping an unspent grant consumes nothing. A started transport releases
+/// the gate after its first poll, before waiting for the response.
 #[cfg(feature = "queue")]
-struct RateGrant {
+pub struct ModelRequestGrant {
     state: ModelRateState,
     _gate: tokio::sync::OwnedMutexGuard<()>,
     charges: Vec<RateCharge>,
 }
 
 #[cfg(feature = "queue")]
-impl RateGrant {
-    fn charge(self) -> Result<(), ModelError> {
+impl ModelRequestGrant {
+    fn charge(self) -> Result<ModelDispatch, ModelError> {
         let mut buckets = self.state.buckets.lock().map_err(|_| {
             ModelError::Queue(symbiotic_core::DiagnosticCode::RateBucketLockPoisoned)
         })?;
@@ -3717,18 +3842,88 @@ impl RateGrant {
                 })?
                 .charge(charge.amount);
         }
-        Ok(())
+        drop(buckets);
+        Ok(ModelDispatch { _gate: self._gate })
+    }
+
+    /// Charge once and start a transport while ordered against cooldown recording.
+    /// Cancellation before this call charges nothing. The stream is not serialized.
+    pub async fn start<F: std::future::Future>(
+        self,
+        transport: F,
+    ) -> Result<F::Output, ModelError> {
+        self.start_checked(|| Ok(Some(())), transport)
+            .await?
+            .ok_or(ModelError::InvalidRequest(
+                DiagnosticCode::InvalidConfiguration,
+            ))
+    }
+
+    /// Recheck consumer admission immediately before charging and the first transport poll.
+    /// Returning None defers the send without charging pacing. The returned guard
+    /// orders consumer state changes through that first poll, then drops before waiting.
+    pub async fn start_checked<F, C, G>(
+        self,
+        check: C,
+        transport: F,
+    ) -> Result<Option<F::Output>, ModelError>
+    where
+        F: std::future::Future,
+        C: FnOnce() -> Result<Option<G>, ModelError>,
+    {
+        tokio::pin!(transport);
+        let mut admission = Some((self, check));
+        std::future::poll_fn(|cx| {
+            if let Some((grant, check)) = admission.take() {
+                let _guard = match check() {
+                    Ok(Some(g)) => g,
+                    Ok(None) => return std::task::Poll::Ready(Ok(None)),
+                    Err(e) => return std::task::Poll::Ready(Err(e)),
+                };
+                let dispatch = match grant.charge() {
+                    Ok(d) => d,
+                    Err(e) => return std::task::Poll::Ready(Err(e)),
+                };
+                let result = transport.as_mut().poll(cx);
+                drop(dispatch);
+                result.map(|out| Ok(Some(out)))
+            } else {
+                transport.as_mut().poll(cx).map(|out| Ok(Some(out)))
+            }
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "queue")]
+struct ModelDispatch {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+#[cfg(feature = "queue")]
+impl ModelDispatch {
+    async fn start<F: std::future::Future>(self, transport: F) -> F::Output {
+        tokio::pin!(transport);
+        let mut guard = Some(self);
+        std::future::poll_fn(|cx| {
+            let result = transport.as_mut().poll(cx);
+            // The first poll initiates the send. Never hold the gate while waiting
+            // for its answer or streaming its body, even if that poll returned Pending.
+            drop(guard.take());
+            result
+        })
+        .await
     }
 }
 
 /// Whether the queue's rate limits allow one more attempt of `request` now.
 #[cfg(feature = "queue")]
 enum RateCheck {
-    /// Go ahead. The grant (`None` when the policy sets no rate limit) is
-    /// spent on a successful claim.
-    Cleared(Option<RateGrant>),
+    /// Go ahead while retaining the account gate, including unpaced policies.
+    Cleared(ModelRequestGrant),
     /// Not enough budget for this long. Nothing was spent.
     Wait(Duration),
+    /// A cooldown was recorded before this request obtained the gate.
+    Cooldown(Duration),
 }
 
 /// Check the queue's rate limits for one more attempt of `request`, without
@@ -3740,6 +3935,7 @@ async fn check_model_budget<R>(
     queue_id: &QueueId,
     config: &ModelQueueConfig,
     request: &R,
+    queue: Option<&dyn QueueBackend>,
 ) -> Result<RateCheck, ModelError>
 where
     R: BudgetedModelRequest,
@@ -3765,17 +3961,14 @@ where
             amount: request.input_budget_units()? as f64,
         });
     }
-    if charges.is_empty() {
-        return Ok(RateCheck::Cleared(None));
+    let held = state.gate(queue_id).await?;
+    if let Some(queue) = queue
+        && let Some(until) = queue.cooldown_until(queue_id).await.map_err(queue_error)?
+        && let Ok(wait) = (until - Utc::now()).to_std()
+        && !wait.is_zero()
+    {
+        return Ok(RateCheck::Cooldown(wait));
     }
-    let gate = {
-        let mut gates = state
-            .gates
-            .lock()
-            .map_err(|_| ModelError::Queue(symbiotic_core::DiagnosticCode::RateGateLockPoisoned))?;
-        gates.entry(queue_id.0.clone()).or_default().clone()
-    };
-    let held = gate.lock_owned().await;
     let wait = {
         let mut buckets = state
             .buckets
@@ -3794,11 +3987,11 @@ where
             .max()
     };
     Ok(match wait {
-        None => RateCheck::Cleared(Some(RateGrant {
+        None => RateCheck::Cleared(ModelRequestGrant {
             state: state.clone(),
             _gate: held,
             charges,
-        })),
+        }),
         Some(wait) => RateCheck::Wait(wait),
     })
 }
@@ -3825,6 +4018,7 @@ async fn wait_for_model_cooldown(
 
 #[cfg(feature = "queue")]
 async fn note_model_cooldown(
+    rate_state: &ModelRateState,
     queue: &dyn QueueBackend,
     queue_id: &QueueId,
     err: &ModelError,
@@ -3838,8 +4032,8 @@ async fn note_model_cooldown(
     };
     let millis = retry_delay_ms.saturating_mul(multiplier).clamp(1, 60_000);
     let until_utc = Utc::now() + ChronoDuration::milliseconds(millis as i64);
-    queue
-        .note_cooldown(queue_id, until_utc)
+    rate_state
+        .note_cooldown(queue, queue_id, until_utc)
         .await
         .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
     Ok(())
@@ -6307,29 +6501,33 @@ mod tests {
 
         let state = ModelRateState::default();
         let cleared = |check: RateCheck| match check {
-            RateCheck::Cleared(grant) => grant.expect("a rate-limited policy returns a grant"),
-            RateCheck::Wait(wait) => panic!("budget is available, but asked to wait {wait:?}"),
+            RateCheck::Cleared(grant) => grant,
+            RateCheck::Wait(wait) | RateCheck::Cooldown(wait) => {
+                panic!("budget is available, but asked to wait {wait:?}")
+            }
         };
         // Cleared without a claim: nothing is spent, and the next caller is
         // cleared at once.
         drop(cleared(
-            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"), None)
                 .await
                 .unwrap(),
         ));
         cleared(
-            check_model_budget(&state, &queue_id, &config, &chat_request("first"))
+            check_model_budget(&state, &queue_id, &config, &chat_request("first"), None)
                 .await
                 .unwrap(),
         )
         .charge()
         .unwrap();
         // Spent: the next caller waits about a second for the refill.
-        match check_model_budget(&state, &queue_id, &config, &chat_request("second"))
+        match check_model_budget(&state, &queue_id, &config, &chat_request("second"), None)
             .await
             .unwrap()
         {
-            RateCheck::Wait(wait) => assert!(wait >= Duration::from_millis(900), "{wait:?}"),
+            RateCheck::Wait(wait) | RateCheck::Cooldown(wait) => {
+                assert!(wait >= Duration::from_millis(900), "{wait:?}")
+            }
             RateCheck::Cleared(_) => panic!("the budget was spent"),
         }
     }
@@ -6424,7 +6622,7 @@ mod tests {
         let request = chat_request("x");
         let queue = QueueId::new("account");
         let state = ModelRateState::default();
-        let RateCheck::Cleared(Some(grant)) = check_model_budget(&state, &queue, &policy, &request)
+        let RateCheck::Cleared(grant) = check_model_budget(&state, &queue, &policy, &request, None)
             .await
             .unwrap()
         else {
@@ -6438,7 +6636,7 @@ mod tests {
         .join();
         assert!(matches!(grant.charge(), Err(ModelError::Queue(_))));
         assert!(matches!(
-            check_model_budget(&state, &queue, &policy, &request).await,
+            check_model_budget(&state, &queue, &policy, &request, None).await,
             Err(ModelError::Queue(_))
         ));
         let state = ModelRateState::default();
@@ -6449,7 +6647,7 @@ mod tests {
         })
         .join();
         assert!(matches!(
-            check_model_budget(&state, &queue, &policy, &request).await,
+            check_model_budget(&state, &queue, &policy, &request, None).await,
             Err(ModelError::Queue(_))
         ));
     }

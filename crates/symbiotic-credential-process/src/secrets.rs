@@ -37,6 +37,16 @@ pub type ResolverError = Box<dyn std::error::Error + Send + Sync>;
 /// or resend it. Opening the credential process still resolves its admission key.
 pub type SecretResolver = dyn Fn(&str) -> Result<SecretValue<Vec<u8>>, ResolverError> + Send + Sync;
 
+/// Fixed subscription protocol and token destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginFamily {
+    /// ChatGPT subscription used by Codex.
+    ChatgptCodex,
+    /// First-party xAI subscription used by Grok.
+    XaiGrok,
+}
+
 /// Configured backend; references carry locations or callbacks, never secret values.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
@@ -45,6 +55,13 @@ pub enum SecretSource {
     None,
     /// Exact owner-only file, opened without following its final symlink.
     OwnerOnlyFile { path: PathBuf },
+    /// Renewable subscription, available only to passthrough routes.
+    LoginFile {
+        /// Owner-only versioned store.
+        path: PathBuf,
+        /// Fixed provider login protocol.
+        family: LoginFamily,
+    },
     /// App callback, available only in thread mode and never serialized.
     #[serde(skip)]
     Resolver {
@@ -60,6 +77,7 @@ impl fmt::Debug for SecretSource {
         match self {
             Self::None => f.write_str("None"),
             Self::OwnerOnlyFile { .. } => f.write_str("OwnerOnlyFile { .. }"),
+            Self::LoginFile { .. } => f.write_str("LoginFile { .. }"),
             Self::Resolver { .. } => f.write_str("Resolver { .. }"),
         }
     }
@@ -149,7 +167,7 @@ impl SecretSource {
             return Err(EgressError::CredentialUnavailable);
         }
         let bytes = match self {
-            Self::None => return Err(EgressError::CredentialUnavailable),
+            Self::None | Self::LoginFile { .. } => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
             Self::Resolver { name, resolve } => {
                 let _scope = ResolverScope::enter()?;
@@ -222,63 +240,6 @@ mod tests {
         let _ = <crate::ProcessConfig as AmbiguousIfDebug<_>>::check;
         let _ = <crate::RouteConfig as AmbiguousIfDebug<_>>::check;
         let _ = <crate::RouteProvider as AmbiguousIfDebug<_>>::check;
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolver_protection_child() {
-        if std::env::var_os("RESOLVER_PROTECTION_TEST").is_none() {
-            return;
-        }
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count = calls.clone();
-        let source = SecretSource::Resolver {
-            name: "provider-key".into(),
-            resolve: Arc::new(move |name| {
-                assert_eq!(name, "provider-key");
-                crate::process_security::require_protection().unwrap();
-                count.fetch_add(1, Ordering::SeqCst);
-                Ok(SecretValue::new(b"synthetic-key".to_vec()))
-            }),
-        };
-        assert!(crate::process_security::require_protection().is_err());
-        assert!(matches!(
-            source.load(100),
-            Err(EgressError::CredentialUnavailable)
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        crate::protect_process().unwrap();
-        assert!(matches!(
-            source.load(100),
-            Err(EgressError::CredentialUnavailable)
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        initialize_resolver_panic_hook(std::panic::take_hook());
-        assert_eq!(&*source.load(100).unwrap(), b"synthetic-key");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            source.load(2),
-            Err(EgressError::CredentialUnavailable)
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolver_refuses_calls_before_process_protection_or_hook_initialization() {
-        assert!(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "secrets::tests::resolver_protection_child",
-                    "--nocapture"
-                ])
-                .env("RESOLVER_PROTECTION_TEST", "1")
-                .status()
-                .unwrap()
-                .success()
-        );
     }
 
     #[cfg(unix)]

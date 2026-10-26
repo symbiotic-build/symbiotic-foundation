@@ -819,7 +819,8 @@ The `none` source is only for keyless provider routes, never admission keys.
 Unknown secret backends are refused during configuration deserialization.
 File values are exact UTF-8 bytes, with no automatic trimming. Files must be owned by
 the process UID, be regular, have no group/other permission bits, and not be symlinks.
-No remote secret backend or credential creation/rotation is performed.
+Static file values are never rotated by Foundation. Login renewal uses the
+[login account protocol](#passthrough-routes-and-login-accounts).
 Secret buffers and adapter key storage zeroize on drop.
 
 Configured providers include `open_ai_chat { operator, thinking, reasoning_effort }`,
@@ -956,3 +957,177 @@ covers in-process chat/Jev reservation release, recovered accounting, advancing
 retry dispatches and refusal at the configured attempt limit. Its fixture expires
 the existing durable cooldown between retries to avoid waiting for production jitter. All new network regressions
 have explicit deadlines; they do not qualify live providers.
+
+## Passthrough routes and login accounts
+
+Version-4 `ProcessConfig` accepts an optional `passthrough` section.
+`PassthroughConfig` names a second Unix socket, a connection limit, exact routes
+and an optional health file. A deployment may configure passthrough without typed
+routes. `ProcessConfig::validate_routes()` checks both route sets and their shared
+account policies without reading credentials or creating state. The existing
+free `validate_routes(routes, max_frame_bytes)` function checks typed routes only.
+
+Each `PassthroughRoute` binds an exact method and origin-form path to one HTTPS
+URL. Query strings, percent escapes, fragments, backslashes, duplicate request
+headers, `Transfer-Encoding` and `Expect` are refused. Requests require HTTP/1.1,
+`Host` and a bounded `Content-Length`. The existing `max_frame_bytes` setting
+bounds the complete HTTP header block. Route byte settings bound the body.
+The second socket uses the typed socket's owner-only directory check, bind lock
+and same-UID peer check. It accepts one request per connection.
+
+The provider receives the caller body unchanged. Only configured `forward_headers`
+are copied, with printable ASCII values of 1 to 8 192 bytes. Authentication,
+cookies, host, forwarding and hop-by-hop headers are excluded. The process injects
+the credential and `Accept-Encoding: identity`. The client ignores ambient proxies,
+disables HTTP retries and follows no redirects.
+
+Routes register with `Runtime::account_admission`. This facade uses the same
+`ModelAdmission` FIFO semaphore, `ModelRateState` request bucket and queue backend
+as typed providers. The backend's existing cooldown row remains authoritative;
+no passthrough queue, cooldown database or second scheduler is created. Registration
+requires matching slot caps, request rates and `rate_burst_seconds`. The burst
+setting defaults to zero, as in the existing runtime. Typed configuration routes
+use that default. Shared typed bindings must leave input-unit pacing and provider
+request limits unset. Raw requests consume the shared request bucket; their
+undecoded bodies have no typed input-unit estimate.
+Passthrough creates no spend reservation in this step.
+`ModelRequestGrant::start_checked` holds a consumer's admission guard through the
+first transport poll. A deferred send consumes no pacing. This orders login-wide
+new-session holds even when routes use distinct runtime account scopes. Failure
+counts share the runtime account scope; session holds share the login store.
+The bare cooldown backend costs one read before preparation and one under the
+send gate, plus a monotonic write when extending a cooldown. Session checks add
+bounded memory lookups and no database rows. Holding item events earns complete
+credential redaction; retaining original complete items earns exact continuation
+replay. The health file remains a derived view of that process and backend state.
+An eligible attempt reads the existing cooldown twice: before preparation and
+under the existing account rate gate immediately before dispatch. A 429 takes
+that gate for one monotonic deadline update. The gate stays held through the first
+transport poll, then releases while the response is pending. Typed sends use the
+same ordering. Waiting repeats the lookup after each deadline. The facade adds
+no stored copy.
+
+Slot waits last until admission or caller disconnect. Each send takes the existing
+rate gate, rechecks credential/cooldown state and charges pacing. First sends,
+resends and continuation sends use that same path. Both `login_required` and
+`renewal_failed` refuse admission after every wait. A static-key 401 gets a local
+fixed 401 without upstream headers. Login 401 renewal remains limited to one exchange.
+
+The Responses adapter classifies failures as `throttle`, `network`, `server` or
+`final`. One retry engine applies `retry_policy` overrides to defaults: unlimited
+same-route retries for throttle/network, three total attempts for server, and fail
+for final. HTTP Retry-After takes precedence over the shared core retry backoff on
+consecutive account failures. Successful completion resets that count. Optional
+`fallback_routes` names are used only by `switch`; an empty list means fail.
+`PassthroughConfig.retry_policies` contains named overrides selected through the
+local `x-symbiotic-retry-policy` header. Unknown names get 400.
+`CredentialProcess::open_with_retry_hook` supplies the embedded-only hook.
+Neither the header nor hook is sent upstream. The queue never relies on provider
+retry behavior in client tools.
+
+The caller may send local `x-symbiotic-request-id` with 1–64 printable ASCII bytes.
+Health lists identified waits with their reason and Unix-second start time.
+`x-symbiotic-queue-waited-ms` reports total waits before the first downstream byte.
+`max_queue_wait_seconds`, absent by default, bounds cooldown waiting only. Local
+bounded-wait responses carry only a computed Retry-After and local headers.
+
+`new_session.session_headers`, absent by default, identifies session tuples. Each
+route keeps a memory-only set of successful tuples, at most 100 000, oldest-first
+and expired after 24 h. Missing every configured header disables session treatment.
+With no hold, new sessions flow freely under ordinary account limits. A retried
+new-session 429 sets a login-wide hold using Retry-After or shared backoff without
+setting account cooldown. New-session waiters release their slots; seen sessions
+continue. After the hold, one probe is allowed until a new-session 2xx opens the
+gate. Another 429 extends the hold. Health exposes the hold's Unix deadline.
+
+The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque
+items, deltas and their identity, provider sequence, usage and classified errors.
+The first adapter is Responses SSE. Other stream dialects are visibly refused at
+validation until their adapters exist. Unchanged Responses events round-trip exactly.
+The credential process holds each item's events until its done event. It scrubs
+every string and each concatenated delta field against all known credential
+encodings, including rotated values, before releasing events in order.
+`max_held_event_bytes` defaults to 67 108 864 and bounds one held item's events.
+Overflow emits a visible error. Candidate-suffix machinery is removed.
+
+On a handled mid-answer failure, the queue discards partial output and continues
+with the original input plus every completed provider item exactly as received,
+including encrypted reasoning. Complete interleaved items survive partial-item
+discard. Release checks the current credential set and compacts discarded output
+positions. Content indexes and reasoning summary indexes keep delta fields separate.
+Joined attempts use the first response ID,
+contiguous sequence numbers and offset output indexes. Later created/in-progress
+events are suppressed. One final completed event contains all output items and
+summed reported usage. Fail decisions emit the original scrubbed error event.
+Caller disconnect cancels all work. Only JSON and uncompressed event streams are
+accepted. Idle timeout is classified as network failure and uses the same policy.
+Spend receipts and usage trailers remain step 2.
+
+Configured `return_headers` carry safe printable ASCII values of 1–8 192 bytes.
+Recognized provider rate-limit headers are forwarded on every status, including
+200, with the stricter 1–256 byte bound. The Responses adapter recognizes only
+primary/secondary used-percent, window-minutes, reset-at, limit-name and the four
+specified credit/reached-type headers. It accepts hyphenated server family names.
+Promotional headers are excluded. Values containing credentials are dropped.
+The latest safe provider rate-limit values and observation time appear in health.
+Responses without those headers leave the last observation. Authentication,
+cookies and hop headers are refused in configuration. Local responses carry no
+upstream headers. An unmatched method/path returns 404 `route_not_found`.
+
+`SecretSource::LoginFile { path, family }` is valid only for passthrough.
+`chatgpt_codex` and `xai_grok` are closed login families with fixed issuers,
+client IDs, renewal encodings and credential headers. The version-1 JSON store
+refuses unknown fields, wrong family values and insecure files. Tokens use
+zeroizing storage and have no diagnostic representation. A lifetime-exclusive
+nonblocking lock prevents another owner or import while the process runs.
+
+Renewal occurs within 300 s of expiry under one async mutex per store.
+Concurrent callers share the completed renewal. Before an exchange, the process
+writes and syncs a nonempty renewal fence and syncs its directory. It installs
+rotated tokens by syncing a temporary store, renaming it and syncing the directory.
+Import follows this same durable-install-before-fence-clear ordering.
+Only then does it truncate and sync the fence. A cancelled or uncertain exchange
+leaves the fence set and requires fresh import. A transport failure established
+before send clears the fence and permits renewal on the next request.
+One upstream 401 forces renewal and one resend. A second 401 marks
+`renewal_failed` and returns 401. It sets the existing refusal fence so restart
+still requires a fresh import; a reopened store reports `login_required`.
+The process refuses new admission before writing that terminal refusal fence.
+A fence write failure cannot restore the rejected login's in-process usability.
+An unusable login returns 503
+`{"error":{"code":"credential_unavailable"}}` without forwarding.
+
+The import command reads a native provider login without running a provider tool
+or making a network request:
+
+```sh
+symbiotic-credential-process login import --family chatgpt_codex --native native-login.json --store login.json
+```
+
+Import validates the provider-specific subscription scope and expiry, takes the
+same lifetime lock and atomically installs an owner-only store. Replacing a store
+requires `--replace`. A successful import clears the renewal fence. The native
+login file becomes stale after the first refresh-token rotation.
+
+When `health_path` is configured, the process atomically publishes version-1 JSON
+at startup, on state changes and at least every 10 s. Runtime cooldown-write
+notifications also trigger publication when typed providers set the deadline.
+Each replacement is synced and has mode 0640; the provisioned directory supplies its group. The file contains
+only `version`, `state`, `updated_at` and per-route `name`, `login`, `expires_at`
+and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
+`rate_limits_seen_at` and `new_session_hold_until`. Login states are `ok`, `expiring` within two days,
+`renewal_failed`, `login_required`, or `static`. SIGTERM and SIGINT publish
+`state: "stopping"` before closing the socket. Readers reject missing or malformed
+files, timestamps older than 30 s, stopping processes and unusable login states.
+There is no socket health endpoint.
+
+This first step adds no passthrough spend receipts or usage trailers. Typed-route
+admission, accounting and recovery retain their existing protocol.
+Provider fixtures use a test-only mapping to loopback HTTP; production routes
+always require HTTPS. Tests cover real Unix sockets and executable shutdown in
+[`passthrough.rs`](../../crates/symbiotic-credential-process/tests/passthrough.rs),
+with provider fixtures in
+[`passthrough_tests.rs`](../../crates/symbiotic-credential-process/src/passthrough_tests.rs).
+Login fixtures are in
+[`login.rs`](../../crates/symbiotic-credential-process/tests/login.rs)
+and the login module's unit tests.

@@ -166,6 +166,7 @@ impl Fixture {
             clock_rollback_warning_tolerance_seconds: 5,
             jobs: Default::default(),
             job_runner: Default::default(),
+            passthrough: None,
             routes: vec![route],
         };
         Self {

@@ -10,6 +10,12 @@ mod in_process;
 pub use in_process::InProcessEgressClient;
 
 mod jobs;
+#[cfg(unix)]
+pub mod login;
+#[cfg(unix)]
+pub mod passthrough;
+#[cfg(unix)]
+pub use passthrough::{PassthroughConfig, PassthroughMethod, PassthroughRoute};
 mod provider;
 mod registry;
 pub mod secrets;
@@ -194,7 +200,7 @@ pub struct ProcessConfig {
     pub admission_key: SecretSource,
     /// Finite upper bound on each secret, including the admission key.
     pub max_secret_bytes: usize,
-    /// Bound on each socket frame before allocation.
+    /// Maximum typed-frame or passthrough-header bytes.
     pub max_frame_bytes: u32,
     /// Maximum concurrent socket handlers; this is not a model scheduler.
     pub max_connections: usize,
@@ -212,9 +218,17 @@ pub struct ProcessConfig {
     pub job_runner: symbiotic_queue::runner::RunnerConfig,
     /// Approved routes; no caller-supplied destinations or secret paths.
     pub routes: Vec<RouteConfig>,
+    /// Optional same-UID HTTP passthrough server sharing the typed account limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<PassthroughConfig>,
 }
 
 impl ProcessConfig {
+    /// Validate both route sets and their shared policies without opening files.
+    pub fn validate_routes(&self) -> Result<(), EgressError> {
+        validated_config_registry(self).map(|_| ())
+    }
+
     /// Refuse callbacks before launching a child; closures cannot cross that boundary.
     pub fn validate_child_process(&self) -> Result<(), EgressError> {
         if std::iter::once(&self.admission_key)
@@ -249,6 +263,22 @@ pub fn validate_routes(routes: &[RouteConfig], max_frame_bytes: u32) -> Result<(
     validated_registry(routes, max_frame_bytes).map(|_| ())
 }
 
+fn validated_config_registry(
+    config: &ProcessConfig,
+) -> Result<Option<symbiotic_ai_runtime::model::ModelRegistry>, EgressError> {
+    let registry = if config.routes.is_empty() {
+        validate_frame_size(config.max_frame_bytes)?;
+        if config.passthrough.is_none() {
+            return Err(EgressError::InvalidRequest);
+        }
+        None
+    } else {
+        Some(validated_registry(&config.routes, config.max_frame_bytes)?)
+    };
+    passthrough::validate(config)?;
+    Ok(registry)
+}
+
 fn validated_registry(
     routes: &[RouteConfig],
     max_frame_bytes: u32,
@@ -259,6 +289,9 @@ fn validated_registry(
     }
     let mut identities = HashSet::new();
     for route in routes {
+        if matches!(route.secret, SecretSource::LoginFile { .. }) {
+            return Err(EgressError::InvalidRequest);
+        }
         validate_route(route, max_frame_bytes)?;
         if !identities.insert((&route.tenant, &route.route)) {
             return Err(EgressError::InvalidRequest);
@@ -343,6 +376,7 @@ struct Inner {
     // The final holder/waiter retires only its key under the lookup mutex.
     request_budget_dispatch: RequestBudgetDispatch,
     runtime: Runtime,
+    passthrough: Option<passthrough::Passthrough>,
     job_runners: tokio::sync::Mutex<HashMap<String, Option<symbiotic_queue::runner::JobRunner>>>,
     _process_lock: Arc<ProcessLock>,
 }
@@ -366,15 +400,14 @@ impl CredentialProcess {
         validate_frame_size(config.max_frame_bytes)?;
         if config.max_secret_bytes < 32
             || config.max_connections == 0
+            || config.max_connections > tokio::sync::Semaphore::MAX_PERMITS
             || config.io_timeout_seconds == 0
-            || config.routes.is_empty()
         {
             return Err(EgressError::InvalidRequest);
         }
         // Validate every route and shared account policy before touching state.
         // A lock or IO failure must not mask invalid deployment configuration.
-        let configured_registry =
-            Arc::new(validated_registry(&config.routes, config.max_frame_bytes)?);
+        let configured_registry = validated_config_registry(&config)?.map(Arc::new);
         let routes = config
             .routes
             .iter()
@@ -385,7 +418,7 @@ impl CredentialProcess {
         let process_lock = lock_process(&config.state_dir)?;
         let key = AdmissionKey::new(config.admission_key.load(config.max_secret_bytes)?.to_vec())?;
         let runtime = Runtime::open(RuntimeConfig {
-            registry: Some(configured_registry),
+            registry: configured_registry,
             state_dir: Some(config.state_dir.clone()),
             ..RuntimeConfig::default()
         })
@@ -393,6 +426,7 @@ impl CredentialProcess {
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
+        let passthrough = passthrough::Passthrough::open(&config, &runtime)?;
         // Replay and ledger acceptance share the runtime operational database.
         let registry =
             Registry::open(&config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE))?;
@@ -404,10 +438,27 @@ impl CredentialProcess {
                 registry: Mutex::new(registry),
                 request_budget_dispatch: RequestBudgetDispatch::default(),
                 runtime,
+                passthrough,
                 job_runners: tokio::sync::Mutex::new(HashMap::new()),
                 _process_lock: Arc::new(process_lock),
             }),
         })
+    }
+
+    /// Open with an embedded-only retry decision hook. JSON cannot configure the hook.
+    #[cfg(unix)]
+    pub fn open_with_retry_hook(
+        config: ProcessConfig,
+        hook: passthrough::RetryHook,
+    ) -> Result<Self, EgressError> {
+        let mut process = Self::open(config)?;
+        let inner = Arc::get_mut(&mut process.inner).ok_or(EgressError::StateUnavailable)?;
+        let pass = inner
+            .passthrough
+            .as_mut()
+            .ok_or(EgressError::InvalidRequest)?;
+        pass.retry_hook = Some(hook);
+        Ok(process)
     }
 
     /// Deployment settings without credential values.
@@ -1178,6 +1229,7 @@ mod tests {
             clock_rollback_warning_tolerance_seconds: 5,
             jobs: Default::default(),
             job_runner: Default::default(),
+            passthrough: None,
             routes: vec![route],
         };
         provider::REGISTRY_BUILDS.set(0);

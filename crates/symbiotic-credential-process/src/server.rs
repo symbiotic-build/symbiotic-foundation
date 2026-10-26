@@ -11,7 +11,10 @@ use tokio::{net::UnixListener, sync::Semaphore};
 /// The socket lock serializes probe, stale unlink and bind across state owners.
 /// An active listener or non-socket path is always refused.
 pub fn bind(process: &CredentialProcess) -> Result<UnixListener, EgressError> {
-    let path = &process.config().socket_path;
+    bind_path(&process.config().socket_path)
+}
+
+pub(crate) fn bind_path(path: &std::path::Path) -> Result<UnixListener, EgressError> {
     let parent = path.parent().ok_or(EgressError::InvalidRequest)?;
     symbiotic_ai_runtime::model::private_fs::check_private_dir(parent)
         .map_err(|_| EgressError::StateUnavailable)?;
