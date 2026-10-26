@@ -680,10 +680,7 @@ async fn connection(process: &CredentialProcess, mut socket: UnixStream) -> Resu
     .await
     {
         Ok(Ok(request)) => request,
-        _ => {
-            fixed(&mut socket, 400, "invalid_request", &[]).await?;
-            return Ok(());
-        }
+        _ => return refuse(process, socket, 400, "invalid_request").await,
     };
     let pass = process
         .inner
@@ -695,12 +692,10 @@ async fn connection(process: &CredentialProcess, mut socket: UnixStream) -> Resu
             && route.config.path == request.path
             && route.config.method.text() == request.method
     }) else {
-        fixed(&mut socket, 404, "route_not_found", &[]).await?;
-        return Ok(());
+        return refuse(process, socket, 404, "route_not_found").await;
     };
     if request.length > route.config.max_request_bytes {
-        fixed(&mut socket, 413, "request_too_large", &[]).await?;
-        return Ok(());
+        return refuse(process, socket, 413, "request_too_large").await;
     }
     let mut body = vec![0; request.length];
     tokio::time::timeout(timeout, socket.read_exact(&mut body))
@@ -819,6 +814,26 @@ async fn finish(write: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> 
         .write_all(b"0\r\n\r\n")
         .await
         .map_err(|_| EgressError::Transport)
+}
+/// Answer before the request body is read, then drain the caller's unread bytes.
+/// Closing a Unix stream with unread input resets the peer on Linux, which can
+/// discard this response before the caller reads it.
+async fn refuse(
+    process: &CredentialProcess,
+    mut socket: UnixStream,
+    status: u16,
+    code: &str,
+) -> Result<()> {
+    fixed(&mut socket, status, code, &[]).await?;
+    let _ = socket.shutdown().await;
+    let unread = u64::from(process.config().max_frame_bytes);
+    let timeout = Duration::from_secs(process.config().io_timeout_seconds);
+    let _ = tokio::time::timeout(
+        timeout,
+        tokio::io::copy(&mut (&mut socket).take(unread), &mut tokio::io::sink()),
+    )
+    .await;
+    Ok(())
 }
 async fn fixed(
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
