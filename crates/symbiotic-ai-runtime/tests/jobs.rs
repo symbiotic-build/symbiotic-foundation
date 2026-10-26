@@ -350,7 +350,7 @@ async fn assert_finish_reason_paths<P: ChatProvider + Clone + 'static>(
                             admission: None, limits: JobLimits { max_attempts: 1 }, recovery_until: None,
                         }).await;
                         let runner = j.start_chat(configured.clone(), RunnerConfig {
-                            poll_interval_ms: 5, ..Default::default()
+                            worker_count: 1, poll_interval_ms: 5, ..Default::default()
                         }, "chat".into()).await.unwrap();
                         wait_state(&j, &id, JobState::Succeeded).await;
                         runner.shutdown().await.unwrap();
@@ -1436,6 +1436,7 @@ async fn slow_receipt_sink_renews_lease_and_respects_cancellation() {
                 .start_chat(
                     binding(p.clone()),
                     RunnerConfig {
+                        worker_count: 1,
                         heartbeat_interval_ms: Some(250),
                         poll_interval_ms: 5,
                         ..Default::default()

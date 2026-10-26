@@ -331,7 +331,10 @@ impl Fixture {
             io_timeout_seconds: 2,
             clock_rollback_warning_tolerance_seconds: 5,
             jobs: Default::default(),
-            job_runner: Default::default(),
+            job_runner: symbiotic_queue::runner::RunnerConfig {
+                poll_interval_ms: 5,
+                ..Default::default()
+            },
             passthrough: None,
             routes: vec![RouteConfig {
                 answer_recovery: Default::default(),
@@ -2799,7 +2802,17 @@ async fn retrieval_dispatch_supports_keyless_permits_and_one_provider_request() 
 
 #[tokio::test]
 async fn grant_revocation_preserves_accepted_handoff_and_accounting() {
-    let fixture = Fixture::new(200, "accepted answer".into(), Duration::from_millis(250)).await;
+    let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let fixture = Fixture::with_response_gate(
+        200,
+        "accepted answer".into(),
+        Duration::ZERO,
+        r#""0.00001234567890123456789""#,
+        false,
+        false,
+        Some(response_gate.clone()),
+    )
+    .await;
     let process = fixture.process().await;
     let (admission, payload) = fixture.attempt("accepted-before-revocation", 1, 10);
     let granted = permit(&process, &admission).await;
@@ -2819,6 +2832,7 @@ async fn grant_revocation_preserves_accepted_handoff_and_accounting() {
     assert_eq!(retained.attempt_id, admission.attempt.attempt_id());
     assert_eq!(retained.spend_state, SpendState::Unknown);
     revoke(&process, 11).await;
+    response_gate.add_permits(1);
     let result = task.await.unwrap();
     assert_eq!(result.receipt.reference, retained.reference);
     assert_eq!(result.receipt.status, DispatchStatus::Succeeded);
@@ -8328,8 +8342,9 @@ fn assert_reconciliation_required(result: &DispatchResult) {
 
 #[tokio::test]
 async fn regression_unresolved_request_different_input_proceeds_until_reconciliation() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        for policy in [None, Some(None), Some(Some(0))] {
+    for policy in [None, Some(None), Some(Some(0))] {
+        // Each completed policy case is progress; retain a per-case hang guard.
+        tokio::time::timeout(Duration::from_secs(5), async {
             let mut fixture = Fixture::new(200, "answer".into(), Duration::ZERO).await;
             if let Some(renewal) = policy {
                 configure_request_budget(&mut fixture, 3, renewal);
@@ -8378,10 +8393,10 @@ async fn regression_unresolved_request_different_input_proceeds_until_reconcilia
             let resolved = request_budget_call(&fixture, &process, "resolved", false, false).await;
             assert!(resolved.error.is_none() && resolved.output.is_some());
             assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
-        }
-    })
-    .await
-    .expect("bounded unresolved request identity regression");
+        })
+        .await
+        .expect("bounded unresolved request identity policy case");
+    }
 }
 
 #[tokio::test]

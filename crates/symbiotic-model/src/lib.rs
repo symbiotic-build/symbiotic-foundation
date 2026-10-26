@@ -6896,11 +6896,16 @@ mod egress_http_tests {
                         stream.write_all(b"invalid TLS handshake").await.unwrap();
                     }
                 });
-                let client = http_client_builder()
-                    .connect_timeout(std::time::Duration::from_millis(100))
-                    .timeout(std::time::Duration::from_secs(1))
-                    .build()
-                    .unwrap();
+                // The rejection is driven by invalid TLS bytes, not a deadline.
+                // Only the stalled handshake needs a connect timeout.
+                let client = http_client_builder();
+                let client = if stall {
+                    client.connect_timeout(std::time::Duration::from_millis(100))
+                } else {
+                    client
+                }
+                .build()
+                .unwrap();
                 let transport_error = client.get(endpoint).send().await.unwrap_err();
                 assert!(transport_error.is_connect());
                 assert_eq!(transport_error.is_timeout(), stall);

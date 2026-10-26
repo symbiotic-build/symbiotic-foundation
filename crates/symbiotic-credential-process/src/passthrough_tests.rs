@@ -616,7 +616,15 @@ async fn maximum_cooldown_wait_returns_fixed_429_and_rounded_remaining_retry_aft
         c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(1)
     })
     .await;
-    let call = harness.call().await;
+    let call = tokio::spawn(read(
+        harness
+            .connect(
+                "/v1/responses",
+                b"{}",
+                "x-symbiotic-request-id: synthetic-wait\r\n",
+            )
+            .await,
+    ));
     let upstream = fixture.next().await;
     let mut answer = Reply::rate(10);
     answer.headers.push(("set-cookie".into(), KEY.into()));
@@ -704,7 +712,7 @@ async fn invalid_content_encoding_and_type_and_response_overflow_end_without_fin
 #[tokio::test]
 async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
     let mut fixture = Fixture::start().await;
-    fixture.idle_timeout = Some(Duration::from_millis(100));
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, |c| {
         c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1;
         c.passthrough.as_mut().unwrap().routes[0]
@@ -721,6 +729,7 @@ async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
     .await;
     let call = harness.call().await;
     let held = fixture.next().await;
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     assert_eq!(decoded(&call.await.unwrap()).0, 502);
     drop(held);
     let next = harness.call().await;
@@ -1336,7 +1345,7 @@ async fn route_event_hold_limit_returns_a_visible_error_for_oversized_items() {
 #[tokio::test]
 async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
     let mut fixture = Fixture::start().await;
-    fixture.idle_timeout = Some(Duration::from_millis(100));
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, login_config).await;
     let call = harness.call().await;
     fixture
@@ -1348,6 +1357,8 @@ async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
         .unwrap();
     let exchange = fixture.next().await;
     assert!(exchange.head.starts_with("POST /oauth/token HTTP/1.1\r\n"));
+    // Drive the timeout only after the server has received the request bytes.
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     let (status, _, body) = decoded(&call.await.unwrap());
     assert_eq!(status, 503);
     assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
@@ -1366,7 +1377,7 @@ async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
 #[tokio::test]
 async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
     let mut fixture = Fixture::start().await;
-    fixture.idle_timeout = Some(Duration::from_millis(100));
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, |config| {
         login_config(config);
         let path = config.state_dir.parent().unwrap().join("login.json");
@@ -1389,6 +1400,8 @@ async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
             .head
             .starts_with("GET /.well-known/openid-configuration HTTP/1.1\r\n")
     );
+    // Drive the timeout only after the server has received the request bytes.
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     let (status, _, body) = decoded(&call.await.unwrap());
     assert_eq!(status, 503);
     assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
@@ -1417,7 +1430,15 @@ async fn rate_limit_and_unauthorized_resends_charge_pacing_while_keeping_the_slo
             route.max_in_flight = 1;
         })
         .await;
-        let call = harness.call().await;
+        let call = tokio::spawn(read(
+            harness
+                .connect(
+                    "/v1/responses",
+                    b"{}",
+                    "x-symbiotic-request-id: synthetic-wait\r\n",
+                )
+                .await,
+        ));
         let first = fixture.next().await;
         let body = first.body.clone();
         let started = Instant::now();
@@ -1473,7 +1494,15 @@ async fn unusable_login_after_slot_cooldown_pacing_or_gate_wait_never_dispatches
                 }
             })
             .await;
-            let first = harness.call().await;
+            let first = tokio::spawn(read(
+                harness
+                    .connect(
+                        "/v1/responses",
+                        b"{}",
+                        "x-symbiotic-request-id: synthetic-wait\r\n",
+                    )
+                    .await,
+            ));
             fixture
                 .next()
                 .await
@@ -2152,6 +2181,10 @@ async fn completed_item_behind_partial_before_headers_survives_disconnect() {
         })
         .ok()
         .unwrap();
+    harness
+        .health_where(|h| !h["routes"][0]["cooldown_until"].is_null())
+        .await;
+    advance_clock(Duration::from_secs(1)).await;
     let continuation = fixture.next().await;
     let mut expected = original;
     expected["input"]
