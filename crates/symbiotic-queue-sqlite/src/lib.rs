@@ -890,7 +890,7 @@ fn find_by_idempotency(
                     created_at, updated_at, last_error_class
              from queue_items
              where queue_id = ?1 and idempotency_key = ?2
-             order by created_at desc
+             order by rowid desc
              limit 1",
         )
         .map_err(storage_error)?;
@@ -1319,6 +1319,38 @@ mod tests {
         let inserted = queue.enqueue(forced).await.unwrap();
         assert_eq!(inserted.disposition, EnqueueDisposition::Inserted);
         assert_ne!(inserted.item.item_id.0, first.item.item_id.0);
+    }
+
+    #[tokio::test]
+    async fn enqueue_finds_the_newest_item_when_its_timestamp_is_older() {
+        // A delayed enqueue or a backward clock step can give a replacement an
+        // earlier created_at than its terminal predecessor.
+        let queue = SqliteQueue::in_memory().unwrap();
+        let first = queue.enqueue(request("same")).await.unwrap().item;
+        queue
+            .claim_item(&first.item_id, "w1", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        queue.complete(&first.item_id, "w1").await.unwrap();
+        let mut forced = request("same");
+        forced.force = true;
+        let replacement = queue.enqueue(forced.clone()).await.unwrap().item;
+        queue
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "update queue_items set created_at = '2000-01-01T00:00:00Z' where item_id = ?1",
+                params![replacement.item_id.0],
+            )
+            .unwrap();
+
+        for request in [request("same"), forced] {
+            let outcome = queue.enqueue(request).await.unwrap();
+            assert_eq!(outcome.disposition, EnqueueDisposition::ActiveDuplicate);
+            assert_eq!(outcome.item.item_id.0, replacement.item_id.0);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
