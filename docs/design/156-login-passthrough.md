@@ -32,6 +32,26 @@ The operator decided on 2026-10-25:
   429 reaches the caller. A maximum wait exists as a setting and is off by default.
   Slot waits are unbounded while the caller stays connected (key decisions 4 and 5).
 
+## Lead decisions
+
+The lead decided on 2026-10-26:
+
+- **Shared account policy:** passthrough supports `max_in_flight` and
+  `requests_per_minute`, with `rate_burst_seconds` controlling request pacing.
+  Undecoded requests are not charged input units. Typed routes sharing the same
+  `(tenant, account)` or sharing key must set `input_units_per_minute: null` and
+  `provider_request_limit: null`. All bindings must agree on `max_in_flight`,
+  `requests_per_minute` and `rate_burst_seconds`; otherwise startup returns
+  `InvalidRequest`. Admission uses the existing runtime, with no new scheduler.
+- **Cooldown and send ordering:** the existing per-account rate gate orders every
+  send against cooldown recording. First sends and resends take the gate, re-read
+  the cooldown, charge pacing, start the send and release the gate. Recording a
+  cooldown after a 429 takes the same gate (§Admission).
+- **Fixed stream hold limits:** the scrubber holds an open delta item's accumulated
+  text until the item completes. The provisional constants stay at 4 MiB held text
+  and 64 MiB held envelopes per stream, as in the predecessor agent proxy. They
+  are not route settings. Exceeding either fails visibly (§Scrubbing).
+
 ## Problem
 
 Agent command-line tools such as the Codex CLI speak their provider's streaming
@@ -132,9 +152,9 @@ tools (A, B and C) run under one host.
    - The credential process records A's input, cached, output and reasoning tokens
      in a settled spend receipt and releases the slot. C takes it.
 
-The provider receives no request between the first 429 and the cooldown's end.
-No tool sees a 429. If B had already been sent when A's 429 arrived, B could also
-receive 429. Its request would also wait out the shared cooldown and be resent.
+The provider receives no request after the cooldown is recorded until it ends.
+No tool sees a 429. If B had already been sent before A's cooldown was recorded, B
+could also receive 429. Its request would wait out the shared cooldown and be resent.
 
 ## Design
 
@@ -202,7 +222,9 @@ group or other permission bits, not a symlink, read with the `max_secret_bytes` 
 | `xai_grok` | OIDC discovery at `{issuer}`, exact host only | form | `Authorization: Bearer`, `X-XAI-Token-Auth` |
 
 Discovery accepts only a token endpoint on the issuer's exact HTTPS host. The token
-endpoint is never caller-supplied and never follows redirects.
+endpoint is never caller-supplied and never follows redirects. Discovery and token
+exchange each have a 30 s timeout, separate from the socket frame I/O timeout.
+Renewal errors use static diagnostic codes, never provider or transport error text.
 
 **Renewal.** The process renews when the access token expires within 300 s, or once
 after the provider answers 401 to a forwarded request. Renewal runs under one async
@@ -223,9 +245,13 @@ If the process stops between steps 1 and 4, the fence stays set. At the next sta
 or the next renewal, a set fence refuses the account with `login_required` and sends
 no token exchange. Reusing a refresh token that the provider may already have rotated
 can make the provider revoke the whole login. A fresh login or import clears the
-fence. A failed exchange that the provider answered (for example 400
-`invalid_grant`) also leaves the account in `login_required`; a transport failure
-before the request was written clears the fence and is retried at the next request.
+fence only after the replacement store is durable (§Import). A failed exchange that
+the provider answered (for example 400 `invalid_grant`) leaves the fence set and the
+account in `login_required`. A timeout or failure before any token-exchange request
+bytes were written clears and syncs the fence; renewal may run at the next request.
+This includes discovery failure or timeout, because no exchange has started. Once
+exchange bytes may have been written, a timeout or failure leaves the fence set and
+the account in `login_required`; no exchange is retried until a fresh import.
 
 **One owner.** The credential process takes an exclusive, non-blocking `flock` on
 `<path>.lock` at startup and holds it for its lifetime. The import command below takes
@@ -240,6 +266,10 @@ writes a version-1 store. It refuses an existing store unless `--replace` is giv
 It prints no token. It runs no provider tool and sends no request: the operator signs
 in with the provider's own tool first. After import, only the credential process may
 renew the login; the native file becomes stale at the first rotation.
+Import installs the new store durably using a temporary file, file sync, rename and
+directory sync. Only then does it clear and sync the renewal fence. A failure or
+stop before the durable install leaves the fence set, so restart cannot renew with
+the old store's possibly rotated refresh token.
 
 **Health.** `PassthroughConfig.health_path` optionally names a sanitized JSON file
 for hosts that must read health without access to the passthrough socket. When
@@ -310,8 +340,8 @@ pub struct PassthroughRoute {
     pub stream: StreamDialect,
     /// Lowercase caller headers copied to the provider; all others are dropped.
     pub forward_headers: Vec<String>,
-    /// Lowercase provider response headers copied back to the caller on every
-    /// response, such as an agent tool's turn-routing header; all others are dropped.
+    /// Lowercase provider headers copied back only with a provider answer.
+    /// See Returned headers for the status-specific allowlist and local responses.
     #[serde(default)]
     pub return_headers: Vec<String>,
     pub max_request_bytes: usize,
@@ -319,6 +349,8 @@ pub struct PassthroughRoute {
     /// Existing account policy fields, shared with typed routes on the same account.
     pub max_in_flight: usize,
     pub requests_per_minute: Option<u32>,
+    /// Existing pacing burst duration; must match every shared binding.
+    pub rate_burst_seconds: u64,
     /// Optional maximum total cooldown wait before answering 429; off when absent.
     /// Slot waits never count against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -337,6 +369,12 @@ pub enum StreamDialect { OpenaiResponses, OpenaiChatCompletions }
 New public names follow the existing configuration conventions: lower snake case
 fields, snake case enum tags, subject first (`max_queue_wait_seconds`, not
 `queue_wait_max_seconds`). `health_path` follows the same field convention.
+Public types are UpperCamelCase nouns: `PassthroughConfig`, `PassthroughRoute` and
+`LoginFamily`. Error and diagnostic reasons are lower snake case, subject first:
+`credential_unavailable`, `route_not_found`, `rate_limited` and `upstream_status`.
+Command options are lower kebab case: `--family`, `--native`, `--store` and `--replace`.
+External protocol names, including header names and provider fields, keep their
+external spelling.
 
 **Transport.** The passthrough socket speaks HTTP/1.1, one request per connection,
 and answers with `Connection: close` and a chunked body. It uses the existing socket
@@ -349,54 +387,80 @@ cookies, `Host` and forwarding headers are never copied.
 
 **Admission.** Each passthrough route registers its account with the runtime exactly
 like a typed route. Typed and passthrough routes on the same `(tenant, account)` or
-sharing key share one slot gate, one cooldown and one pacing bucket. Shared bindings
-must agree on `max_in_flight` and `requests_per_minute`, or startup is refused, as for
-typed routes.
+sharing key share one slot gate, one cooldown and one pacing bucket. Passthrough
+supports only the account's `max_in_flight` and `requests_per_minute` limits, with
+`rate_burst_seconds` controlling pacing burst duration; it charges no input units.
+Typed routes may share the account only with `input_units_per_minute: null` and
+`provider_request_limit: null`. Every binding must agree on `max_in_flight`,
+`requests_per_minute` and `rate_burst_seconds`. Configuration validation refuses
+incompatible sharing at startup with `InvalidRequest`.
+
+The ordering point is the runtime's existing per-account rate gate, the lock held
+from its pacing check through the claim
+([AI runtime §Current shared limits](../architecture/ai-runtime.md#current-shared-limits)).
+Typed sends pass this same gate. Every passthrough send, first or resent, takes the
+gate, re-reads the durable cooldown, takes pacing admission, charges one request
+immediately before starting the send, starts the send and releases the gate.
+Recording a cooldown after a 429 takes that gate too. A send therefore either starts
+before the cooldown is recorded and is already in flight, or sees the cooldown and
+waits. The gate is released before any cooldown or pacing wait and before streaming
+the answer. This extends the existing runtime mechanism; it adds no scheduler.
 
 **Procedure: admitting one passthrough request**
 
-1. **Match the route:** method and path select one route; anything else gets 404.
-2. **Check the login:** a route in `login_required` answers 503 with code
-   `credential_unavailable` and sends nothing. This uses the process's current
-   state; a host's earlier health-file check does not replace it.
-3. **Wait for a slot and pacing budget:** FIFO, as long as the caller stays connected.
+1. **Match the route:** method and path select one route; anything else gets 404
+   `route_not_found`.
+2. **Check the login:** a route in `login_required` or `renewal_failed` answers 503
+   `credential_unavailable` and sends nothing. Recheck after every wait and
+   immediately before dispatch. This uses the process's current state; a host's
+   earlier health-file check does not replace it.
+3. **Wait for a slot:** FIFO, as long as the caller stays connected.
    - A slot wait is the normal state of a low in-flight limit, not a failure.
    - A caller that disconnects while waiting leaves the queue; nothing is sent.
 4. **Wait out the cooldown:** while `cooldown_until` is in the future, send nothing.
    - The request keeps its slot; during a cooldown no slot could send anyway.
    - With `max_queue_wait_seconds` set, a request whose cooldown waits reach it gets
-     429 with the remaining cooldown and the allowlisted headers.
+     a fixed 429 with a locally computed `Retry-After` for the remaining cooldown
+     and no upstream header (§Returned headers).
 5. **Keep the caller waiting:** see §Long waits.
 6. **Renew if needed:** take a renewal when the access token expires within 300 s.
-7. **Reserve and send:** reserve one request in the spend ledger, inject the
-   credential headers, and send the caller's body bytes unchanged.
-   - Check the shared cooldown again at dispatch. Once a cooldown is recorded, no
-     request leaves for the provider until it ends; return to step 4 instead.
-8. **On a 429 before any response byte:** set the cooldown, record a `rate_limited`
-   receipt, and go back to step 4 with the same body.
+7. **Reserve and send:** reserve one request in the spend ledger and inject the
+   credential headers. Use the rate gate ordering above to send the body unchanged.
+   - If the cooldown is active, release the gate and return to step 4.
+   - If pacing budget is unavailable, release the gate and wait with the slot held;
+     then recheck login state and return to step 4.
+   - Every send is charged, including resends after a 429 or a login's first 401.
+8. **On a 429 before any response byte reaches the caller:** take the rate gate and
+   record the cooldown, then release the gate, record a `rate_limited` receipt, and
+   return to step 4 with the same body and slot.
 
 The slot is held until the response stream ends, fails or the caller disconnects.
 A caller disconnect cancels the upstream request. Requests remain concurrent up to
 `max_in_flight`; a limit of two permits two streams, without serialization.
-Requests already sent when the first 429 arrives may also receive 429. Each such
-request follows step 8 and waits out the shared cooldown before being resent.
+Requests already sent before the cooldown is recorded may also receive 429. Each
+such request follows step 8 and waits out the shared cooldown before being resent.
 
 **Responses.**
 
-- **2xx:** streamed to the caller through the scrubber. `Content-Type` is forwarded
-  when it is `text/event-stream` or `application/json`; any other type, or a
-  compressed body, ends the response with an error. A family whose endpoint omits the
-  type on its event stream (the ChatGPT Codex endpoint does) declares that, and the
-  route reads it as `text/event-stream`.
-- **401:** the process renews once and resends once, before any byte reaches the
-  caller. A second 401 marks the login `renewal_failed` and returns 401.
+- **2xx:** streamed to the caller through the scrubber. The process sets
+  `Content-Type` to the validated format, `text/event-stream` or `application/json`;
+  any other upstream type, or a compressed body, ends the response with an error.
+  A family whose endpoint omits the type on its event stream (the ChatGPT Codex
+  endpoint does) declares that, and the route reads it as `text/event-stream`.
+- **401 on a login route:** the process renews once and resends once, before any
+  byte reaches the caller. The resend returns to admission step 4 with the same
+  slot, rechecking login state, cooldown and pacing. A second 401 marks the login
+  `renewal_failed` and returns that request a fixed 401. The state persists until a
+  fresh import; later requests get 503 `credential_unavailable` at admission.
+- **401 on a static-key route:** returns a locally generated fixed 401, with no
+  upstream header, renewal or resend.
 - **429:** sets the account cooldown, and the request waits and is resent (step 8).
-  This also applies to every request already in flight when the first 429 arrives.
+  This also applies to every request already in flight when the cooldown is recorded.
   After the cooldown is recorded, no new request is sent until it ends.
   The caller receives 429 only when its `max_queue_wait_seconds` is reached; then it
-  has a fixed body and only the allowlisted headers below.
-- **Other non-2xx:** the status is forwarded with a fixed body and no upstream
-  header. The upstream body is discarded because it can echo tokens.
+  has a fixed body and the locally computed `Retry-After` (§Returned headers).
+- **Other non-2xx:** the status is forwarded with a fixed body. The upstream body is
+  discarded because it can echo tokens. All headers follow §Returned headers.
 
 **Forwarded request headers.** The route copies the caller headers named in
 `forward_headers`, with their values unchanged, and drops all others. Agent tools put
@@ -408,19 +472,36 @@ that drops them still works, but each request lands on a cold cache, which costs
 input tokens and time. The host's route configuration must list every such header its
 tool sends. Each value must be 1 to 8 192 bytes of printable ASCII, or the header is
 dropped.
+Configuration validation refuses `authorization`, `cookie`, `host`, `content-length`,
+`transfer-encoding`, `connection`, `te`, `upgrade` and `proxy-authorization` in
+`forward_headers`; the credential process owns those credential or transport headers.
 
-**Returned headers.** Every response the process forwards, of any status, also
-carries the route's `return_headers` that the provider sent. Agent tools read some
-of them back on their next request; for example the Codex CLI keeps
-`x-codex-turn-state` and sends it again, so later requests of a turn reach the same
-provider state. Each value must be 1 to 8 192 bytes of printable ASCII and must not
-contain a credential the scrubber knows; otherwise that header is dropped. The
+**Returned headers.** A response carrying a provider answer, of any status, carries
+only the route's `return_headers` that the provider sent, plus the rate-limit
+allowlist below on 429 and 503. No other upstream header is relayed. Non-2xx bodies
+are fixed. Agent tools read some of them back on their next request; for example the
+Codex CLI keeps `x-codex-turn-state` and sends it again, so later requests of a turn
+reach the same provider state. Each value must be 1 to 8 192 bytes of printable
+ASCII and must not contain a credential the scrubber knows; otherwise that header
+is dropped. The
 response to a request that waited and was resent after a 429 carries the headers of
 the final provider answer.
 
 Allowlisted headers on 429 and 503 are `retry-after`, `x-ratelimit-*`, and the
 family's documented rate-limit headers. Their values must be ASCII without control
 characters and at most 256 bytes each, or they are dropped.
+
+Locally generated responses carry no upstream header: 404 `route_not_found`,
+503 `credential_unavailable`, 429 after `max_queue_wait_seconds`, and the fixed 401
+for a static-key route. The local 429 carries only a locally computed `Retry-After`
+for the remaining cooldown, in addition to locally generated transport headers.
+The process generates its own framing and validated content type (§Transport and
+§Responses); these are not relayed upstream headers.
+
+Configuration validation refuses `set-cookie`, `cookie`, `authorization`,
+`proxy-authenticate`, `www-authenticate`, `location`, `content-length`,
+`transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer`, `upgrade`,
+`content-encoding` and `host` in `return_headers`.
 
 **Long waits.** A request can wait minutes for a slot or a cooldown before its first
 response byte. The credential process sends the caller nothing during the wait by
@@ -444,9 +525,13 @@ encodings the existing credential boundary checks: exact bytes, JSON-escaped UTF
 percent-encoded UTF-8 (both hex cases), standard and URL-safe Base64 (padded and
 unpadded). For event streams it also accumulates the dialect's delta text fields
 (output text, reasoning text, tool-call arguments, names and IDs), so a token split
-across deltas is redacted before the event that completes it is released. Held text
-is bounded at 4 MiB and held event envelopes at 64 MiB; exceeding either ends the
-stream with an error. These bounds are provisional settings, not measured maxima.
+across deltas is redacted before release. It holds each open delta item's accumulated
+text and event envelopes until that item completes: the event completing a credential
+can arrive later. Holding only a credential-length suffix would require rewriting
+already-released events. The provisional constants are 4 MiB held text and 64 MiB
+held event envelopes per stream, the values used by the predecessor agent proxy.
+They are not measured maxima or route settings. Exceeding either ends the stream
+with a visible error.
 
 Redaction, not refusal, is the rule here because the stream has already reached
 the caller in part. Refusal would cut every stream that quotes a token-shaped value.
@@ -486,9 +571,10 @@ The process therefore does not apply these typed-route mechanisms to them:
   passthrough receipt does not block the next passthrough request;
 - the response cache and request deduplication;
 - the known-zero rule for automatic retry. A passthrough request is resent after a
-  429 (step 8) and once after a 401. A provider that answers 429 before any response
-  byte has refused the request, and `Retry-After` is its instruction to send it again
-  later; the receipt of the refused attempt still stays `Unknown`.
+  429 (step 8) and once after a login route's first 401. A provider that answers 429
+  before any response byte reaches the caller has refused the request, and
+  `Retry-After` is its instruction to send it again later; the receipt of the refused
+  attempt still stays `Unknown`.
 
 This extends the boundary contract: passthrough routes serve trusted same-UID hosts
 outside Memory's data authorization. Approval of this record includes adding that
@@ -498,7 +584,9 @@ sentence to [boundary.md §Supported modes](../architecture/boundary.md#supporte
 
 A passthrough route may use `owner_only_file` instead of a login. The process then
 injects `Authorization: Bearer <key>` and never renews. This covers API-key accounts
-whose agent tools speak an OpenAI-compatible streaming protocol.
+whose agent tools speak an OpenAI-compatible streaming protocol. A provider 401
+returns a locally generated fixed 401 body without upstream headers; it causes no
+renewal or resend.
 
 ## Failure modes
 
@@ -509,8 +597,10 @@ whose agent tools speak an OpenAI-compatible streaming protocol.
   its socket. After a crash, the last healthy file can stay fresh for up to 30 s.
   Work admitted in that window encounters the same connection failure as work
   whose service fails mid-run.
-- **Renewal failed:** the route reports `renewal_failed` or `login_required` and
-  answers 503 `credential_unavailable`. An operator signs in again and imports.
+- **Renewal failed:** admission refuses a route in `renewal_failed` or
+  `login_required` with 503 `credential_unavailable`. The request whose second 401
+  set `renewal_failed` receives the fixed 401 instead. An operator signs in again
+  and imports to restore admission.
 - **Restart during a stream:** the caller's stream ends without its final chunk. The
   receipt stays `Unknown`; the cooldown survives in the durable queue backend; slots
   start empty. The tool's own stream retry resends that step.
@@ -605,6 +695,17 @@ All use loopback provider fixtures with synthetic tokens, in
   exchange; all ten carry the new token.
 - **Fence:** a process killed after the exchange and before install restarts with
   `login_required` and sends no exchange; import clears it.
+- **Import ordering:** interrupt replacement import before the new store's directory
+  sync; restart still sees the set fence and sends no exchange with the old token.
+  An import that finishes installs the complete new store durably before clearing
+  and syncing the fence; restart renews only with the imported token.
+- **Renewal I/O bounds:** a discovery that never answers and a token exchange that
+  never answers each fail at their own 30 s timeout. Discovery timeout or failure,
+  and exchange timeout or failure proven to precede request bytes, clear and sync
+  the fence. Restart permits renewal. When exchange bytes may have been written,
+  timeout or failure keeps the fence set; restart reports `login_required` and
+  sends no exchange. Caller errors and diagnostics contain static codes, never
+  fixture response or transport error text.
 - **Store checks:** group-readable, symlinked, wrong-owner, wrong-issuer and
   unknown-field stores are refused at startup.
 - **Lock:** import is refused while the process runs.
@@ -630,8 +731,23 @@ All use loopback provider fixtures with synthetic tokens, in
   `set-cookie: x` reaches the caller with `x-codex-turn-state: abc` only when it is in
   `return_headers`, and never with `set-cookie`; a value containing a known token is
   dropped.
-- **Routes:** an unknown path, a query string and a redirect answer are refused with
-  no credential sent.
+- **Header configuration:** each forbidden name listed in §Forwarded request
+  headers and §Returned headers is refused in its respective configuration list.
+  Startup fails before any provider request.
+- **Route validation:** an unknown or invalid path, or a query string, is refused
+  before any provider request; the fixture receives no request or credential.
+- **Provider redirect:** a fixture redirect answer is not followed. The redirect
+  target receives no request or credential; the caller receives the redirect status
+  with a fixed body and only permitted returned headers, without `location`.
+- **Response header rule:** provider answers with 200, a redirect, a login's second
+  401, 500 and 503 carry the configured `return_headers` only. A 503 also carries
+  the rate-limit allowlist. Unlisted upstream headers and non-2xx upstream bodies
+  never reach the caller. After a 429 and resend, only the final provider answer's
+  headers reach the caller, not the held 429's headers.
+- **Local response headers:** route-not-found 404, credential-unavailable 503,
+  maximum-wait 429 and static-key 401 carry no upstream headers, even when a prior
+  provider answer supplied configured return headers or rate-limit headers. Only
+  the maximum-wait 429 adds a locally computed `Retry-After`.
 - **429 is waited out:** a fixture answers 429 with `Retry-After: 30`, then 200. The
   caller receives one 200 stream about 30 s later and no 429; the fixture sees the
   same body twice.
@@ -642,10 +758,19 @@ All use loopback provider fixtures with synthetic tokens, in
   The fixture receives no request during the cooldown, and both callers receive
   complete 200 streams without a 429.
 - **Maximum wait:** with `max_queue_wait_seconds: 10` and `Retry-After: 600`, the
-  caller gets 429 after about 10 s with `retry-after` about 590, allowlisted headers
-  only and a fixed body.
+  caller gets a fixed 429 after about 10 s with locally computed `Retry-After`
+  about 590 and no upstream header.
 - **Typed and passthrough share:** a typed chat call on the same account waits out a
   cooldown set by a passthrough 429.
+- **Shared policy validation:** for both `(tenant, account)` and sharing-key
+  pooling, matching concurrency, request rate and burst duration with null typed
+  input-unit and provider request limits permits startup. Each mismatched shared
+  field, non-null `input_units_per_minute` or non-null `provider_request_limit`
+  refuses startup with `InvalidRequest`. Passthrough sends charge no input units.
+- **Pacing every send:** with a controlled clock, the first send, a 429 resend and
+  a login's 401 resend each wait for request pacing budget and charge it once
+  immediately before sending. During each resend wait the original slot stays
+  held; the fixture receives the same body and no send before pacing permits it.
 - **In-flight limit:** with `max_in_flight: 2`, five callers never have more than
   two concurrent requests at the fixture.
 - **Slot wait is not a 429:** with `max_in_flight: 1`, `max_queue_wait_seconds: 5` and
@@ -654,6 +779,9 @@ All use loopback provider fixtures with synthetic tokens, in
   sent.
 - **Cooldown set during a slot wait:** a caller waiting for a slot when another
   caller's request gets 429 with `Retry-After: 30` is sent only after that cooldown.
+- **Cooldown recorded before dispatch:** pause a sender after its slot grant and
+  before it takes the rate gate. Another caller's 429 records a cooldown under that
+  gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
 - **Scrubbing:** Synthetic tokens split across every chunk boundary and across
   Responses and Chat Completions deltas are redacted in all listed encodings.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
@@ -662,7 +790,16 @@ All use loopback provider fixtures with synthetic tokens, in
   `symbiotic-usage` trailer carrying those counts; without a usage event, or without
   `TE: trailers`, no trailer is sent.
 - **Restart:** a cooldown set before a restart still delays the first request after it.
-- **401:** one 401 causes one renewal and one resend; two 401s mark `renewal_failed`.
+- **Login 401:** one 401 causes one renewal and one resend with the held slot;
+  two 401s mark `renewal_failed` and give that request a fixed 401. Later requests
+  get 503 `credential_unavailable` with no send. The state survives later requests
+  until a fresh import restores admission.
+- **Unusable login admission:** both `login_required` and `renewal_failed` refuse
+  new requests with 503 `credential_unavailable` and no provider request. A caller
+  already waiting for a slot, cooldown, pacing or renewal when either state is set
+  gets the same 503 after the wait and sends nothing, including before a resend.
+- **Static-key 401:** a fixture 401 causes one provider request, no renewal and no
+  resend. The caller gets a fixed 401 body without any upstream header.
 - **Peer UID:** a connection from another UID is refused before parsing.
 
 ## Implementation size
