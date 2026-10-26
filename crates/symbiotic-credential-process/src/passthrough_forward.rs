@@ -192,10 +192,12 @@ impl Passthrough {
         }
         fixed(write, status, code, &headers).await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn retry_decision(
         &self,
         route: &Route,
         failure: &Failure,
+        new_session: bool,
         policy: &RetryPolicy,
         attempt: u32,
         started: bool,
@@ -240,15 +242,14 @@ impl Passthrough {
             *n = n.checked_add(1).ok_or(EgressError::StateUnavailable)?;
             self.changed.notify_one();
         }
-        let mut delay_ms = None;
-        if rule.action == RetryAction::RetrySame {
+        let delay = if rule.action == RetryAction::RetrySame {
             let count = route.retries.failures.load(Ordering::Acquire);
             let retry_after = (failure.headers.get_all("retry-after").iter().count() == 1)
                 .then(|| failure.headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| retry::parse_retry_after(v, self.now().timestamp()).ok());
-            let delay = match retry_after {
+            Some(match retry_after {
                 Some(s) => Duration::from_secs(s),
                 None => Duration::from_millis(
                     retry::delay_ms(
@@ -261,14 +262,29 @@ impl Passthrough {
                     )
                     .map_err(|_| EgressError::StateUnavailable)?,
                 ),
-            };
+            })
+        } else {
+            None
+        };
+        // One journal line per retry decision, before the hold or cooldown is recorded.
+        tracing::warn!(
+            route = %route.config.name,
+            code = %failure.code,
+            ?class,
+            attempt,
+            new_session,
+            bytes_reached_caller = started,
+            action = ?rule.action,
+            delay_ms = delay.map(|d| d.as_millis()),
+            "upstream failure"
+        );
+        if let Some(delay) = delay {
             let until = self
                 .now()
                 .checked_add_signed(
                     chrono::Duration::from_std(delay).map_err(|_| EgressError::StateUnavailable)?,
                 )
                 .ok_or(EgressError::StateUnavailable)?;
-            delay_ms = Some(delay.as_millis());
             if failure.new_session {
                 let _gate = route
                     .account
@@ -293,19 +309,6 @@ impl Passthrough {
                     .map_err(|_| EgressError::StateUnavailable)?;
             }
         }
-        // One journal line per upstream failure: the only per-event record of retries.
-        tracing::warn!(
-            route = %route.config.name,
-            status = failure.status,
-            code = %failure.code,
-            ?class,
-            attempt,
-            new_session = failure.new_session,
-            bytes_reached_caller = started,
-            action = ?rule.action,
-            delay_ms,
-            "upstream failure"
-        );
         Ok(rule)
     }
     pub(super) async fn forward(
@@ -595,6 +598,15 @@ impl Passthrough {
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
+                        // The provider's own status; the retry decision line follows for
+                        // failures that reach it.
+                        tracing::warn!(
+                            route = %route.config.name,
+                            status,
+                            attempt,
+                            new_session = was_new,
+                            "upstream refused"
+                        );
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
                             return self
                                 .local_error(write, false, 401, "upstream_status", &wait, None)
@@ -659,6 +671,7 @@ impl Passthrough {
                 .retry_decision(
                     route,
                     &failure,
+                    was_new,
                     &policy,
                     attempt,
                     started,
