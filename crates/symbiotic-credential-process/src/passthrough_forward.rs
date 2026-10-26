@@ -240,6 +240,7 @@ impl Passthrough {
             *n = n.checked_add(1).ok_or(EgressError::StateUnavailable)?;
             self.changed.notify_one();
         }
+        let mut delay_ms = None;
         if rule.action == RetryAction::RetrySame {
             let count = route.retries.failures.load(Ordering::Acquire);
             let retry_after = (failure.headers.get_all("retry-after").iter().count() == 1)
@@ -267,6 +268,7 @@ impl Passthrough {
                     chrono::Duration::from_std(delay).map_err(|_| EgressError::StateUnavailable)?,
                 )
                 .ok_or(EgressError::StateUnavailable)?;
+            delay_ms = Some(delay.as_millis());
             if failure.new_session {
                 let _gate = route
                     .account
@@ -291,6 +293,19 @@ impl Passthrough {
                     .map_err(|_| EgressError::StateUnavailable)?;
             }
         }
+        // One journal line per upstream failure: the only per-event record of retries.
+        tracing::warn!(
+            route = %route.config.name,
+            status = failure.status,
+            code = %failure.code,
+            ?class,
+            attempt,
+            new_session = failure.new_session,
+            bytes_reached_caller = started,
+            action = ?rule.action,
+            delay_ms,
+            "upstream failure"
+        );
         Ok(rule)
     }
     pub(super) async fn forward(
