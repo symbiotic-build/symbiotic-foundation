@@ -47,10 +47,19 @@ The lead decided on 2026-10-26:
   send against cooldown recording. First sends and resends take the gate, re-read
   the cooldown, charge pacing, start the send and release the gate. Recording a
   cooldown after a 429 takes the same gate (§Admission).
-- **Fixed stream hold limits:** the scrubber holds an open delta item's accumulated
-  text until the item completes. The provisional constants stay at 4 MiB held text
-  and 64 MiB held envelopes per stream, as in the predecessor agent proxy. They
-  are not route settings. Exceeding either fails visibly (§Scrubbing).
+- **Retention approach for this step:** the scrubber holds an open delta item's
+  accumulated text until the item completes. Whole-item retention is already
+  implemented and tested in the stream module. Holding only events that intersect
+  an unresolved credential-length suffix is the target design, tracked as
+  [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161); it is
+  not yet qualified for interleaved fields (§Scrubbing).
+- **Hold limits are provisional route settings:** `max_held_text_bytes` defaults
+  to 4 194 304 and `max_held_event_bytes` to 67 108 864. Both are positive byte
+  limits per stream, with Serde defaults. They are provisional settings under the
+  [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings),
+  not measured maxima. Exceeding either ends the stream with an error (§Scrubbing).
+  `rate_burst_seconds` also defaults to 0 with `#[serde(default)]`, so existing
+  configurations stay valid.
 
 ## Problem
 
@@ -346,10 +355,16 @@ pub struct PassthroughRoute {
     pub return_headers: Vec<String>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    /// Provisional hard byte limits per stream; both must be positive.
+    #[serde(default = "default_max_held_text_bytes")]
+    pub max_held_text_bytes: usize,
+    #[serde(default = "default_max_held_event_bytes")]
+    pub max_held_event_bytes: usize,
     /// Existing account policy fields, shared with typed routes on the same account.
     pub max_in_flight: usize,
     pub requests_per_minute: Option<u32>,
     /// Existing pacing burst duration; must match every shared binding.
+    #[serde(default)]
     pub rate_burst_seconds: u64,
     /// Optional maximum total cooldown wait before answering 429; off when absent.
     /// Slot waits never count against it.
@@ -399,8 +414,10 @@ The ordering point is the runtime's existing per-account rate gate, the lock hel
 from its pacing check through the claim
 ([AI runtime §Current shared limits](../architecture/ai-runtime.md#current-shared-limits)).
 Typed sends pass this same gate. Every passthrough send, first or resent, takes the
-gate, re-reads the durable cooldown, takes pacing admission, charges one request
-immediately before starting the send, starts the send and releases the gate.
+gate, rechecks login state, re-reads the durable cooldown and checks pacing admission.
+Only after those checks pass does it reserve one request in the spend ledger,
+charge pacing, start the send and release the gate. A waiting request creates no
+reservation; each actual send creates exactly one.
 Recording a cooldown after a 429 takes that gate too. A send therefore either starts
 before the cooldown is recorded and is already in flight, or sees the cooldown and
 waits. The gate is released before any cooldown or pacing wait and before streaming
@@ -424,13 +441,18 @@ the answer. This extends the existing runtime mechanism; it adds no scheduler.
      and no upstream header (§Returned headers).
 5. **Keep the caller waiting:** see §Long waits.
 6. **Renew if needed:** take a renewal when the access token expires within 300 s.
-7. **Reserve and send:** reserve one request in the spend ledger and inject the
-   credential headers. Use the rate gate ordering above to send the body unchanged.
+7. **Check send admission:** take the rate gate and recheck login state, cooldown
+   and pacing budget before creating any spend reservation.
+   - If the login is unusable, release the gate and answer 503
+     `credential_unavailable` without sending.
    - If the cooldown is active, release the gate and return to step 4.
    - If pacing budget is unavailable, release the gate and wait with the slot held;
      then recheck login state and return to step 4.
+8. **Reserve and send:** with the gate still held and all checks passed, inject the
+   credential headers and reserve one request in the spend ledger. Immediately
+   charge pacing, send the body unchanged and release the gate.
    - Every send is charged, including resends after a 429 or a login's first 401.
-8. **On a 429 before any response byte reaches the caller:** take the rate gate and
+9. **On a 429 before any response byte reaches the caller:** take the rate gate and
    record the cooldown, then release the gate, record a `rate_limited` receipt, and
    return to step 4 with the same body and slot.
 
@@ -438,7 +460,7 @@ The slot is held until the response stream ends, fails or the caller disconnects
 A caller disconnect cancels the upstream request. Requests remain concurrent up to
 `max_in_flight`; a limit of two permits two streams, without serialization.
 Requests already sent before the cooldown is recorded may also receive 429. Each
-such request follows step 8 and waits out the shared cooldown before being resent.
+such request follows step 9 and waits out the shared cooldown before being resent.
 
 **Responses.**
 
@@ -454,7 +476,7 @@ such request follows step 8 and waits out the shared cooldown before being resen
   fresh import; later requests get 503 `credential_unavailable` at admission.
 - **401 on a static-key route:** returns a locally generated fixed 401, with no
   upstream header, renewal or resend.
-- **429:** sets the account cooldown, and the request waits and is resent (step 8).
+- **429:** sets the account cooldown, and the request waits and is resent (step 9).
   This also applies to every request already in flight when the cooldown is recorded.
   After the cooldown is recorded, no new request is sent until it ends.
   The caller receives 429 only when its `max_queue_wait_seconds` is reached; then it
@@ -525,13 +547,21 @@ encodings the existing credential boundary checks: exact bytes, JSON-escaped UTF
 percent-encoded UTF-8 (both hex cases), standard and URL-safe Base64 (padded and
 unpadded). For event streams it also accumulates the dialect's delta text fields
 (output text, reasoning text, tool-call arguments, names and IDs), so a token split
-across deltas is redacted before release. It holds each open delta item's accumulated
-text and event envelopes until that item completes: the event completing a credential
-can arrive later. Holding only a credential-length suffix would require rewriting
-already-released events. The provisional constants are 4 MiB held text and 64 MiB
-held event envelopes per stream, the values used by the predecessor agent proxy.
-They are not measured maxima or route settings. Exceeding either ends the stream
-with a visible error.
+across deltas is redacted before release. This step keeps whole-item retention:
+it holds each open delta item's accumulated text and event envelopes until that item
+completes. The stream module already implements and tests this approach. The target
+design holds only events that intersect an unresolved credential-length suffix;
+[#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161) tracks
+qualifying it for interleaved fields.
+
+The provisional route settings `max_held_text_bytes` and `max_held_event_bytes`
+default to 4 194 304 bytes of held text and 67 108 864 bytes of held event envelopes,
+respectively. These defaults come from the predecessor agent proxy, not measured
+maxima. Both settings must be positive; configuration validation refuses zero.
+Each is a hard limit on the total held across all open items in one stream.
+Before retaining text or an event envelope that would exceed either limit, the
+scrubber ends the stream with a visible error. These are provisional settings under
+the [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings).
 
 Redaction, not refusal, is the rule here because the stream has already reached
 the caller in part. Refusal would cut every stream that quotes a token-shaped value.
@@ -571,7 +601,7 @@ The process therefore does not apply these typed-route mechanisms to them:
   passthrough receipt does not block the next passthrough request;
 - the response cache and request deduplication;
 - the known-zero rule for automatic retry. A passthrough request is resent after a
-  429 (step 8) and once after a login route's first 401. A provider that answers 429
+  429 (step 9) and once after a login route's first 401. A provider that answers 429
   before any response byte reaches the caller has refused the request, and
   `Retry-After` is its instruction to send it again later; the receipt of the refused
   attempt still stays `Unknown`.
@@ -670,6 +700,8 @@ Each mechanism this design adds, and the requirement it serves:
 | `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
+| Whole-item retention | reuses the tested stream module until suffix retention is qualified (#161) |
+| `max_held_text_bytes`, `max_held_event_bytes` | hard per-stream retention limits with provisional route defaults |
 | Usage reader | usage receipts (#156 item 3) |
 | `symbiotic-usage` trailer | hosts that enforce their own per-job token ceilings need each response's usage; without it they would parse the stream a second time |
 | 401 renewal and one resend | a token revoked before its expiry would otherwise fail every request until restart |
@@ -734,6 +766,9 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Header configuration:** each forbidden name listed in §Forwarded request
   headers and §Returned headers is refused in its respective configuration list.
   Startup fails before any provider request.
+- **Route defaults:** omitting `max_held_text_bytes`, `max_held_event_bytes` and
+  `rate_burst_seconds` loads 4 194 304, 67 108 864 and 0, respectively. Explicit
+  positive hold limits are preserved; zero for either hold limit refuses startup.
 - **Route validation:** an unknown or invalid path, or a query string, is refused
   before any provider request; the fixture receives no request or credential.
 - **Provider redirect:** a fixture redirect answer is not followed. The redirect
@@ -771,6 +806,11 @@ All use loopback provider fixtures with synthetic tokens, in
   a login's 401 resend each wait for request pacing budget and charge it once
   immediately before sending. During each resend wait the original slot stays
   held; the fixture receives the same body and no send before pacing permits it.
+- **Reservation after admission:** with pacing exhausted and a controlled clock,
+  a waiting request creates no spend reservation. Repeated admission checks while
+  pacing is exhausted still create none. Once pacing permits a send, exactly one
+  reservation exists for it. Repeat for a 429 resend and a login's 401 resend;
+  each actual send has one reservation, with none added during its waits.
 - **In-flight limit:** with `max_in_flight: 2`, five callers never have more than
   two concurrent requests at the fixture.
 - **Slot wait is not a 429:** with `max_in_flight: 1`, `max_queue_wait_seconds: 5` and
@@ -784,6 +824,10 @@ All use loopback provider fixtures with synthetic tokens, in
   gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
 - **Scrubbing:** Synthetic tokens split across every chunk boundary and across
   Responses and Chat Completions deltas are redacted in all listed encodings.
+- **Stream hold limits:** for each configured hold limit, interleaved open items
+  may total exactly the limit. The next text or event envelope that would exceed
+  it ends the stream with an error before retention or release. Test text and
+  event-envelope limits independently, keeping the other below its limit.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
   counts; a cut stream produces an `Unknown` receipt.
 - **Usage trailer:** with `TE: trailers`, the same stream ends with a
