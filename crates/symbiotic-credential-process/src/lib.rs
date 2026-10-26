@@ -15,6 +15,7 @@ mod registry;
 pub mod secrets;
 #[cfg(unix)]
 pub mod server;
+pub mod stream;
 
 use in_process::AnswerValidator;
 use registry::Registry;
