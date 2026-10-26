@@ -331,10 +331,7 @@ impl Fixture {
             io_timeout_seconds: 2,
             clock_rollback_warning_tolerance_seconds: 5,
             jobs: Default::default(),
-            job_runner: symbiotic_queue::runner::RunnerConfig {
-                poll_interval_ms: 5,
-                ..Default::default()
-            },
+            job_runner: Default::default(),
             passthrough: None,
             routes: vec![RouteConfig {
                 answer_recovery: Default::default(),
