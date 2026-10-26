@@ -47,17 +47,19 @@ The lead decided on 2026-10-26:
   send against cooldown recording. First sends and resends take the gate, re-read
   the cooldown, charge pacing, start the send and release the gate. Recording a
   cooldown after a 429 takes the same gate (§Admission).
-- **Retention approach for this step:** the scrubber holds an open delta item's
-  accumulated text until the item completes. Whole-item retention is already
-  implemented and tested in the stream module. Holding only events that intersect
-  an unresolved credential-length suffix is the target design, tracked as
-  [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161); it is
-  not yet qualified for interleaved fields (§Scrubbing).
-- **Hold limits are provisional route settings:** `max_held_text_bytes` defaults
-  to 4 194 304 and `max_held_event_bytes` to 67 108 864. Both are positive byte
-  limits per stream, with Serde defaults. They are provisional settings under the
+- **Candidate-suffix retention:** the scrubber matches each open delta field's
+  accumulated decoded text. It holds events whose delta bytes intersect that
+  field's unresolved last `L − 1` bytes, where `L` is the longest encoded credential
+  variant. A held event holds every later event in arrival order (§Scrubbing).
+  Implementation reworks the stream module from the scrubber PR to this design
+  and closes [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161).
+- **One hold limit, a provisional route setting:** `max_held_event_bytes` defaults
+  to 67 108 864 with a Serde default. It is a positive byte limit on held event
+  envelopes per stream. Interleaved fields can hold later events behind a stalled
+  field's unresolved tail, even though matching text per field is bounded by
+  `L − 1` bytes plus one delta (§Scrubbing). The default is provisional under the
   [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings),
-  not measured maxima. Exceeding either ends the stream with an error (§Scrubbing).
+  not a measured maximum. Exceeding it ends the stream with a visible error.
   `rate_burst_seconds` also defaults to 0 with `#[serde(default)]`, so existing
   configurations stay valid.
 
@@ -355,9 +357,7 @@ pub struct PassthroughRoute {
     pub return_headers: Vec<String>,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
-    /// Provisional hard byte limits per stream; both must be positive.
-    #[serde(default = "default_max_held_text_bytes")]
-    pub max_held_text_bytes: usize,
+    /// Provisional hard byte limit on held event envelopes per stream; positive.
     #[serde(default = "default_max_held_event_bytes")]
     pub max_held_event_bytes: usize,
     /// Existing account policy fields, shared with typed routes on the same account.
@@ -545,23 +545,46 @@ The scrubber redacts, rather than refuses, every value the login has held in thi
 process (current and rotated tokens, account ID) and the static key. It matches the
 encodings the existing credential boundary checks: exact bytes, JSON-escaped UTF-8,
 percent-encoded UTF-8 (both hex cases), standard and URL-safe Base64 (padded and
-unpadded). For event streams it also accumulates the dialect's delta text fields
-(output text, reasoning text, tool-call arguments, names and IDs), so a token split
-across deltas is redacted before release. This step keeps whole-item retention:
-it holds each open delta item's accumulated text and event envelopes until that item
-completes. The stream module already implements and tests this approach. The target
-design holds only events that intersect an unresolved credential-length suffix;
-[#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161) tracks
-qualifying it for interleaved fields.
+unpadded). Let `L` be the byte length of the longest of these encoded credential
+variants.
 
-The provisional route settings `max_held_text_bytes` and `max_held_event_bytes`
-default to 4 194 304 bytes of held text and 67 108 864 bytes of held event envelopes,
-respectively. These defaults come from the predecessor agent proxy, not measured
-maxima. Both settings must be positive; configuration validation refuses zero.
-Each is a hard limit on the total held across all open items in one stream.
-Before retaining text or an event envelope that would exceed either limit, the
-scrubber ends the stream with a visible error. These are provisional settings under
-the [boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings).
+For event streams, matching spans each open delta field's accumulated decoded text:
+output text, reasoning text, tool-call arguments, names and IDs. Each field has its
+own matching state; interleaved fields are never concatenated. A delta byte can be
+part of a still-incomplete match only within the last `L − 1` bytes of its field's
+text. This unresolved suffix, rather than the whole item, determines retention.
+
+**Procedure: scrub and release stream events**
+
+1. **Match the next delta:** extend its field's decoded text and find completed
+   credential matches before releasing any event.
+2. **Redact completed matches:** replace the matched bytes inside the still-held
+   events that carry them, including the new event. The `L − 1` window ensures
+   every byte of a match is in a held event when that match completes.
+3. **Release resolved events:** hold an event while any of its delta bytes, in any
+   field, lies within that field's unresolved last `L − 1` bytes. Otherwise release
+   it, strictly in arrival order; a held event also holds every later event.
+4. **Resolve completed fields:** at item completion, resolve all of that item's
+   remaining fields; at stream end, resolve every remaining field. Release events
+   in arrival order once no unresolved earlier event holds them. Stream end
+   releases all held events.
+
+Matching text retained per field is at most `L − 1` bytes plus one delta,
+independent of item length. Event envelopes are retained separately until release.
+For example, a tool-call argument field can stop mid-token while output-text events
+keep arriving. Its unresolved tail holds those later events until its next delta
+resolves the tail or the item ends. Held event envelopes can therefore accumulate
+across interleaved fields despite the bound on matching text.
+
+The one provisional route setting `max_held_event_bytes` defaults to 67 108 864
+bytes of held event envelopes per stream. This default comes from the predecessor
+agent proxy, not a measured maximum. It must be positive; configuration validation
+refuses zero. Before retaining an event envelope that would exceed this total,
+the scrubber ends the stream with a visible error, without releasing unresolved
+events. There is no separate text limit. The setting follows the
+[boundary contract's bounds rule](../architecture/boundary.md#bounds-as-labelled-settings).
+Implementation reworks the stream module from the scrubber PR to this design and
+closes [#161](https://github.com/symbiotic-build/symbiotic-foundation/issues/161).
 
 Redaction, not refusal, is the rule here because the stream has already reached
 the caller in part. Refusal would cut every stream that quotes a token-shaped value.
@@ -700,8 +723,8 @@ Each mechanism this design adds, and the requirement it serves:
 | `return_headers` | agent tools that read a routing header back would lose their turn state without it |
 | Header allowlist on 429 and 503 | tools need the reset time; other headers can carry tokens or cookies |
 | Scrubber | credentials must not reach the caller, which may be untrusted |
-| Whole-item retention | reuses the tested stream module until suffix retention is qualified (#161) |
-| `max_held_text_bytes`, `max_held_event_bytes` | hard per-stream retention limits with provisional route defaults |
+| Candidate-suffix retention | redacts split credentials with matching text bounded independently of item length |
+| `max_held_event_bytes` | limits event envelopes accumulated behind an interleaved field's stalled tail |
 | Usage reader | usage receipts (#156 item 3) |
 | `symbiotic-usage` trailer | hosts that enforce their own per-job token ceilings need each response's usage; without it they would parse the stream a second time |
 | 401 renewal and one resend | a token revoked before its expiry would otherwise fail every request until restart |
@@ -713,6 +736,8 @@ Removed while designing:
 - parsing response bodies for reset hints; headers only;
 - signed admission, answer recovery, request budgets and caching for passthrough
   (§What passthrough does not reuse);
+- whole-item retention and its separate text limit; candidate-suffix retention
+  bounds matching text independently of item length (§Scrubbing);
 - a total request deadline; the idle timeout fails on lack of progress instead.
 - a bound on slot waits, and the invented `Retry-After: 1` it would have needed;
 - a default cooldown bound; the setting stays, off by default;
@@ -766,9 +791,9 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Header configuration:** each forbidden name listed in §Forwarded request
   headers and §Returned headers is refused in its respective configuration list.
   Startup fails before any provider request.
-- **Route defaults:** omitting `max_held_text_bytes`, `max_held_event_bytes` and
-  `rate_burst_seconds` loads 4 194 304, 67 108 864 and 0, respectively. Explicit
-  positive hold limits are preserved; zero for either hold limit refuses startup.
+- **Route defaults:** omitting `max_held_event_bytes` and `rate_burst_seconds`
+  loads 67 108 864 and 0, respectively. An explicit positive event-envelope limit
+  is preserved; zero refuses startup.
 - **Route validation:** an unknown or invalid path, or a query string, is refused
   before any provider request; the fixture receives no request or credential.
 - **Provider redirect:** a fixture redirect answer is not followed. The redirect
@@ -822,12 +847,28 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Cooldown recorded before dispatch:** pause a sender after its slot grant and
   before it takes the rate gate. Another caller's 429 records a cooldown under that
   gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
-- **Scrubbing:** Synthetic tokens split across every chunk boundary and across
-  Responses and Chat Completions deltas are redacted in all listed encodings.
-- **Stream hold limits:** for each configured hold limit, interleaved open items
-  may total exactly the limit. The next text or event envelope that would exceed
-  it ends the stream with an error before retention or release. Test text and
-  event-envelope limits independently, keeping the other below its limit.
+- **Scrubbing:** for each listed encoding, split a synthetic credential at every
+  byte boundary across transport chunks and across Responses and Chat Completions
+  deltas. Repeat for output text, reasoning text, tool-call arguments, names and
+  IDs. The caller receives the complete stream with every credential redacted.
+- **Interleaved field scrubbing:** split an encoded synthetic credential in each
+  of two fields, then alternate their prefix and suffix deltas. Repeat for every
+  encoding and split boundary. Each credential is redacted within its own field;
+  matching never joins bytes from different fields.
+- **Long single-field stream:** 65 537 deltas of 64 bytes in one field complete
+  within default limits. Matching text retained is at most `L − 1` bytes plus
+  one 64-byte delta, about `L` bytes, independent of total item length. The caller
+  receives the complete stream in arrival order without a hold-limit error.
+- **Release order:** a tool-call argument field pauses with an unresolved suffix
+  while output-text events arrive. No later event reaches the caller before the
+  held event. Advancing the argument field until its old suffix is resolved releases
+  eligible events in arrival order. Item completion resolves its remaining fields;
+  stream end resolves all remaining fields and releases every held event in order.
+- **Interleaved stall limit:** a tool-call argument field stops mid-token while
+  output-text events keep streaming. Held event envelopes may total exactly
+  `max_held_event_bytes`. The next envelope that would exceed it ends the stream
+  with a visible error before retention or release; no unresolved credential bytes
+  reach the caller.
 - **Usage:** a `response.completed` event produces a settled receipt with its token
   counts; a cut stream produces an `Unknown` receipt.
 - **Usage trailer:** with `TE: trailers`, the same stream ends with a
