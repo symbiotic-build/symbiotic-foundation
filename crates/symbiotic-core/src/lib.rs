@@ -3,6 +3,8 @@
 //! Keep this crate deliberately small. It should contain stable identifiers and
 //! policy labels that generic crates need to agree on, not product behavior.
 
+pub mod retry;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

@@ -8,5 +8,7 @@ repository.workspace = true
 description = "Tiny shared vocabulary for Symbiotic foundation crates"
 
 [dependencies]
+httpdate = "1"
 serde.workspace = true
+thiserror.workspace = true
 uuid.workspace = true

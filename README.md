@@ -12,7 +12,9 @@ Reusable Rust contracts for durable AI work:
   ready chat, embedding, rerank and classifier providers. Queueing, retries,
   limits, cooldowns, attempt budgets, caching, traces, usage receipts and
   persistence are internal. See [docs/architecture/ai-runtime.md](docs/architecture/ai-runtime.md).
-- `symbiotic-core` — tiny shared vocabulary and identifiers.
+- `symbiotic-core` — tiny shared vocabulary, identifiers, and the public `retry`
+  module for Retry-After parsing, backoff, and deterministic jitter. It needs no
+  HTTP client, async runtime, queue, or database.
 - `symbiotic-queue` — durable execution queue traits and state vocabulary,
   plus the in-process `MemoryQueue` backend and a backend conformance suite; no
   storage dependency.
