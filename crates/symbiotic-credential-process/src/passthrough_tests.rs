@@ -2266,3 +2266,352 @@ async fn deadline_crossing_between_clock_reads_allows_socket_dispatch() {
         assert_eq!(decoded(&read(caller).await).2, br#"{"result":"ok"}"#);
     }
 }
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl LogCapture {
+    /// Capture this thread's events with the production format and `directives`.
+    fn install(directives: &str) -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let writer = capture.clone();
+        let subscriber =
+            symbiotic_core::logging::subscriber(directives, move || writer.clone()).unwrap();
+        // With exactly one registered dispatcher, tracing-core caches a new callsite's
+        // interest from the registering thread's default: another test thread without a
+        // subscriber would disable the callsite for every thread. A second, permanent
+        // dispatcher makes interest per thread.
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
+    }
+    fn lines(&self) -> Vec<Value> {
+        let bytes = self.0.lock().unwrap();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        for secret in [
+            KEY,
+            "synthetic-body-token",
+            "discarded upstream body",
+            "synthetic-old-access",
+            "synthetic-old-refresh",
+            "synthetic-old-id",
+        ] {
+            assert!(
+                !output.contains(secret),
+                "sensitive fixture content in logs"
+            );
+        }
+        output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_retry_logs_share_validated_request_id_and_complete_once() {
+    let (capture, _subscriber) =
+        LogCapture::install("off,symbiotic_credential_process::passthrough=debug");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness
+        .connect(
+            "/v1/responses",
+            br#"{"token":"synthetic-body-token"}"#,
+            "x-symbiotic-request-id: synthetic-request\r\n",
+        )
+        .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::rate(0))
+        .ok()
+        .unwrap();
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let lines = capture.lines();
+    assert!(!lines.is_empty(), "request logging must not pass vacuously");
+    for message in [
+        "request admitted",
+        "queue wait",
+        "request sent",
+        "upstream status",
+        "upstream failure",
+        "request completed",
+    ] {
+        assert!(
+            lines.iter().any(|line| line["message"] == message),
+            "missing {message}: {lines:?}"
+        );
+    }
+    for line in &lines {
+        assert_eq!(
+            line["spans"][0]["request_id"], "synthetic-request",
+            "{line}"
+        );
+        assert_eq!(line["spans"][0]["name"], "model_request");
+        assert!(line["target"].as_str().is_some());
+        assert!(line.get("fields").is_none());
+        assert!(line.get("span").is_none());
+    }
+    let completed: Vec<_> = lines
+        .iter()
+        .filter(|line| line["message"] == "request completed")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    let completed = completed[0];
+    assert_eq!(
+        (
+            completed["route"].as_str(),
+            completed["outcome"].as_str(),
+            completed["status"].as_u64(),
+            completed["attempts"].as_u64()
+        ),
+        (Some("responses"), Some("complete"), Some(200), Some(2))
+    );
+    assert!(completed["queue_waited_ms"].is_u64());
+    assert!(completed["elapsed_ms"].is_u64());
+    println!("captured request completed: {completed}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_absent_request_id_logs_one_local_uuid() {
+    let (capture, _subscriber) =
+        LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness.connect("/v1/responses", b"{}", "").await;
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let lines = capture.lines();
+    assert!(!lines.is_empty(), "request logging must not pass vacuously");
+    let id = lines[0]["spans"][0]["request_id"].as_str().unwrap();
+    let uuid = uuid::Uuid::parse_str(id.strip_prefix("local-").expect("local request ID")).unwrap();
+    assert_eq!(uuid.get_version_num(), 4);
+    for line in &lines {
+        assert_eq!(line["spans"][0]["request_id"], id);
+    }
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_local_refusals_log_one_completion_with_returned_code_and_status() {
+    for (headers, status, code) in [
+        (
+            format!("x-symbiotic-request-id: {KEY}\r\n"),
+            400,
+            "request_id_invalid",
+        ),
+        (
+            "x-symbiotic-request-id: synthetic-request\r\nx-symbiotic-retry-policy: unknown\r\n"
+                .into(),
+            400,
+            "retry_policy_unknown",
+        ),
+        (
+            "x-symbiotic-request-id: synthetic-request\r\n".into(),
+            429,
+            "rate_limited",
+        ),
+        (
+            "x-symbiotic-request-id: synthetic-request\r\n".into(),
+            503,
+            "credential_unavailable",
+        ),
+    ] {
+        let (capture, _subscriber) =
+            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |c| {
+            if status == 503 {
+                login_config(c);
+            }
+            c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
+        })
+        .await;
+        if status == 503 {
+            write_private(
+                &harness._dir.path().join("login.json.renewal"),
+                b"uncertain_rotation",
+            );
+        }
+        let caller = harness.connect("/v1/responses", b"{}", &headers).await;
+        if status == 429 {
+            fixture
+                .next()
+                .await
+                .reply
+                .send(Reply::rate(1))
+                .ok()
+                .unwrap();
+        }
+        let (actual, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (actual, serde_json::from_slice::<Value>(&body).unwrap()),
+            (status, json!({"error":{"code":code}}))
+        );
+        let lines = capture.lines();
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        assert_eq!(completed.len(), 1, "{lines:?}");
+        assert_eq!(
+            (
+                completed[0]["outcome"].as_str(),
+                completed[0]["status"].as_u64(),
+                completed[0]["attempts"].as_u64()
+            ),
+            (
+                Some(code),
+                Some(u64::from(status)),
+                Some(u64::from(status == 429))
+            )
+        );
+        let id = completed[0]["spans"][0]["request_id"].as_str().unwrap();
+        if code == "request_id_invalid" {
+            assert!(id.starts_with("local-"));
+        } else {
+            assert_eq!(id, "synthetic-request");
+        }
+        assert!(fixture.incoming.try_recv().is_err());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
+    let (capture, _subscriber) = LogCapture::install("warn");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "x-symbiotic-request-id: synthetic-request\r\n",
+        )
+        .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::rate(0))
+        .ok()
+        .unwrap();
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let lines = capture.lines();
+    let failure = lines
+        .iter()
+        .find(|line| line["message"] == "upstream failure")
+        .expect("upstream failure is a warning");
+    assert_eq!(failure["spans"][0]["request_id"], "synthetic-request");
+    assert!(lines.iter().all(|line| line["level"] != "INFO"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_early_refusals_and_body_disconnect_log_one_completion() {
+    for (request, status, outcome, expected_id) in [
+        ("MALFORMED\r\n\r\n", Some(400), "invalid_request", None),
+        (
+            "POST /v1/unknown HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 0\r\nx-symbiotic-request-id: synthetic-request\r\n\r\n",
+            Some(404),
+            "route_not_found",
+            Some("synthetic-request"),
+        ),
+        (
+            "POST /v1/responses HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 3\r\nx-symbiotic-request-id: synthetic-request\r\n\r\nabc",
+            Some(413),
+            "request_too_large",
+            Some("synthetic-request"),
+        ),
+        (
+            "POST /v1/responses HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 2\r\nx-symbiotic-request-id: synthetic-request\r\n\r\n{",
+            None,
+            "cancelled",
+            Some("synthetic-request"),
+        ),
+    ] {
+        let (capture, _subscriber) =
+            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |config| {
+            config.passthrough.as_mut().unwrap().routes[0].max_request_bytes = 2;
+        })
+        .await;
+        let mut caller = UnixStream::connect(harness.path()).await.unwrap();
+        caller.write_all(request.as_bytes()).await.unwrap();
+        if let Some(status) = status {
+            caller.shutdown().await.unwrap();
+            let (actual, _, body) = decoded(&read(caller).await);
+            assert_eq!(
+                (actual, serde_json::from_slice::<Value>(&body).unwrap()),
+                (status, json!({"error":{"code":outcome}})),
+            );
+        } else {
+            // EOF before Content-Length bytes cancels body receipt, before forwarding.
+            drop(caller);
+        }
+        let lines = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let lines = capture.lines();
+                if lines
+                    .iter()
+                    .any(|line| line["message"] == "request completed")
+                {
+                    break lines;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("early exit must complete its request record");
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        assert_eq!(completed.len(), 1, "{lines:?}");
+        let completed = completed[0];
+        assert_eq!(
+            (
+                completed["outcome"].as_str(),
+                completed["status"].as_u64(),
+                completed["attempts"].as_u64(),
+                completed["queue_waited_ms"].as_u64()
+            ),
+            (Some(outcome), status.map(u64::from), Some(0), Some(0)),
+        );
+        if status.is_none() {
+            assert!(completed.get("status").is_none());
+        }
+        assert!(completed["elapsed_ms"].is_u64());
+        let id = completed["spans"][0]["request_id"].as_str().unwrap();
+        if let Some(expected) = expected_id {
+            assert_eq!(id, expected);
+        } else {
+            let uuid = uuid::Uuid::parse_str(id.strip_prefix("local-").unwrap()).unwrap();
+            assert_eq!(uuid.get_version_num(), 4);
+        }
+        for line in &lines {
+            assert_ne!(line["message"], "request refused");
+            assert_eq!(line["spans"][0]["name"], "model_request");
+            assert_eq!(line["spans"][0]["request_id"], id);
+        }
+        assert!(fixture.incoming.try_recv().is_err());
+    }
+}

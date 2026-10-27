@@ -25,6 +25,7 @@ fn route_json() -> serde_json::Value {
 
 fn config(dir: &std::path::Path, routes: Vec<RouteConfig>, frame: u32) -> ProcessConfig {
     ProcessConfig {
+        log: None,
         version: PROTOCOL_VERSION,
         state_dir: dir.join("state"),
         socket_path: dir.join("egress.sock"),

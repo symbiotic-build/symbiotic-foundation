@@ -24,7 +24,7 @@ symbiotic-egress = { path = "../symbiotic-egress" }
 symbiotic-trace = { path = "../symbiotic-trace" }
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "signal"] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+symbiotic-core = { path = "../symbiotic-core", features = ["logging"] }
 uuid.workspace = true
 zeroize = "1"
 

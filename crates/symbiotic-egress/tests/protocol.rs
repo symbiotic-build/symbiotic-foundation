@@ -478,6 +478,7 @@ mod clients {
         std::fs::write(&admission, vec![42; 32]).unwrap();
         std::fs::set_permissions(&admission, std::fs::Permissions::from_mode(0o600)).unwrap();
         let config = ProcessConfig {
+            log: None,
             version: PROTOCOL_VERSION,
             state_dir: dir.path().join("state"),
             socket_path: dir.path().join(if in_process {
