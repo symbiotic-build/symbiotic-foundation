@@ -2279,6 +2279,21 @@ impl std::io::Write for LogCapture {
     }
 }
 impl LogCapture {
+    /// Capture this thread's events with the production format and `directives`.
+    fn install(directives: &str) -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let writer = capture.clone();
+        let subscriber =
+            symbiotic_core::logging::subscriber(directives, move || writer.clone()).unwrap();
+        // With exactly one registered dispatcher, tracing-core caches a new callsite's
+        // interest from the registering thread's default: another test thread without a
+        // subscriber would disable the callsite for every thread. A second, permanent
+        // dispatcher makes interest per thread.
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
+    }
     fn lines(&self) -> Vec<Value> {
         let bytes = self.0.lock().unwrap();
         let output = std::str::from_utf8(&bytes).unwrap();
@@ -2304,14 +2319,8 @@ impl LogCapture {
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_retry_logs_share_validated_request_id_and_complete_once() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let subscriber = symbiotic_core::logging::subscriber(
-        "off,symbiotic_credential_process::passthrough=debug",
-        move || writer.clone(),
-    )
-    .unwrap();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (capture, _subscriber) =
+        LogCapture::install("off,symbiotic_credential_process::passthrough=debug");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness
@@ -2377,14 +2386,8 @@ async fn passthrough_retry_logs_share_validated_request_id_and_complete_once() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_absent_request_id_logs_one_local_uuid() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let subscriber = symbiotic_core::logging::subscriber(
-        "off,symbiotic_credential_process::passthrough=info",
-        move || writer.clone(),
-    )
-    .unwrap();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (capture, _subscriber) =
+        LogCapture::install("off,symbiotic_credential_process::passthrough=info");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness.connect("/v1/responses", b"{}", "").await;
@@ -2432,14 +2435,8 @@ async fn passthrough_local_refusals_log_one_completion_with_returned_code_and_st
             "credential_unavailable",
         ),
     ] {
-        let capture = LogCapture::default();
-        let writer = capture.clone();
-        let subscriber = symbiotic_core::logging::subscriber(
-            "off,symbiotic_credential_process::passthrough=info",
-            move || writer.clone(),
-        )
-        .unwrap();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (capture, _subscriber) =
+            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
             if status == 503 {
@@ -2499,10 +2496,7 @@ async fn passthrough_local_refusals_log_one_completion_with_returned_code_and_st
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let subscriber = symbiotic_core::logging::subscriber("warn", move || writer.clone()).unwrap();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (capture, _subscriber) = LogCapture::install("warn");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness
@@ -2532,14 +2526,8 @@ async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_unmatched_route_logs_one_refusal_with_code() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let subscriber = symbiotic_core::logging::subscriber(
-        "off,symbiotic_credential_process::passthrough=info",
-        move || writer.clone(),
-    )
-    .unwrap();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (capture, _subscriber) =
+        LogCapture::install("off,symbiotic_credential_process::passthrough=info");
     let fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness.connect("/v1/unknown", b"{}", "").await;

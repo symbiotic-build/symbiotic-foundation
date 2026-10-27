@@ -1560,19 +1560,20 @@ async fn signed_attempt_time_warning(
 #[tokio::test]
 async fn signed_attempt_time_open_log_sink_reports_executable_warnings() {
     let logs = executable_dispatch(None, None, Some((3600, 5, false))).await;
-    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr.
-    assert_eq!(logs.matches("WARN").count(), 3);
-    assert_eq!(
-        logs.matches("event=\"signed_attempt_time_ahead\"").count(),
-        3
-    );
-    for field in [
-        "recorded_at=",
-        "foundation_now=",
-        "ahead_seconds=",
-        "tolerance_seconds=5",
-    ] {
-        assert_eq!(logs.matches(field).count(), 3);
+    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr,
+    // one JSON line each.
+    let warnings: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|line: &serde_json::Value| line["event"] == "signed_attempt_time_ahead")
+        .collect();
+    assert_eq!(warnings.len(), 3, "{logs}");
+    for warning in &warnings {
+        assert_eq!(warning["level"], "WARN");
+        assert_eq!(warning["tolerance_seconds"], 5);
+        for field in ["recorded_at", "foundation_now", "ahead_seconds"] {
+            assert!(warning[field].is_u64(), "{warning}");
+        }
     }
     assert!(!logs.contains(SECRET));
     assert!(!logs.contains(&general_purpose::STANDARD.encode(SECRET)));
