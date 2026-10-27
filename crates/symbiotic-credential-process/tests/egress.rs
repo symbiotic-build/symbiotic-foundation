@@ -226,6 +226,27 @@ async fn regression_child_startup_wait_bounds_unready_child() {
     .await;
 }
 
+fn process_config(dir: &std::path::Path) -> ProcessConfig {
+    ProcessConfig {
+        log: None,
+        version: PROTOCOL_VERSION,
+        state_dir: dir.join("state"),
+        socket_path: dir.join("egress.sock"),
+        admission_key: SecretSource::OwnerOnlyFile {
+            path: dir.join("admission"),
+        },
+        max_secret_bytes: 4096,
+        max_frame_bytes: 262144,
+        max_connections: 8,
+        io_timeout_seconds: 2,
+        clock_rollback_warning_tolerance_seconds: 5,
+        jobs: Default::default(),
+        job_runner: Default::default(),
+        passthrough: None,
+        routes: Vec::new(),
+    }
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: ProcessConfig,
@@ -390,53 +411,37 @@ impl Fixture {
                 });
             }
         });
-        let config = ProcessConfig {
-            log: None,
-            version: PROTOCOL_VERSION,
-            state_dir: dir.path().join("state"),
-            socket_path: dir.path().join("egress.sock"),
-            admission_key: SecretSource::OwnerOnlyFile {
-                path: dir.path().join("admission"),
+        let mut config = process_config(dir.path());
+        config.routes = vec![RouteConfig {
+            answer_recovery: Default::default(),
+            tenant: "tenant".into(),
+            account: "account".into(),
+            account_sharing_key: None,
+            provider_request_limit: None,
+            max_attempts: 3,
+            request_budget: None,
+            route: "chat".into(),
+            secret_ref: "provider-key".into(),
+            secret: SecretSource::OwnerOnlyFile {
+                path: dir.path().join("provider"),
             },
-            max_secret_bytes: 4096,
-            max_frame_bytes: 262144,
-            max_connections: 8,
-            io_timeout_seconds: 2,
-            clock_rollback_warning_tolerance_seconds: 5,
-            jobs: Default::default(),
-            job_runner: Default::default(),
-            passthrough: None,
-            routes: vec![RouteConfig {
-                answer_recovery: Default::default(),
-                tenant: "tenant".into(),
-                account: "account".into(),
-                account_sharing_key: None,
-                provider_request_limit: None,
-                max_attempts: 3,
-                request_budget: None,
-                route: "chat".into(),
-                secret_ref: "provider-key".into(),
-                secret: SecretSource::OwnerOnlyFile {
-                    path: dir.path().join("provider"),
-                },
-                destination: format!("http://{address}/v1"),
-                model: "test-model".into(),
-                provider: RouteProvider::OpenAiChat {
-                    operator: "test".into(),
-                    thinking: None,
-                    reasoning_effort: None,
-                },
-                allow_loopback_http: true,
-                max_input_bytes: 32768,
-                max_response_bytes: 32768,
-                max_field_bytes: 1024,
-                max_output_tokens: 100,
-                max_in_flight: 4,
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                timeout_seconds: 1,
-            }],
-        };
+            destination: format!("http://{address}/v1"),
+            model: "test-model".into(),
+            provider: RouteProvider::OpenAiChat {
+                operator: "test".into(),
+                thinking: None,
+                reasoning_effort: None,
+            },
+            allow_loopback_http: true,
+            max_input_bytes: 32768,
+            max_response_bytes: 32768,
+            max_field_bytes: 1024,
+            max_output_tokens: 100,
+            max_in_flight: 4,
+            requests_per_minute: None,
+            input_units_per_minute: None,
+            timeout_seconds: 1,
+        }];
         Self {
             dir,
             config,
@@ -9135,26 +9140,36 @@ async fn regression_request_budget_lookup_failure_refuses_before_http() {
 #[tokio::test]
 async fn logging_startup_prefers_environment_directives_and_refuses_invalid_ones() {
     use std::io::Read;
-    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
-    let secret_path = fixture.dir.path().join("provider");
-    std::fs::write(&secret_path, b"synthetic-passthrough-secret").unwrap();
-    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let passthrough_path = fixture.dir.path().join("logging.sock");
-    let start = |configured: Option<&str>, environment: Option<&str>| {
-        let mut config = fixture.config.clone();
-        config.log = configured.map(str::to_owned);
-        // An unmatched passthrough request emits completion without a provider call.
-        config.passthrough = Some(serde_json::from_value(serde_json::json!({
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, value) in [
+        ("admission", KEY),
+        ("provider", b"synthetic-passthrough-secret".as_slice()),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, value).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut config = process_config(dir.path());
+    let passthrough_path = dir.path().join("logging.sock");
+    // An unmatched passthrough request emits completion without a provider call.
+    config.passthrough = Some(
+        serde_json::from_value(serde_json::json!({
             "socket_path": passthrough_path, "max_connections": 1,
             "routes": [{"name": "logging", "tenant": "tenant", "account": "logging",
                 "account_sharing_key": null, "method": "post", "path": "/v1/responses",
                 "destination": "https://provider.invalid/answer",
-                "secret": {"backend": "owner_only_file", "path": fixture.dir.path().join("provider")},
+                "secret": {"backend": "owner_only_file", "path": dir.path().join("provider")},
                 "stream": "openai_responses", "forward_headers": [],
                 "max_request_bytes": 1024, "max_response_bytes": 1024,
                 "max_in_flight": 1, "requests_per_minute": null, "idle_timeout_seconds": 1}]
-        })).unwrap());
-        let path = fixture.dir.path().join("logging-config.json");
+        }))
+        .unwrap(),
+    );
+    let start = |configured: Option<&str>, environment: Option<&str>| {
+        let mut config = config.clone();
+        config.log = configured.map(str::to_owned);
+        let path = dir.path().join("logging-config.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut command = std::process::Command::new(credential_process());
@@ -9254,5 +9269,4 @@ async fn logging_startup_prefers_environment_directives_and_refuses_invalid_ones
             assert!(lines.iter().all(|line| line["level"] != "INFO"), "{stderr}");
         }
     }
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }
