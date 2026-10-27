@@ -793,7 +793,7 @@ fn cooldown_active(
 pub const QUEUE_SCHEMA_VERSION: u32 = 17;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
-    conn.busy_timeout(std::time::Duration::from_millis(sqlite_busy_timeout_ms()))
+    conn.busy_timeout(std::time::Duration::from_millis(60_000))
         .map_err(storage_error)?;
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(storage_error)?;
@@ -891,14 +891,6 @@ fn read_code(
     row.get::<_, Option<String>>(column)?
         .map(|code| symbiotic_core::DiagnosticCode::parse(&code).ok_or_else(invalid_stored_code))
         .transpose()
-}
-
-fn sqlite_busy_timeout_ms() -> u64 {
-    std::env::var("SYMBIOTIC_QUEUE_SQLITE_BUSY_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(60_000)
 }
 
 fn find_by_idempotency(
@@ -1213,31 +1205,6 @@ mod tests {
     }
 
     #[test]
-    fn trial_version_15_confirmed_purge_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.sqlite");
-        drop(SqliteQueue::open(&path).unwrap());
-        let conn = Connection::open(&path).unwrap();
-        conn.execute("INSERT INTO jobs(scope,id,key,digest,state,final_state,kind,delivery_generation) VALUES ('scope','id','key','digest','\"Accepted\"','\"Purged\"',NULL,1)", []).unwrap();
-        conn.pragma_update(None, "user_version", 15).unwrap();
-        assert!(matches!(
-            SqliteQueue::open(&path),
-            Err(QueueError::Storage(
-                symbiotic_core::DiagnosticCode::UnsupportedQueueSchema
-            ))
-        ));
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
-                .unwrap(),
-            15
-        );
-        assert!(
-            conn.query_row("SELECT kind IS NULL FROM jobs", [], |r| r.get::<_, bool>(0))
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn unversioned_existing_queue_or_wrong_version_is_refused_without_migration() {
         for version in [
             -1,
@@ -1295,28 +1262,6 @@ mod tests {
             run_after: None,
             max_attempts: Some(2),
             force: false,
-        }
-    }
-
-    #[test]
-    fn sqlite_busy_timeout_defaults_to_longer_lock_wait() {
-        unsafe {
-            std::env::remove_var("SYMBIOTIC_QUEUE_SQLITE_BUSY_TIMEOUT_MS");
-        }
-        assert_eq!(sqlite_busy_timeout_ms(), 60_000);
-
-        unsafe {
-            std::env::set_var("SYMBIOTIC_QUEUE_SQLITE_BUSY_TIMEOUT_MS", "1500");
-        }
-        assert_eq!(sqlite_busy_timeout_ms(), 1500);
-
-        unsafe {
-            std::env::set_var("SYMBIOTIC_QUEUE_SQLITE_BUSY_TIMEOUT_MS", "0");
-        }
-        assert_eq!(sqlite_busy_timeout_ms(), 60_000);
-
-        unsafe {
-            std::env::remove_var("SYMBIOTIC_QUEUE_SQLITE_BUSY_TIMEOUT_MS");
         }
     }
 
