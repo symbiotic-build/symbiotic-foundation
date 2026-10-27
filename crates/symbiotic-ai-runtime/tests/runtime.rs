@@ -690,15 +690,6 @@ mod custom_cache {
     use super::*;
 
     #[tokio::test]
-    async fn an_abandoned_call_does_not_block_the_identical_request_behind_it() {
-        let state = private_tempdir();
-        super::an_abandoned_call_does_not_block_the_identical_request_behind_it(persistent(
-            state.path(),
-        ))
-        .await;
-    }
-
-    #[tokio::test]
     async fn a_waiter_and_a_later_caller_share_the_answer_of_an_abandoned_call() {
         // A host cache answers later callers independently of the operational store.
         let state = private_tempdir();

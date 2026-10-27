@@ -763,13 +763,13 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
 
 #[tokio::test(start_paused = true)]
 async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
+    let queue = counted(Arc::new(memory_queue()));
     let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
         symbiotic_core::DiagnosticCode::ProviderFailure,
     )]);
     let provider = queued(
         raw.clone(),
-        queue,
+        queue.clone(),
         ModelQueueConfig {
             retry_base_delay_ms: 1_500,
             retry_provider_errors: true,
@@ -783,14 +783,33 @@ async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
     .with_invocation("retry-waiters".into());
     // Two callers of the same request: one runs the failing attempt, the
     // other waits on the same queue item.
-    let (first, second) = tokio::join!(
-        provider.chat(request("fractional")),
-        provider.chat(request("fractional"))
+    let queue_id = raw.descriptor.queue_id();
+    let began = tokio::time::Instant::now();
+    queue
+        .note_cooldown(&queue_id, queue.now() + chrono::Duration::milliseconds(100))
+        .await
+        .unwrap();
+    let caller = provider.clone();
+    let first = tokio::spawn(async move { caller.chat(request("fractional")).await });
+    // Observe the real backend's deadline read before extending the sleeping request.
+    queue.cooldown_read.notified().await;
+    let extended = queue.now() + chrono::Duration::milliseconds(250);
+    queue.note_cooldown(&queue_id, extended).await.unwrap();
+    // Drive the caller through the original deadline before checking for early dispatch.
+    tokio::time::sleep(Duration::from_millis(249)).await;
+    assert!(
+        raw.starts.lock().unwrap().is_empty(),
+        "dispatch preceded the extended cooldown"
     );
-    first.unwrap();
-    second.unwrap();
+    let (first, second) = tokio::join!(first, provider.chat(request("fractional")));
+    assert_eq!(first.unwrap().unwrap().text, "fractional");
+    assert_eq!(second.unwrap().text, "fractional");
     let starts = raw.starts.lock().unwrap().clone();
     assert!(starts.len() >= 2, "{starts:?}");
+    assert!(
+        starts[0].duration_since(began) >= Duration::from_millis(250),
+        "dispatch preceded the extended cooldown"
+    );
     let waited = starts[1].duration_since(starts[0]);
     assert!(
         waited >= Duration::from_millis(1_490),
@@ -966,6 +985,7 @@ struct CountsRenewals {
     heartbeat_entered: tokio::sync::Notify,
     completion_state: AtomicUsize,
     running_read: tokio::sync::Notify,
+    cooldown_read: tokio::sync::Notify,
     pause_claim: std::sync::atomic::AtomicBool,
     claim_reached: tokio::sync::Notify,
     resume_claim: tokio::sync::Notify,
@@ -991,6 +1011,7 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         heartbeat_entered: tokio::sync::Notify::new(),
         completion_state: AtomicUsize::new(0),
         running_read: tokio::sync::Notify::new(),
+        cooldown_read: tokio::sync::Notify::new(),
         pause_claim: std::sync::atomic::AtomicBool::new(false),
         claim_reached: tokio::sync::Notify::new(),
         resume_claim: tokio::sync::Notify::new(),
@@ -1194,7 +1215,9 @@ impl QueueBackend for CountsRenewals {
         &self,
         queue_id: &QueueId,
     ) -> Result<Option<chrono::DateTime<Utc>>, QueueError> {
-        self.inner.cooldown_until(queue_id).await
+        let result = self.inner.cooldown_until(queue_id).await;
+        self.cooldown_read.notify_one();
+        result
     }
     async fn note_cooldown(
         &self,

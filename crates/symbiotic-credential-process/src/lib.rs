@@ -396,7 +396,7 @@ impl CredentialProcess {
         Self::open_with_clock(config, Arc::new(chrono::Utc::now))
     }
 
-    /// Open with a trusted host clock for authorization and runtime deadlines.
+    /// Open with a trusted host clock for authorization, runtime and passthrough deadlines.
     pub fn open_with_clock(
         config: ProcessConfig,
         clock: symbiotic_queue::jobs::JobClock,
@@ -436,7 +436,7 @@ impl CredentialProcess {
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
-        let passthrough = passthrough::Passthrough::open(&config, &runtime)?;
+        let passthrough = passthrough::Passthrough::open(&config, &runtime, clock.clone())?;
         // Replay and ledger acceptance share the runtime operational database.
         let clock: registry::Clock = Arc::new(move || {
             u64::try_from(clock().timestamp()).map_err(|_| EgressError::StateUnavailable)

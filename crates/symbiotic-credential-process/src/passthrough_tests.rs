@@ -156,6 +156,12 @@ pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
     })).unwrap()
 }
 pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
+    open_with_clock(config, test_clock::clock())
+}
+fn open_with_clock(
+    config: ProcessConfig,
+    clock: symbiotic_queue::jobs::JobClock,
+) -> Result<CredentialProcess> {
     let key = config.state_dir.parent().unwrap().join("key");
     if config
         .passthrough
@@ -167,15 +173,7 @@ pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
     {
         write_private(&key, KEY.as_bytes());
     }
-    let clock = test_clock::clock();
-    let mut process = CredentialProcess::open_with_clock(config, clock.clone())?;
-    Arc::get_mut(&mut process.inner)
-        .unwrap()
-        .passthrough
-        .as_mut()
-        .unwrap()
-        .clock = Some(clock);
-    Ok(process)
+    CredentialProcess::open_with_clock(config, clock)
 }
 impl Harness {
     async fn start(fixture: &Fixture, change: impl FnOnce(&mut ProcessConfig)) -> Self {
@@ -197,7 +195,7 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config(dir.path());
         change(&mut config);
-        let mut process = open(config).unwrap();
+        let mut process = open_with_clock(config, clock.unwrap_or_else(test_clock::clock)).unwrap();
         let pass = Arc::get_mut(&mut process.inner)
             .unwrap()
             .passthrough
@@ -205,9 +203,6 @@ impl Harness {
             .unwrap();
         pass.wire_base = Some(fixture.base.clone());
         pass.retry_hook = hook;
-        if clock.is_some() {
-            pass.clock = clock;
-        }
         for route in &mut pass.routes {
             route.client = reqwest::Client::builder()
                 .no_proxy()
@@ -651,14 +646,13 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
     let directory = tempfile::tempdir().unwrap();
     let mut settings = config(directory.path());
     settings.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
-    let mut process = open(settings).unwrap();
     let frozen_at = Utc::now() + chrono::Duration::seconds(60);
+    let mut process = open_with_clock(settings, Arc::new(move || frozen_at)).unwrap();
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
         .as_mut()
         .unwrap();
-    pass.clock = Some(Arc::new(move || frozen_at));
     let account = pass.routes[0].account.clone();
     for (nanoseconds, seconds) in [(1, 1), (1_000_000_000, 1), (1_000_000_001, 2)] {
         account
@@ -974,7 +968,14 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
         model::{ChatMessage, ChatRequest, OpenAiCompatibleChatProvider},
     };
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |_| {}).await;
+    let clock = test_clock::clock();
+    let harness = Harness::with_clock(
+        &fixture,
+        |_| {},
+        None,
+        Some(Arc::new(move || clock() + chrono::Duration::days(30))),
+    )
+    .await;
     let route = &harness.process.inner.passthrough.as_ref().unwrap().routes[0];
     let typed = harness
         .process
@@ -1044,6 +1045,9 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
     }
     assert_eq!(decoded(&passthrough.await.unwrap()).0, 200);
     assert_eq!(typed.await.unwrap().unwrap().text, "typed answer");
+    harness
+        .health_where(|h| h["routes"][0]["cooldown_until"].is_null())
+        .await;
 }
 
 #[tokio::test]

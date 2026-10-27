@@ -358,11 +358,14 @@ pub(crate) struct Passthrough {
     pub(crate) retry_hook: Option<RetryHook>,
     #[cfg(test)]
     wire_base: Option<String>,
-    #[cfg(test)]
-    clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
+    clock: symbiotic_queue::jobs::JobClock,
 }
 impl Passthrough {
-    pub(crate) fn open(config: &ProcessConfig, runtime: &Runtime) -> Result<Option<Self>> {
+    pub(crate) fn open(
+        config: &ProcessConfig,
+        runtime: &Runtime,
+        clock: symbiotic_queue::jobs::JobClock,
+    ) -> Result<Option<Self>> {
         let Some(pass) = &config.passthrough else {
             return Ok(None);
         };
@@ -454,17 +457,12 @@ impl Passthrough {
             retry_hook: None,
             #[cfg(test)]
             wire_base: None,
-            #[cfg(test)]
-            clock: None,
+            clock,
         }))
     }
 
     fn now(&self) -> DateTime<Utc> {
-        #[cfg(test)]
-        if let Some(clock) = &self.clock {
-            return clock();
-        }
-        Utc::now()
+        (self.clock)()
     }
 }
 impl Route {

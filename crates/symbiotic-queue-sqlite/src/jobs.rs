@@ -1562,6 +1562,130 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn regression_sqlite_completion_lock_wait_cannot_revive_expired_claim() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI64, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expiry.sqlite");
+        let queue = Arc::new(SqliteQueue::open(&path).unwrap());
+        let scope = scope();
+        let config = JobConfig {
+            claim_lease_seconds: 1,
+            ..JobConfig::default()
+        };
+        let now = Utc::now();
+        let clock: JobClock = Arc::new(move || now);
+        let JobResponse::Enqueued(rows) = queue
+            .jobs(
+                &scope,
+                &config,
+                clock.clone(),
+                JobRequest::Enqueue(vec![spec("expiry")]),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("enqueue")
+        };
+        let id = match &rows[0] {
+            Enqueued::Inserted(id) => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        let JobResponse::Job(Some(claim)) = queue
+            .jobs(
+                &scope,
+                &config,
+                clock,
+                JobRequest::Claim {
+                    kinds: vec!["handler".into()],
+                    slots_available: 1,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("claim")
+        };
+        let mut blocker = Connection::open(path).unwrap();
+        let lock = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let time = Arc::new(AtomicI64::new(now.timestamp_millis()));
+        let observed = time.clone();
+        let (started, ready) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        queue.conn.lock().unwrap().authorizer(Some(
+            move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Begin,
+                    }
+                ) && let Some(started) = started.take()
+                {
+                    started.send(()).unwrap();
+                }
+                rusqlite::hooks::Authorization::Allow
+            },
+        ));
+        let worker_queue = queue.clone();
+        let worker_scope = scope.clone();
+        let worker_config = config.clone();
+        let worker_id = id.clone();
+        let generation = claim.generation;
+        let lease_until = claim.lease_until.unwrap();
+        let worker = tokio::spawn(async move {
+            worker_queue
+                .jobs(
+                    &worker_scope,
+                    &worker_config,
+                    Arc::new(move || {
+                        DateTime::from_timestamp_millis(observed.load(Ordering::SeqCst)).unwrap()
+                    }),
+                    JobRequest::Complete {
+                        job: worker_id,
+                        generation,
+                        state: JobState::Succeeded,
+                        origin: ResultOrigin::Handler,
+                        output: Some(b"late".to_vec()),
+                        receipt: None,
+                        diagnostic: None,
+                    },
+                )
+                .await
+        });
+        // The callback runs while preparing BEGIN, before the held writer lock can be acquired.
+        tokio::task::spawn_blocking(move || {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        time.store(
+            (lease_until + Duration::milliseconds(1)).timestamp_millis(),
+            Ordering::SeqCst,
+        );
+        lock.commit().unwrap();
+        let result = worker.await.unwrap();
+        assert!(
+            matches!(result, Err(JobError::StaleClaim)),
+            "late completion accepted: {result:?}"
+        );
+        let JobResponse::Job(Some(row)) = queue
+            .jobs(&scope, &config, Arc::new(move || now), JobRequest::Get(id))
+            .await
+            .unwrap()
+        else {
+            panic!("get")
+        };
+        assert_eq!(row.state, JobState::Running);
+        assert!(row.output.is_none());
+    }
+
     #[test]
     fn jobs_heartbeat_never_decodes_or_rewrites_content() {
         let queue = SqliteQueue::in_memory().unwrap();

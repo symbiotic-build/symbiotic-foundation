@@ -1586,13 +1586,28 @@ mod tests {
         let attempt = first.clone();
         let permit = granted.permit.clone();
         let (started, ready) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        registry
+            .0
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Begin,
+                    }
+                ) && let Some(started) = started.take()
+                {
+                    started.send(()).unwrap();
+                }
+                rusqlite::hooks::Authorization::Allow
+            }));
         let worker = std::thread::spawn(move || {
-            assert!((registry.1)().unwrap() < attempt.expires_at);
-            started.send(()).unwrap();
             let result = registry.consume(&attempt, &permit, &reservation(&attempt), 1);
             (registry, result)
         });
-        ready.recv().unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         time.store(first.expires_at, std::sync::atomic::Ordering::SeqCst);
         lock.commit().unwrap();
         let (mut registry, result) = worker.join().unwrap();

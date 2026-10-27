@@ -146,7 +146,7 @@ impl Passthrough {
                 .cooldown_until()
                 .await
                 .map_err(|_| EgressError::StateUnavailable)?
-                .filter(|at| *at > Utc::now())
+                .filter(|at| *at > self.now())
                 .map(|at| at.timestamp());
             let secrets = route.secrets().await;
             let h = route
@@ -169,7 +169,7 @@ impl Passthrough {
                 .lock()
                 .map_err(|_| EgressError::StateUnavailable)?
                 .until
-                .filter(|t| *t > Utc::now())
+                .filter(|t| *t > self.now())
                 .map(|t| t.timestamp());
             routes.push(RouteHealth {
                 name: &route.config.name,

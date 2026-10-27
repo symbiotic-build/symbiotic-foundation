@@ -5211,27 +5211,6 @@ mod tests {
     #[cfg(feature = "queue")]
     use symbiotic_queue_sqlite::SqliteQueue;
 
-    #[cfg(feature = "queue")]
-    #[tokio::test(start_paused = true)]
-    async fn regression_cooldown_wait_rereads_after_waking() {
-        let queue = std::sync::Arc::new(
-            symbiotic_queue::MemoryQueue::new().with_clock(test_clock::clock()),
-        );
-        let queue_id = QueueId::new("extended-cooldown");
-        queue
-            .note_cooldown(&queue_id, queue.now() + ChronoDuration::milliseconds(100))
-            .await
-            .unwrap();
-        let waiter = wait_for_model_cooldown(queue.as_ref(), &queue_id);
-        tokio::pin!(waiter);
-        // Poll through the initial read so the extension occurs while sleeping.
-        assert!(futures::poll!(waiter.as_mut()).is_pending());
-        let extended = queue.now() + ChronoDuration::milliseconds(250);
-        queue.note_cooldown(&queue_id, extended).await.unwrap();
-        waiter.await.unwrap();
-        assert!(queue.now() >= extended);
-    }
-
     #[test]
     fn failed_http_client_construction_refuses_chat_and_embedding_configuration() {
         let mut chat = OpenAiCompatibleChatProvider::new("op", "model", "http://localhost", "")
@@ -6349,7 +6328,7 @@ mod tests {
         );
         let provider = QueuedChatProvider::new(
             LeaseCrossingChat::new(),
-            queue,
+            queue.clone(),
             "worker",
             ModelQueueConfig {
                 max_in_flight: 1,
@@ -6368,7 +6347,16 @@ mod tests {
 
         let response = provider.chat(chat_request("hello")).await.unwrap();
 
-        assert_eq!(response.text, "hello");
+        let item = queue
+            .get_item(response.trace.queue_item_id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (response.text.as_str(), item.status, item.lease_until),
+            ("hello", QueueStatus::Succeeded, None),
+            "renewal must keep the claim valid through completion"
+        );
     }
 
     #[test]

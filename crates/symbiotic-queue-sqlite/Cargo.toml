@@ -20,6 +20,7 @@ symbiotic-queue = { path = "../symbiotic-queue" }
 tokio.workspace = true
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 symbiotic-queue = { path = "../symbiotic-queue", features = ["conformance"] }
 futures = "0.3"
 tempfile = "3"
