@@ -1157,6 +1157,7 @@ async fn stream_progress_can_exceed_the_idle_timeout_without_a_total_deadline() 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (send, incoming) = mpsc::channel::<Upstream>(1);
+    let (progress, mut chunks) = mpsc::channel::<Vec<u8>>(1);
     let task = tokio::spawn(async move {
         let _send = send;
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -1167,25 +1168,69 @@ async fn stream_progress_can_exceed_the_idle_timeout_without_a_total_deadline() 
         }
         let mut body = [0; 2];
         stream.read_exact(&mut body).await.unwrap();
-        let response = br#"{"text":"slow answer"}"#;
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).as_bytes()).await.unwrap();
-        for part in response.chunks(8) {
-            stream.write_all(part).await.unwrap();
-            if part.len() == 8 {
-                tokio::time::sleep(Duration::from_millis(60)).await;
-            }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        while let Some(bytes) = chunks.recv().await {
+            stream.write_all(&bytes).await.unwrap();
         }
     });
     let fixture = Fixture {
-        idle_timeout: Some(Duration::from_millis(100)),
+        idle_timeout: None,
         base,
         incoming,
         task,
     };
     let harness = Harness::start(&fixture, |_| {}).await;
-    let (status, _, body) = decoded(&harness.call().await.await.unwrap());
+    let mut caller = harness.connect("/v1/responses", b"{}", "").await;
+    let mut received = Vec::new();
+    let types = [
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+    ];
+    for (index, kind) in types.iter().enumerate() {
+        if index != 0 {
+            // Each gap is below the one-second idle limit. Together they exceed it.
+            // Advance only after the caller receives the preceding complete event.
+            advance_clock(Duration::from_millis(600)).await;
+        }
+        let event = json!({"type":kind,"response":{"id":"slow-answer"}});
+        progress
+            .send(format!("data: {event}\n\n").into_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                received.push(
+                    caller
+                        .read_u8()
+                        .await
+                        .expect("stream ended before progress"),
+                );
+                if received.ends_with(b"\n\n\r\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("each complete event must reach the caller");
+    }
+    drop(progress);
+    received.extend(read(caller).await);
+    let (status, _, body) = decoded(&received);
     assert_eq!(status, 200);
-    assert_eq!(body, br#"{"text":"slow answer"}"#);
+    let events = ResponsesAdapter::default().feed(&body, 100_000).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.record().value["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        types
+    );
 }
 
 #[tokio::test]
