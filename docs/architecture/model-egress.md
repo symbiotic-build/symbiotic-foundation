@@ -999,7 +999,7 @@ new-session holds even when routes use distinct runtime account scopes. Failure
 counts share the runtime account scope; session holds share the login store.
 The bare cooldown backend costs one read before preparation and one under the
 send gate, plus a monotonic write when extending a cooldown. Session checks add
-bounded memory lookups and no database rows. Holding item events prevents partial
+bounded memory lookups and no database rows. Holding Responses item events prevents partial
 items reaching callers; retaining original complete items earns exact continuation
 replay. The health file remains a derived view of that process and backend state.
 An eligible attempt reads the existing cooldown twice: before preparation and
@@ -1047,15 +1047,17 @@ items, deltas and their identity, provider sequence, usage and classified errors
 The adapters support `stream: "openai_responses"` and `stream: "openai_chat_completions"`.
 Chat Completions accepts SSE and non-streaming JSON. Original bytes are relayed
 without re-encoding. Unchanged Responses events round-trip exactly.
-The credential process holds each item's events until its done event, then releases
+For Responses, the credential process holds each item's events until its done event, then releases
 them in order.
-Responses performs no response-body credential matching (operator decision 2026-10-26).
+Responses POST performs no response-body credential matching (operator decision 2026-10-26).
 Issue #162 requires Chat Completions and GET JSON listings to scrub held credentials
 using the model credential encoding set. One incremental scrubber replaces matches
 with `[REDACTED]`, including matches split across network chunks.
 The corresponding Warden matching-filter removal is tracked by
 [warden#493](https://github.com/symbiotic-build/warden/issues/493).
-`max_held_event_bytes` defaults to 67 108 864 and bounds one held item's events.
+`max_held_event_bytes` defaults to 67 108 864 and bounds one held Responses item's events.
+Chat Completions forwards complete SSE records progressively after scrubbing;
+the same setting bounds each record, not a complete choice.
 Overflow emits a visible error.
 
 On a handled Responses mid-answer failure, the queue discards partial output and continues
@@ -1075,7 +1077,7 @@ A final usage chunk supplies prompt, completion, cached and reasoning token coun
 Non-streaming JSON uses its `usage` object. Successful terminal responses settle
 reported numeric usage in the canonical ledger. Missing usage, errors, cancellation
 and disconnects keep `Unknown`. Provider identity text and answer bytes are excluded.
-The ledger adds one existing receipt row per dispatched POST attempt and uses its
+The ledger adds one existing receipt row per dispatched Chat Completions POST attempt and uses its
 native reserve/finish transactions. It adds no table or index. Independent generated
 attempt invocations prevent unknown receipts from blocking subsequent passthrough sends.
 Settlement precedes the final HTTP chunk; a ledger failure leaves HTTP incomplete.
@@ -1177,7 +1179,8 @@ and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
 files, timestamps older than 30 s, stopping processes and unusable login states.
 There is no socket health endpoint.
 
-This first step adds no passthrough spend receipts or usage trailers. Typed-route
+Only Chat Completions POST creates passthrough spend receipts; Responses POST and
+GET listings create none. Passthrough adds no usage trailers. Typed-route
 admission, accounting and recovery retain their existing protocol.
 Provider fixtures use a test-only mapping to loopback HTTP; production routes
 always require HTTPS. Tests cover real Unix sockets and executable shutdown in
