@@ -7,13 +7,13 @@ use symbiotic_ai_runtime::model::{
     item_stream::{ItemEvent, ResponsesAdapter},
 };
 
-/// Provider event dialect. Only Responses currently has an item-stream adapter.
+/// Provider event dialect. Chat Completions cannot continue and join after output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamDialect {
     /// OpenAI Responses SSE and JSON.
     OpenaiResponses,
-    /// Reserved configuration spelling; refused until its adapter is implemented.
+    /// OpenAI Chat Completions SSE and JSON.
     OpenaiChatCompletions,
 }
 /// Static diagnostic with no provider content.

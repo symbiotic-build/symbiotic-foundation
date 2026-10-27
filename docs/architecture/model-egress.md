@@ -971,7 +971,7 @@ free `validate_routes(routes, max_frame_bytes)` function checks typed routes onl
 Each `PassthroughRoute` binds an exact method and origin-form path to one HTTPS
 URL. Query strings, percent escapes, fragments, backslashes, duplicate request
 headers, `Transfer-Encoding` and `Expect` are refused. Requests require HTTP/1.1,
-`Host` and a bounded `Content-Length`. The existing `max_frame_bytes` setting
+`Host` and a bounded `Content-Length`. GET may omit Content-Length for an empty body. The existing `max_frame_bytes` setting
 bounds the complete HTTP header block. Route byte settings bound the body.
 The second socket uses the typed socket's owner-only directory check, bind lock
 and same-UID peer check. It accepts one request per connection.
@@ -991,7 +991,8 @@ setting defaults to zero, as in the existing runtime. Typed configuration routes
 use that default. Shared typed bindings must leave input-unit pacing and provider
 request limits unset. Raw requests consume the shared request bucket; their
 undecoded bodies have no typed input-unit estimate.
-Passthrough creates no spend reservation in this step.
+Chat Completions POST reserves each dispatched attempt in the existing spend ledger.
+GET listings and Responses do not create reservations.
 `ModelRequestGrant::start_checked` holds a consumer's admission guard through the
 first transport poll. A deferred send consumes no pacing. This orders login-wide
 new-session holds even when routes use distinct runtime account scopes. Failure
@@ -1043,17 +1044,21 @@ gate. Another 429 extends the hold. Health exposes the hold's Unix deadline.
 
 The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque
 items, deltas and their identity, provider sequence, usage and classified errors.
-The first adapter is Responses SSE. Other stream dialects are visibly refused at
-validation until their adapters exist. Unchanged Responses events round-trip exactly.
+The adapters support `stream: "openai_responses"` and `stream: "openai_chat_completions"`.
+Chat Completions accepts SSE and non-streaming JSON. Original bytes are relayed
+without re-encoding. Unchanged Responses events round-trip exactly.
 The credential process holds each item's events until its done event, then releases
 them in order.
-No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+Responses performs no response-body credential matching (operator decision 2026-10-26).
+Issue #162 requires Chat Completions and GET JSON listings to scrub held credentials
+using the model credential encoding set. One incremental scrubber replaces matches
+with `[REDACTED]`, including matches split across network chunks.
 The corresponding Warden matching-filter removal is tracked by
 [warden#493](https://github.com/symbiotic-build/warden/issues/493).
 `max_held_event_bytes` defaults to 67 108 864 and bounds one held item's events.
 Overflow emits a visible error.
 
-On a handled mid-answer failure, the queue discards partial output and continues
+On a handled Responses mid-answer failure, the queue discards partial output and continues
 with the original input plus every completed provider item exactly as received,
 including encrypted reasoning. Complete interleaved items survive partial-item
 discard. Release compacts discarded output positions.
@@ -1063,8 +1068,56 @@ events are suppressed. One final completed event contains all output items and
 summed reported usage. Fail decisions emit the original error event.
 Caller disconnect cancels all work. Only JSON and uncompressed event streams are
 accepted. Idle timeout is classified as network failure and uses the same policy.
-Passthrough requests do not yet record spend receipts or return the usage trailer;
-[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
+Chat Completions uses the same retry engine before the first downstream byte.
+After that byte, a failure stays visible and no policy or hook may retry or switch. Fallback routes must use the same method and dialect.
+The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
+A final usage chunk supplies prompt, completion, cached and reasoning token counts.
+Non-streaming JSON uses its `usage` object. Successful terminal responses settle
+reported numeric usage in the canonical ledger. Missing usage, errors, cancellation
+and disconnects keep `Unknown`. Provider identity text and answer bytes are excluded.
+The ledger adds one existing receipt row per dispatched POST attempt and uses its
+native reserve/finish transactions. It adds no table or index. Independent generated
+attempt invocations prevent unknown receipts from blocking subsequent passthrough sends.
+Settlement precedes the final HTTP chunk; a ledger failure leaves HTTP incomplete.
+
+For model listings, configure the existing `method: "get"`, exact `path` (for example
+`/v1/models`), destination URL and account credential. Keep the account's `stream`
+value. GET accepts JSON only and uses the same scrubber and account admission.
+No new configuration key or spend receipt is needed for listings.
+Responses receipts and usage trailers remain tracked by
+[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165).
+
+For a MiMo host, this example is one entry in `passthrough.routes`. The host
+provisions the key file with owner-only access and raw key bytes without a trailing
+newline. The limits are example deployment
+values; account-sharing routes must use matching account limits.
+
+```json
+{
+  "name": "mimo-chat",
+  "tenant": "warden",
+  "account": "mimo",
+  "account_sharing_key": null,
+  "method": "post",
+  "path": "/v1/chat/completions",
+  "destination": "https://token-plan-ams.xiaomimimo.com/v1/chat/completions",
+  "secret": {"backend": "owner_only_file", "path": "/run/warden-model/mimo-api-key"},
+  "stream": "openai_chat_completions",
+  "forward_headers": ["content-type", "accept"],
+  "return_headers": ["x-request-id"],
+  "max_request_bytes": 8388608,
+  "max_response_bytes": 67108864,
+  "max_in_flight": 2,
+  "requests_per_minute": null,
+  "idle_timeout_seconds": 120
+}
+```
+
+The caller selects `xiaomi/mimo-v2.6-flash` in its request body. For streamed usage,
+it asks for `stream_options.include_usage: true`. Foundation does not add or rewrite
+those request fields. A listing route uses `method: "get"`, `path: "/v1/models"`
+and its fixed provider models URL, with the same account and limits.
+
 
 Configured `return_headers` carry safe printable ASCII values of 1–8 192 bytes.
 Recognized provider rate-limit headers are forwarded on every status, including

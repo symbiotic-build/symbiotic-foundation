@@ -71,7 +71,7 @@ pub struct PassthroughConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PassthroughMethod {
-    /// GET with an explicit Content-Length, including zero.
+    /// GET with an optional Content-Length, defaulting to zero.
     Get,
     /// POST with a bounded Content-Length body.
     Post,
@@ -287,12 +287,13 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             || route.max_in_flight == 0
             || route.requests_per_minute == Some(0)
             || route.idle_timeout_seconds == 0
-            || route.stream != StreamDialect::OpenaiResponses
             || !retry_policy::valid(&route.retry_policy)
-            || route
-                .fallback_routes
-                .iter()
-                .any(|n| !pass.routes.iter().any(|r| &r.name == n))
+            || route.fallback_routes.iter().any(|n| {
+                !pass
+                    .routes
+                    .iter()
+                    .any(|r| &r.name == n && r.stream == route.stream && r.method == route.method)
+            })
             || route.new_session.as_ref().is_some_and(|c| {
                 c.session_headers.is_empty() || !header_list_valid(&c.session_headers, false)
             })
@@ -669,7 +670,8 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
     let length = headers
         .iter()
         .find(|(k, _)| k == "content-length")
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.as_slice())
+        .or_else(|| (method == "GET").then_some(b"0".as_slice()))
         .filter(|v| !v.is_empty() && v.iter().all(u8::is_ascii_digit))
         .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
         .ok_or(EgressError::InvalidRequest)?;

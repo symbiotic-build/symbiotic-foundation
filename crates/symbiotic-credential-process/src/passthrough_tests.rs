@@ -2795,3 +2795,369 @@ async fn passthrough_early_refusals_and_body_disconnect_log_one_completion() {
         assert!(fixture.incoming.try_recv().is_err());
     }
 }
+
+fn chat_config(config: &mut ProcessConfig) {
+    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+    route.stream = StreamDialect::OpenaiChatCompletions;
+    route.path = "/v1/chat/completions".into();
+}
+fn chat_reply(stream: bool, usage: bool) -> Reply {
+    let mut value = json!({"id":"synthetic-chat","model":"synthetic-model","echo":KEY,"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}]});
+    if usage {
+        value["usage"] = json!({"prompt_tokens":7,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2},"completion_tokens_details":{"reasoning_tokens":1}});
+    }
+    Reply {
+        status: 200,
+        headers: vec![(
+            "content-type".into(),
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }
+            .into(),
+        )],
+        body: if stream {
+            let mut wire = String::from(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            );
+            if usage {
+                value["choices"] = json!([]);
+                wire.push_str(&format!("data: {value}\n\n"));
+            }
+            wire.push_str("data: [DONE]\n\n");
+            wire.into_bytes()
+        } else {
+            serde_json::to_vec(&value).unwrap()
+        },
+    }
+}
+fn chat_receipts(harness: &Harness) -> Vec<(String, Option<Value>)> {
+    let connection = rusqlite::Connection::open(
+        harness
+            .process
+            .config()
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    connection
+        .prepare("SELECT state, usage FROM spend_receipts ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, Option<String>>(1)?
+                    .map(|v| serde_json::from_str(&v).unwrap()),
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn chat_completions_static_key_stream_and_json_preserve_wire_and_record_reported_usage() {
+    for stream in [false, true] {
+        for usage in [false, true] {
+            let mut fixture = Fixture::start().await;
+            let harness = Harness::start(&fixture, chat_config).await;
+            let caller = harness
+                .connect(
+                    "/v1/chat/completions",
+                    br#"{"stream_options":{"include_usage":true}}"#,
+                    "",
+                )
+                .await;
+            let upstream = fixture.next().await;
+            assert!(
+                upstream
+                    .head
+                    .contains(&format!("authorization: Bearer {KEY}\r\n"))
+            );
+            assert_eq!(
+                upstream.body,
+                br#"{"stream_options":{"include_usage":true}}"#
+            );
+            let reply = chat_reply(stream, usage);
+            let expected = String::from_utf8(reply.body.clone())
+                .unwrap()
+                .replace(KEY, "[REDACTED]")
+                .into_bytes();
+            upstream.reply.send(reply).ok().unwrap();
+            let (status, _, body) = decoded(&read(caller).await);
+            assert_eq!((status, body), (200, expected));
+            let receipts = chat_receipts(&harness);
+            if usage {
+                let mut expected =
+                    serde_json::to_value(symbiotic_trace::UsageTrace::default()).unwrap();
+                for (key, count) in [
+                    ("input_tokens", 7),
+                    ("output_tokens", 3),
+                    ("cache_hit_tokens", 2),
+                    ("cache_miss_tokens", 5),
+                    ("reasoning_tokens", 1),
+                ] {
+                    expected[key] = json!(count);
+                }
+                assert_eq!(receipts, vec![("settled".into(), Some(expected))]);
+            } else {
+                assert_eq!(receipts, vec![("unknown".into(), None)]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_completions_pre_byte_throttle_and_server_failure_retry_through_shared_cooldown() {
+    for status in [429, 503] {
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, chat_config).await;
+        let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+        let mut failure = Reply::rate(60);
+        failure.status = status;
+        fixture.next().await.reply.send(failure).ok().unwrap();
+        harness
+            .health_where(|h| h["routes"][0]["retried_events"][status.to_string()] == 1)
+            .await;
+        assert!(harness.account().cooldown_until().await.unwrap().is_some());
+        assert!(fixture.incoming.try_recv().is_err());
+        advance_clock(Duration::from_secs(61)).await;
+        let reply = chat_reply(true, true);
+        let expected = String::from_utf8(reply.body.clone())
+            .unwrap()
+            .replace(KEY, "[REDACTED]")
+            .into_bytes();
+        fixture.next().await.reply.send(reply).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).2, expected);
+        let receipts = chat_receipts(&harness);
+        assert_eq!(
+            receipts.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["unknown", "settled"]
+        );
+    }
+}
+
+// Controlled provider bytes use a channel, never a sleep or reqwest chunk assumptions.
+async fn chat_stream_fixture() -> (Fixture, mpsc::Sender<Vec<u8>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (send, incoming) = mpsc::channel(1);
+    let (progress, mut chunks) = mpsc::channel::<Vec<u8>>(1);
+    let task = tokio::spawn(async move {
+        let _send = send;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        let mut body = [0; 2];
+        stream.read_exact(&mut body).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        while let Some(bytes) = chunks.recv().await {
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    (
+        Fixture {
+            idle_timeout: None,
+            base,
+            incoming,
+            task,
+        },
+        progress,
+    )
+}
+
+#[tokio::test]
+async fn chat_completions_scrubs_credentials_split_across_provider_chunks() {
+    let (fixture, progress) = chat_stream_fixture().await;
+    let harness = Harness::start(&fixture, chat_config).await;
+    let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+    let wire = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{KEY}\"}}}}]}}\n\ndata: [DONE]\n\n"
+    );
+    for byte in wire.bytes() {
+        progress.send(vec![byte]).await.unwrap();
+    }
+    drop(progress);
+    assert_eq!(
+        decoded(&read(caller).await).2,
+        wire.replace(KEY, "[REDACTED]").as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_failure_after_first_byte_is_visible_even_with_retry_override() {
+    for provider_error in [false, true] {
+        let (fixture, progress) = chat_stream_fixture().await;
+        let hook: RetryHook = Arc::new(|_| {
+            Some(RetryRule {
+                action: RetryAction::RetrySame,
+                max_attempts: Some(3),
+                backoff: RetryBackoff {
+                    base_delay_ms: Some(1),
+                },
+            })
+        });
+        let harness = Harness::with_hook(&fixture, chat_config, Some(hook)).await;
+        let mut caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n";
+        progress.send(first.to_vec()).await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !received.ends_with(b"\n\n\r\n") {
+                received.push(caller.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        if provider_error {
+            progress
+                .send(b"data: {\"error\":{\"code\":\"slow_down\"}}\n\n".to_vec())
+                .await
+                .unwrap();
+        }
+        drop(progress);
+        received.extend(read(caller).await);
+        let (status, _, body) = decoded(&received);
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(if provider_error {
+            b"data: {\"error\":{\"code\":\"slow_down\"}}\n\n"
+        } else {
+            b"event: error\ndata: {\"type\":\"error\",\"code\":\"upstream_disconnect\"}\n\n"
+        });
+        assert_eq!((status, body), (200, expected));
+        assert_eq!(chat_receipts(&harness), vec![("unknown".into(), None)]);
+    }
+}
+
+#[tokio::test]
+async fn chat_completions_disconnect_before_first_byte_retries_original_request() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        chat_config(c);
+        c.passthrough.as_mut().unwrap().routes[0]
+            .retry_policy
+            .insert(
+                ErrorClass::Network,
+                RetryRule {
+                    action: RetryAction::RetrySame,
+                    max_attempts: Some(2),
+                    backoff: RetryBackoff {
+                        base_delay_ms: Some(1),
+                    },
+                },
+            );
+    })
+    .await;
+    let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+    drop(fixture.next().await.reply);
+    let retried = fixture.next().await;
+    assert_eq!(retried.body, b"{}");
+    let reply = chat_reply(true, false);
+    let expected = reply.body.clone();
+    retried.reply.send(reply).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).2, expected);
+}
+
+#[tokio::test]
+async fn chat_completions_get_model_listing_relays_json_with_scrubbing() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        chat_config(c);
+        let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+        route.method = PassthroughMethod::Get;
+        route.path = "/v1/models".into();
+        route.destination = "https://provider.invalid/v1/models".into();
+    })
+    .await;
+    let mut caller = UnixStream::connect(harness.path()).await.unwrap();
+    caller
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: ignored.invalid\r\n\r\n")
+        .await
+        .unwrap();
+    let upstream = fixture.next().await;
+    assert!(upstream.head.starts_with("GET /v1/models HTTP/1.1\r\n"));
+    assert_eq!(upstream.body, b"");
+    let mut reply = Reply::json();
+    reply.body = format!(
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"synthetic-model\",\"owner\":\"{KEY}\"}}]}}"
+    )
+    .into_bytes();
+    let expected = String::from_utf8(reply.body.clone())
+        .unwrap()
+        .replace(KEY, "[REDACTED]");
+    upstream.reply.send(reply).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).2, expected.as_bytes());
+    assert_eq!(chat_receipts(&harness), vec![]);
+}
+
+#[tokio::test]
+async fn chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = config(directory.path());
+    chat_config(&mut settings);
+    let process = open(settings.clone()).unwrap();
+    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let unknown = route
+        .account
+        .reserve_passthrough(&route.config.identity())
+        .unwrap();
+    route
+        .account
+        .finish_passthrough(&unknown, &symbiotic_trace::UsageTrace::default())
+        .unwrap();
+    let settled = route
+        .account
+        .reserve_passthrough(&route.config.identity())
+        .unwrap();
+    let usage = symbiotic_trace::UsageTrace {
+        input_tokens: Some(7),
+        output_tokens: Some(3),
+        cache_hit_tokens: Some(2),
+        cache_miss_tokens: Some(5),
+        reasoning_tokens: Some(1),
+        response_id: Some("synthetic-provider-text".into()),
+        served_model: Some("synthetic-model".into()),
+        ..Default::default()
+    };
+    route.account.finish_passthrough(&settled, &usage).unwrap();
+    drop(process);
+    let reopened = open(settings).unwrap();
+    let missing = reopened
+        .inner
+        .runtime
+        .spend_receipt(&unknown)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            missing.state,
+            serde_json::to_value(missing.usage).unwrap(),
+            missing.output,
+            missing.recovery
+        ),
+        (model::SpendState::Unknown, Value::Null, None, None)
+    );
+    let measured = reopened
+        .inner
+        .runtime
+        .spend_receipt(&settled)
+        .unwrap()
+        .unwrap();
+    let mut expected = usage;
+    expected.response_id = None;
+    expected.served_model = None;
+    assert_eq!(measured.state, model::SpendState::Settled);
+    assert_eq!(
+        serde_json::to_value(measured.usage).unwrap(),
+        serde_json::to_value(Some(expected)).unwrap()
+    );
+    assert_eq!((measured.output, measured.recovery), (None, None));
+}

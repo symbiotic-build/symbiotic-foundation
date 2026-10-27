@@ -111,6 +111,65 @@ pub fn credential_encodings(secret: &str) -> Result<SecretValue<Vec<String>>, cr
     Ok(encodings)
 }
 
+/// Incremental credential replacement using the same encoding set as typed responses.
+/// Retains only a possible credential prefix between calls, including network splits.
+pub struct CredentialScrubber {
+    encodings: SecretValue<Vec<String>>,
+    pending: SecretValue<Vec<u8>>,
+}
+impl CredentialScrubber {
+    /// Build one scrubber for all credentials held by a route.
+    pub fn new(secrets: &[String]) -> Result<Self, crate::ModelError> {
+        let mut encodings = SecretValue::new(Vec::new());
+        for secret in secrets.iter().filter(|s| !s.is_empty()) {
+            encodings.extend(credential_encodings(secret)?.iter().cloned());
+        }
+        encodings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        encodings.dedup();
+        Ok(Self {
+            encodings,
+            pending: SecretValue::new(Vec::new()),
+        })
+    }
+    /// Replace credential bytes, retaining incomplete matches until more input arrives.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        self.release(false)
+    }
+    /// Release the final suffix after the response completes or visibly fails.
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.release(true)
+    }
+    fn release(&mut self, finished: bool) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut position = 0;
+        while position < self.pending.len() {
+            let rest = &self.pending[position..];
+            if !finished
+                && self
+                    .encodings
+                    .iter()
+                    .any(|s| s.len() > rest.len() && s.as_bytes().starts_with(rest))
+            {
+                break;
+            }
+            if let Some(secret) = self
+                .encodings
+                .iter()
+                .find(|s| rest.starts_with(s.as_bytes()))
+            {
+                position += secret.len();
+                output.extend_from_slice(b"[REDACTED]");
+            } else {
+                output.push(rest[0]);
+                position += 1;
+            }
+        }
+        self.pending.drain(..position);
+        output
+    }
+}
+
 /// Refuse credential echoes in decoded strings, object keys and encoded numbers.
 /// Used only by the complete adapter-result boundary.
 pub(crate) fn check_response(
@@ -260,6 +319,28 @@ pub(crate) fn credential_boundary<T: CredentialResponse>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_scrubber_replaces_every_encoding_across_every_byte_split() {
+        let secret = "synthetic-key/+=";
+        for encoded in credential_encodings(secret).unwrap().iter() {
+            let wire = format!("prefix {encoded} suffix");
+            for split in 0..=wire.len() {
+                let mut scrubber = CredentialScrubber::new(&[secret.into()]).unwrap();
+                let mut actual = scrubber.feed(&wire.as_bytes()[..split]);
+                actual.extend(scrubber.feed(&wire.as_bytes()[split..]));
+                actual.extend(scrubber.finish());
+                assert_eq!(actual, b"prefix [REDACTED] suffix");
+            }
+        }
+    }
+    #[test]
+    fn credential_scrubber_holds_overlapping_prefix_and_preserves_unmatched_suffix() {
+        let mut scrubber =
+            CredentialScrubber::new(&["synthetic".into(), "synthetic-long".into()]).unwrap();
+        assert_eq!(scrubber.feed(b"safe synthetic"), b"safe ");
+        assert_eq!(scrubber.feed(b"-long synt"), b"[REDACTED] ");
+        assert_eq!(scrubber.finish(), b"synt");
+    }
     #[test]
     fn regression_keyless_credential_boundary_preserves_raw_results() {
         let boundary = CredentialBoundary::new(String::new().into());

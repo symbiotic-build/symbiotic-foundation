@@ -410,3 +410,28 @@ fn passthrough_contract_new_fields_default_and_local_headers_cannot_be_forwarded
         }
     }
 }
+
+#[test]
+fn chat_completions_and_get_model_listing_routes_validate_without_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(dir.path());
+    let routes = &mut settings.passthrough.as_mut().unwrap().routes;
+    routes[0].stream = symbiotic_credential_process::stream::StreamDialect::OpenaiChatCompletions;
+    routes[0].path = "/v1/chat/completions".into();
+    let mut models = routes[0].clone();
+    models.name = "models".into();
+    models.method = symbiotic_credential_process::PassthroughMethod::Get;
+    models.path = "/v1/models".into();
+    models.destination = "https://provider.invalid/v1/models".into();
+    routes.push(models);
+    assert_eq!(settings.validate_routes(), Ok(()));
+    settings.passthrough.as_mut().unwrap().routes[0].fallback_routes = vec!["models".into()];
+    assert!(settings.validate_routes().is_err());
+    settings.passthrough.as_mut().unwrap().routes[1].method =
+        symbiotic_credential_process::PassthroughMethod::Post;
+    assert_eq!(settings.validate_routes(), Ok(()));
+    settings.passthrough.as_mut().unwrap().routes[1].stream =
+        symbiotic_credential_process::stream::StreamDialect::OpenaiResponses;
+    assert!(settings.validate_routes().is_err());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}

@@ -979,7 +979,8 @@ impl Runtime {
 }
 
 /// Access to the runtime's existing account slot, pacing and durable cooldown.
-/// No queue item, retry scheduler, cache or spend receipt is created by this handle.
+/// Admission creates no queue item, retry scheduler, cache or spend receipt.
+/// Explicit passthrough accounting uses the runtime's existing canonical ledger.
 #[derive(Clone)]
 pub struct AccountAdmission {
     runtime: Runtime,
@@ -1028,6 +1029,52 @@ impl Runtime {
 }
 
 impl AccountAdmission {
+    /// Reserve one undecoded provider attempt in the existing canonical spend ledger.
+    /// Each send has an independent invocation; unknown attempts never block later sends.
+    pub fn reserve_passthrough(
+        &self,
+        binding: &BindingIdentity,
+    ) -> Result<SpendReceiptRef, ModelError> {
+        let reference = SpendReceiptRef::new(format!("passthrough:{}", QueueItemId::new().0))?;
+        let reservation = SpendReservation {
+            reference: reference.clone(),
+            account: self.queue_id.0.clone(),
+            invocation: reference.as_str().to_owned(),
+            binding: model::configuration_revision(binding)?.0,
+            request_limit: None,
+        };
+        if !self.runtime.inner.spend.reserve(&reservation)? {
+            return Err(ModelError::Queue(
+                symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
+            ));
+        }
+        Ok(reference)
+    }
+
+    /// Settle reported numeric usage without storing provider text or response bytes.
+    /// Missing usage leaves the reservation unknown, including after a process restart.
+    pub fn finish_passthrough(
+        &self,
+        reference: &SpendReceiptRef,
+        usage: &symbiotic_trace::UsageTrace,
+    ) -> Result<(), ModelError> {
+        let usage = symbiotic_trace::UsageTrace {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_hit_tokens: usage.cache_hit_tokens,
+            cache_miss_tokens: usage.cache_miss_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            ..Default::default()
+        };
+        if !model::has_measured_usage(&usage) {
+            return Ok(());
+        }
+        self.runtime
+            .inner
+            .spend
+            .finish(reference, SpendState::Settled, Some(usage), None, None)
+    }
+
     /// Observe cooldown writes in this runtime, including typed-provider writes.
     /// Re-read durable account state after each notification.
     pub fn subscribe_cooldowns(&self) -> tokio::sync::watch::Receiver<()> {

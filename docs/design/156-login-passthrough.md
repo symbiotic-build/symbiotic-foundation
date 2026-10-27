@@ -13,7 +13,7 @@ This record designs two additions to the credential process for
 2. a **passthrough route**, which forwards an agent tool's own streaming HTTP request
    through the account's existing queue limits without decoding it.
 
-Nothing here is implemented yet. The operator approved this record on 2026-10-25
+Login and Responses passthrough are implemented. The operator approved this record on 2026-10-25
 (§Operator decisions). It changes a security boundary and the
 [boundary contract](../architecture/boundary.md), so only the operator could approve it.
 
@@ -144,8 +144,8 @@ account (two or three streams to start).
 - **Maximum cooldown wait:** `max_queue_wait_seconds`, an optional route setting, off
   by default. When set, a request that has waited that long for cooldowns gets 429
   with the remaining cooldown. Waiting for a free slot never counts against it.
-- **Stream dialect:** which provider event format a route streams. Only OpenAI
-  Responses has an item-stream adapter in this step.
+- **Stream dialect:** which provider event format a route streams: OpenAI
+  Responses or Chat Completions.
 
 ## Walkthrough
 
@@ -420,7 +420,8 @@ rules: owner-only directory, the bind lock beside the socket, and a peer UID equ
 the process UID. A host therefore runs as the same UID as the credential process.
 Request parsing is strict: one origin-form path without query, percent, fragment or
 backslash; no duplicate headers; no `Transfer-Encoding` or `Expect`; a
-`Content-Length` within `max_request_bytes`. The caller's `Authorization`,
+`Content-Length` within `max_request_bytes` on POST. GET may omit Content-Length
+for an empty body. The caller's `Authorization`,
 cookies, `Host` and forwarding headers are never copied.
 
 **Admission.** Each passthrough route registers its account with the runtime exactly
@@ -641,8 +642,60 @@ provider fields remain opaque. Public Rust names use the naming conventions abov
 One Responses SSE adapter decodes provider events and re-encodes them. Unchanged
 events round-trip byte-for-byte. Modified events preserve every JSON field except
 explicit join edits. The credential process implements holding and joining once
-against the neutral enum. No Chat Completions,
-Anthropic Messages or Gemini adapter is built in this step.
+against the neutral enum. The Chat Completions adapter also decodes SSE and JSON
+into neutral events. It preserves original bytes for forwarding. Anthropic Messages
+and Gemini remain outside this implementation.
+
+### Chat Completions and model listings (#162)
+
+Issue [#162](https://github.com/symbiotic-build/symbiotic-foundation/issues/162)
+extends the approved passthrough with `stream: "openai_chat_completions"`.
+This task requires credential scrubbing and receipts for Chat Completions, replacing
+those deferrals for this dialect only. Responses keeps its existing behavior.
+
+A POST route accepts Chat Completions SSE or JSON. The adapter reads choices,
+provider errors, final usage and the `[DONE]` sentinel. It never reconstructs wire
+bytes from decoded JSON. A finish reason ends a choice; `[DONE]` ends the SSE response.
+Missing `[DONE]` is a visible disconnect, even after a final usage chunk.
+
+Every Chat Completions envelope passes through one incremental credential scrubber
+before forwarding. The scrubber uses the existing credential encoding set and replaces
+matches with `[REDACTED]`. An unfinished match waits for the next bytes. The same
+scrubber handles JSON model listings and non-streaming answers. Unmatched bytes,
+including unknown fields and SSE metadata, remain unchanged.
+
+The shared retry engine handles throttle, network and server failures before the
+first downstream byte. Once any bytes reach the caller, retries and route switching
+are refused, including overrides from named policies or hooks. Chat Completions has
+no replayable item identity. Fallback routes must use the same method and dialect. Provider error envelopes stay visible after scrubbing;
+a disconnect produces the existing static `upstream_disconnect` event. Responses
+alone continues and joins complete items.
+
+A Chat Completions POST reserves one attempt in the runtime's existing spend ledger
+immediately before each send. A successful terminal response settles only reported
+numeric usage. The final SSE `usage` object maps `prompt_tokens`, `completion_tokens`,
+`prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`
+to the existing usage fields. Non-streaming JSON uses the same mapping. Missing usage,
+provider errors, disconnects and cancellation retain `Unknown`. Provider text and answer
+bytes are never stored. Each send has an independent generated invocation, so an unknown
+attempt does not prevent the next send. Settlement precedes the final HTTP chunk;
+a ledger failure leaves the response visibly incomplete. No new table, index or queue
+is added.
+
+Configure a model listing with the existing `method: "get"`, exact `path` and
+`destination`, and the account's existing `stream` value. No new configuration key
+is needed. GET accepts a missing Content-Length as zero and relays JSON only. Listings
+reuse admission, retry, cooldown, header filtering and scrubbing. They create no spend
+receipt. POST continues to require Content-Length.
+
+Verification: `chat_completions_and_get_model_listing_routes_validate_without_io`,
+`chat_completions_static_key_stream_and_json_preserve_wire_and_record_reported_usage`,
+`chat_completions_pre_byte_throttle_and_server_failure_retry_through_shared_cooldown`,
+`chat_completions_scrubs_credentials_split_across_provider_chunks`,
+`chat_completions_failure_after_first_byte_is_visible_even_with_retry_override`,
+`chat_completions_disconnect_before_first_byte_retries_original_request` and
+`chat_completions_get_model_listing_relays_json_with_scrubbing` and
+`chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after_restart`.
 
 ### Continue and join
 
@@ -698,7 +751,8 @@ without parsing the stream. A stream without a usage event gets no trailer. The
 process keeps no per-caller totals and enforces no per-caller ceiling.
 
 **Deferred (operator decision, 2026-10-26).** The first implementation ships without
-both the spend receipts and the usage trailer above. Nothing consumes them yet: a login
+Responses spend receipts and the usage trailer above. Chat Completions receipts ship
+under #162 as described above. Nothing consumes Responses receipts yet: a login
 account has no per-request price, and no host enforces per-request usage yet.
 [#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
 
