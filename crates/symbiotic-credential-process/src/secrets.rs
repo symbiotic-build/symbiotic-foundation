@@ -45,6 +45,8 @@ pub enum LoginFamily {
     ChatgptCodex,
     /// First-party xAI subscription used by Grok.
     XaiGrok,
+    /// Kimi Code subscription used by the Kimi CLI.
+    KimiCode,
 }
 
 /// Configured backend; references carry locations or callbacks, never secret values.

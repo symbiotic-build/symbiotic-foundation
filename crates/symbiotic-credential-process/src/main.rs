@@ -71,6 +71,7 @@ fn import_login(
                     match args.next().as_deref().and_then(|value| value.to_str()) {
                         Some("chatgpt_codex") => LoginFamily::ChatgptCodex,
                         Some("xai_grok") => LoginFamily::XaiGrok,
+                        Some("kimi_code") => LoginFamily::KimiCode,
                         _ => return Err(InvalidRequest),
                     },
                 );
