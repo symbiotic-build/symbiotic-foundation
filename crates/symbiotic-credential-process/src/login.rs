@@ -943,7 +943,10 @@ mod tests {
                     let is_discovery = head.starts_with("GET ");
                     let value = if body.is_empty() {
                         Value::Null
-                    } else if head.contains("application/json") {
+                    } else if head
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/json")
+                    {
                         serde_json::from_slice(&body).unwrap()
                     } else {
                         json!(String::from_utf8(body).unwrap())
