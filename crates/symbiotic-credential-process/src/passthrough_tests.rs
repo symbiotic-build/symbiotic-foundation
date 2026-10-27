@@ -2496,3 +2496,62 @@ async fn passthrough_local_refusals_log_one_completion_with_returned_code_and_st
         assert!(fixture.incoming.try_recv().is_err());
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = symbiotic_core::logging::subscriber("warn", move || writer.clone()).unwrap();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "x-symbiotic-request-id: synthetic-request\r\n",
+        )
+        .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::rate(0))
+        .ok()
+        .unwrap();
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let lines = capture.lines();
+    let failure = lines
+        .iter()
+        .find(|line| line["message"] == "upstream failure")
+        .expect("upstream failure is a warning");
+    assert_eq!(failure["spans"][0]["request_id"], "synthetic-request");
+    assert!(lines.iter().all(|line| line["level"] != "INFO"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_unmatched_route_logs_one_refusal_with_code() {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = symbiotic_core::logging::subscriber(
+        "off,symbiotic_credential_process::passthrough=info",
+        move || writer.clone(),
+    )
+    .unwrap();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness.connect("/v1/unknown", b"{}", "").await;
+    assert_eq!(decoded(&read(caller).await).0, 404);
+    let lines = capture.lines();
+    let refused: Vec<_> = lines
+        .iter()
+        .filter(|line| line["message"] == "request refused")
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines:?}");
+    assert_eq!(
+        (refused[0]["status"].as_u64(), refused[0]["code"].as_str()),
+        (Some(404), Some("route_not_found"))
+    );
+}

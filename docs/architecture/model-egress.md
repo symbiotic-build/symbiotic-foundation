@@ -1153,8 +1153,13 @@ debug events; other waits are info events. `request sent` reports the accumulate
 queue wait at info level.
 Completion reports the caller's HTTP status, attempt count, total queue wait,
 elapsed time and `complete` or an error code. If no HTTP status was sent,
-completion omits `status`. A disconnected caller has outcome `cancelled`.
-The request span uses the validated `x-symbiotic-request-id` header.
+completion omits `status`. A disconnected caller has outcome `cancelled`; its
+completion still counts a send already started and the wait in progress.
+A request refused before forwarding (malformed head, unknown route, oversized
+body) logs one `request refused` event with `status` and `code` instead; it has
+no request span.
+The request span uses the validated `x-symbiotic-request-id` header. The span is
+ERROR level, so a `warn` filter still keeps the request ID on warnings.
 Absent or invalid IDs use `local-` plus a generated UUID v4 in logs only.
 Health waiting entries still require a valid caller-supplied ID.
 Credentials, bodies and other header values are excluded from these events.
@@ -1171,17 +1176,18 @@ Environment="SYMBIOTIC_LOG=info,symbiotic_credential_process::passthrough::forwa
 ```
 
 Restart the instance to apply the override.
-Find one request across all instances by its exact span field
-(`-g` matches a regular expression against each line; build-i9 has no `jq`):
+Find one request across all instances by its exact span field. `-g` matches a
+PCRE2 regular expression against each line, so `\Q...\E` makes the ID literal
+(an ID with `.` would otherwise match other IDs). build-i9 has no `jq`.
 
 ```sh
-journalctl -u 'warden-model@*' --since '1 hour ago' -o cat -g '"request_id":"ID"'
+journalctl -u 'warden-model@*' --since '1 hour ago' -o cat -g '"request_id":"\QID\E"'
 ```
 
 Find every request whose ID starts with a prefix, such as one Warden job:
 
 ```sh
-journalctl -u 'warden-model@*' --since today -o cat -g '"request_id":"JOB-'
+journalctl -u 'warden-model@*' --since today -o cat -g '"request_id":"\QPREFIX\E'
 ```
 
 Show only upstream failures of one instance:

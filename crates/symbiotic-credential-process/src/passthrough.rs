@@ -832,6 +832,8 @@ async fn refuse(
     status: u16,
     code: &str,
 ) -> Result<()> {
+    // Refused before forwarding, so no request ID or completion event exists yet.
+    tracing::info!(status, code, "request refused");
     fixed(&mut socket, status, code, &[]).await?;
     let _ = socket.shutdown().await;
     let unread = u64::from(process.config().max_frame_bytes);

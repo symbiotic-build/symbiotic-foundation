@@ -69,6 +69,8 @@ struct RequestLog {
     outcome: String,
     status: Option<u16>,
     attempts: u32,
+    // Start of the wait in progress, so cancellation still counts it.
+    waiting_since: Option<Instant>,
 }
 impl RequestLog {
     fn new(route: &Route, started_at: Instant) -> Self {
@@ -81,9 +83,17 @@ impl RequestLog {
             outcome: "cancelled".into(),
             status: None,
             attempts: 0,
+            waiting_since: None,
         }
     }
-    fn waited(&mut self, route: &Route, reason: &'static str, elapsed: Duration) {
+    fn wait_started(&mut self) {
+        self.waiting_since = Some(Instant::now());
+    }
+    fn waited(&mut self, route: &Route, reason: &'static str) {
+        let elapsed = self
+            .waiting_since
+            .take()
+            .map_or(Duration::ZERO, |since| since.elapsed());
         self.total += elapsed;
         if reason != "slot" {
             self.cooldown += elapsed;
@@ -105,7 +115,11 @@ impl Drop for RequestLog {
                 outcome = self.outcome,
                 status = self.status,
                 attempts = self.attempts,
-                queue_waited_ms = self.total.as_millis() as u64,
+                queue_waited_ms = (self.total
+                    + self
+                        .waiting_since
+                        .map_or(Duration::ZERO, |since| since.elapsed()))
+                .as_millis() as u64,
                 elapsed_ms = self.started_at.elapsed().as_millis() as u64,
                 "request completed"
             )
@@ -122,10 +136,9 @@ impl Passthrough {
         wait: &mut RequestLog,
     ) -> Result<()> {
         let _entry = self.waiting(route, id, reason)?;
-        let start = Instant::now();
+        wait.wait_started();
         tokio::time::sleep(duration).await;
-        let elapsed = start.elapsed();
-        wait.waited(route, reason, elapsed);
+        wait.waited(route, reason);
         Ok(())
     }
     async fn session_permit(
@@ -176,13 +189,12 @@ impl Passthrough {
                 return Ok(Ok(None));
             }
             let _entry = self.waiting(route, id, "new_session")?;
-            let started = Instant::now();
+            wait.wait_started();
             let permit = tokio::select! {
                 p=route.retries.sessions.probe.clone().acquire_owned()=>Some(p.map_err(|_|EgressError::StateUnavailable)?),
                 r=changes.changed()=>{r.map_err(|_|EgressError::StateUnavailable)?;None},
             };
-            let elapsed = started.elapsed();
-            wait.waited(route, "new_session", elapsed);
+            wait.waited(route, "new_session");
             route.usable().await?;
             if let Some(permit) = permit {
                 let s = route
@@ -411,7 +423,8 @@ impl Passthrough {
         let log_id = id
             .map(str::to_owned)
             .unwrap_or_else(|| format!("local-{}", uuid::Uuid::new_v4()));
-        let span = tracing::info_span!("model_request", request_id = %log_id);
+        // ERROR level keeps the span, and so the request ID, under a warn-only filter.
+        let span = tracing::error_span!("model_request", request_id = %log_id);
         async {
             let mut wait = RequestLog::new(initial, started_at);
             if invalid_id {
@@ -454,11 +467,7 @@ impl Passthrough {
             wait.status = Some(400);
             return fixed(write, 400, "retry_policy_unknown", &[]).await;
         }
-        tracing::info!(
-            route = initial.config.name,
-            retry_policy = policy_name.and_then(|n| n.ok()).unwrap_or("none"),
-            "request admitted"
-        );
+        tracing::info!(route = initial.config.name, "request admitted");
         let mut route = initial;
         let mut fallback = initial.config.fallback_routes.iter();
         let mut started = false;
@@ -505,7 +514,7 @@ impl Passthrough {
             };
             if slot.is_none() {
                 let _entry = self.waiting(route, id, "slot")?;
-                let now = Instant::now();
+                wait.wait_started();
                 slot = Some(
                     route
                         .account
@@ -513,8 +522,7 @@ impl Passthrough {
                         .await
                         .map_err(|_| EgressError::StateUnavailable)?,
                 );
-                let elapsed = now.elapsed();
-                wait.waited(route, "slot", elapsed);
+                wait.waited(route, "slot");
             }
             let cooldown = match self.cooldown(route, id, wait).await {
                 Ok(c) => c,
@@ -657,7 +665,9 @@ impl Passthrough {
                             Ok(None)
                         } else {
                             was_new = new;
-                            // Logged inside the check, so it precedes the transport send.
+                            // Counted and logged inside the check, which runs just before the
+                            // transport starts, so a cancelled send still counts.
+                            wait.attempts = next_attempt;
                             tracing::info!(
                                 route = route.config.name,
                                 attempt = next_attempt,
@@ -676,7 +686,6 @@ impl Passthrough {
                 slot = None;
                 continue;
             };
-            wait.attempts = next_attempt;
             let attempt = next_attempt;
             tracing::info!(
                 route = route.config.name,

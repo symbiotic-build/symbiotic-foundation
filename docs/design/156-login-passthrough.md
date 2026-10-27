@@ -408,6 +408,9 @@ Public types are UpperCamelCase nouns: `PassthroughConfig`, `PassthroughRoute` a
 `LoginFamily`. Error and diagnostic reasons are lower snake case, subject first:
 `credential_unavailable`, `route_not_found`, `rate_limited` and `upstream_status`.
 Command options are lower kebab case: `--family`, `--native`, `--store` and `--replace`.
+Log event messages are lower case words, subject first: `request completed`,
+`upstream failure`. Log fields and outcome values are lower snake case, as
+reasons are: `queue_waited_ms`, `rate_limited`.
 External protocol names, including header names and provider fields, keep their
 external spelling.
 
