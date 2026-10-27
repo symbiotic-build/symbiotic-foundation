@@ -12,7 +12,7 @@ impl AttemptLog<'_> {
     fn warn(
         &self,
         code: &str,
-        class: Option<ErrorClass>,
+        class: ErrorClass,
         bytes_reached_caller: bool,
         action: &str,
         delay_ms: Option<u128>,
@@ -297,7 +297,7 @@ impl Passthrough {
         // One journal line per retry decision, before the hold or cooldown is recorded.
         log.warn(
             &failure.code,
-            Some(class),
+            class,
             started,
             match rule.action {
                 RetryAction::RetrySame => "retry_same",
@@ -629,7 +629,7 @@ impl Passthrough {
                                 return Ok(());
                             }
                             AnswerOutcome::Terminated(code) => {
-                                log.warn(code, None, started, "fail", None);
+                                log.warn(code, ErrorClass::Final, started, "fail", None);
                                 return self
                                     .local_error(write, started, 502, code, &wait, None)
                                     .await;
@@ -638,7 +638,7 @@ impl Passthrough {
                         }
                     } else {
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
-                            log.warn("upstream_status", None, started, "fail", None);
+                            log.warn("upstream_status", ErrorClass::Final, started, "fail", None);
                             return self
                                 .local_error(write, false, 401, "upstream_status", &wait, None)
                                 .await;
@@ -649,12 +649,24 @@ impl Passthrough {
                         {
                             let renewed = login_request.retried();
                             if login.after_unauthorized(login_request).await.is_ok() {
-                                log.warn("upstream_status", None, started, "renew", None);
+                                log.warn(
+                                    "upstream_status",
+                                    ErrorClass::Final,
+                                    started,
+                                    "renew",
+                                    None,
+                                );
                                 *injected = login_request.headers().clone();
                                 continue;
                             }
                             if !renewed {
-                                log.warn("credential_unavailable", None, started, "fail", None);
+                                log.warn(
+                                    "credential_unavailable",
+                                    ErrorClass::Final,
+                                    started,
+                                    "fail",
+                                    None,
+                                );
                                 return self
                                     .local_error(
                                         write,
@@ -680,7 +692,13 @@ impl Passthrough {
                                 }
                             }
                             Err(EgressError::LimitExceeded) => {
-                                log.warn("response_too_large", None, started, "fail", None);
+                                log.warn(
+                                    "response_too_large",
+                                    ErrorClass::Final,
+                                    started,
+                                    "fail",
+                                    None,
+                                );
                                 return self
                                     .local_error(
                                         write,
