@@ -6133,50 +6133,12 @@ mod tests {
         );
         let request = chat_request("same request");
         let request_hash = hash_json(&request).unwrap();
-        let queue_id = QueueId::new("chat:deepseek:deepseek-v4-pro");
-        let descriptor = ProviderDescriptor {
-            identity: ModelIdentity::new("chat", "deepseek", "deepseek-v4-pro"),
-            provider_class: ProviderClass::Cloud,
-            capabilities: vec![ModelCapability::Chat],
-            auth_mode: ProviderAuthMode::None,
-            metadata: serde_json::json!({}),
-        };
-        let preexisting = queue
-            .enqueue(EnqueueRequest {
-                queue_id: queue_id.clone(),
-                kind: "chat".to_string(),
-                payload: model_queue_payload(
-                    &ModelCapability::Chat,
-                    &request_hash,
-                    &descriptor,
-                    Some(LogicalRetryState {
-                        attempts_used: 0,
-                        max_attempts: 2,
-                    }),
-                ),
-                idempotency_key: Some(format!("{}:{request_hash}", queue_id.0)),
-                run_after: None,
-                max_attempts: Some(2),
-                force: false,
-            })
-            .await
-            .unwrap();
-        let claimed = queue
-            .claim_item(&preexisting.item.item_id, "preexisting-worker", 60, Some(1))
-            .await
-            .unwrap()
-            .unwrap();
-        queue
-            .complete(&claimed.item_id, "preexisting-worker")
-            .await
-            .unwrap();
-
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = QueuedChatProvider::new(
             SlowCountingChat::new(active, max_seen, calls.clone()),
-            queue,
+            queue.clone(),
             "worker",
             ModelQueueConfig {
                 max_in_flight: 1,
@@ -6193,17 +6155,29 @@ mod tests {
         )
         .with_spend_ledger(test_spend::ledger(), None);
 
-        let response = provider.chat(request).await.unwrap();
-
-        assert_eq!(response.text, "same request");
+        let first = provider.chat(request.clone()).await.unwrap();
+        assert_eq!(first.text, "same request");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let first_id = first.trace.queue_item_id.unwrap();
+        assert_eq!(
+            queue.get_item(&first_id).await.unwrap().unwrap().status,
+            QueueStatus::Succeeded
+        );
         let scope = std::fs::read_dir(dir.path().join("cache/chat"))
             .unwrap()
             .next()
             .unwrap()
             .unwrap()
             .path();
-        assert!(scope.join(format!("{request_hash}.json")).is_file());
+        let cached = scope.join(format!("{request_hash}.json"));
+        assert!(cached.is_file());
+        std::fs::remove_file(&cached).unwrap();
+
+        let response = provider.chat(request).await.unwrap();
+        assert_eq!(response.text, "same request");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_ne!(response.trace.queue_item_id, Some(first_id));
+        assert!(cached.is_file());
     }
 
     #[cfg(feature = "queue")]

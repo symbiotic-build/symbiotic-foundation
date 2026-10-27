@@ -1,7 +1,7 @@
 //! Real Unix sockets and loopback providers. Only URL/TLS mapping is test injected.
 use super::*;
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::Ordering};
 use tokio::sync::{mpsc, oneshot};
 
 #[path = "../../test-support/clock.rs"]
@@ -734,15 +734,28 @@ async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
 #[tokio::test]
 async fn cooldown_is_durable_across_runtime_restart() {
     let mut fixture = Fixture::start().await;
-    let mut harness = Harness::start(&fixture, |_| {}).await;
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(
+        (Utc::now() + chrono::Duration::days(1)).timestamp_millis(),
+    ));
+    let clock: symbiotic_queue::jobs::JobClock = {
+        let now = now.clone();
+        Arc::new(move || DateTime::from_timestamp_millis(now.load(Ordering::SeqCst)).unwrap())
+    };
+    let mut harness = Harness::with_clock(
+        &fixture,
+        |config| config.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0),
+        None,
+        Some(clock.clone()),
+    )
+    .await;
     let config = harness.process.config().clone();
-    let until = Utc::now() + chrono::Duration::seconds(1);
+    let until = clock() + chrono::Duration::seconds(1);
     harness.account().note_cooldown(until).await.unwrap();
     harness.task.abort();
     let _ = (&mut harness.task).await;
     let retained = std::mem::replace(&mut harness._dir, tempfile::tempdir().unwrap());
     drop(harness);
-    let mut process = open(config).unwrap();
+    let mut process = open_with_clock(config, clock).unwrap();
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
@@ -782,14 +795,18 @@ async fn cooldown_is_durable_across_runtime_restart() {
             .timestamp(),
         until.timestamp()
     );
-    let call = restarted.call().await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), fixture.incoming.recv())
-            .await
-            .is_err()
-    );
-    advance_clock(Duration::from_secs(1)).await;
-    let upstream = fixture.next().await;
+    let refused = restarted.call().await;
+    let (status, headers, body) = decoded(&refused.await.unwrap());
+    assert_eq!(status, 429);
+    assert!(headers.contains("retry-after: 1\r\n"), "{headers}");
+    assert_eq!(body, br#"{"error":{"code":"rate_limited"}}"#);
+    assert!(fixture.incoming.try_recv().is_err());
+    now.fetch_add(1_000, Ordering::SeqCst);
+    let mut call = restarted.call().await;
+    let upstream = tokio::select! {
+        upstream = fixture.next() => upstream,
+        response = &mut call => panic!("expired durable cooldown refused dispatch: {:?}", decoded(&response.unwrap())),
+    };
     assert!(
         restarted.process.inner.passthrough.as_ref().unwrap().now() >= until,
         "restarted process dispatched inside its durable cooldown"
@@ -1798,13 +1815,25 @@ async fn provider_rate_headers_on_success_reach_health_and_caller_without_promot
 #[tokio::test]
 async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sessions() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        let route = &mut c.passthrough.as_mut().unwrap().routes[0];
-        route.max_in_flight = 8;
-        route.new_session = Some(NewSessionConfig {
-            session_headers: vec!["session-id".into(), "thread-id".into()],
-        });
-    })
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(
+        (Utc::now() + chrono::Duration::days(1)).timestamp_millis(),
+    ));
+    let clock: symbiotic_queue::jobs::JobClock = {
+        let now = now.clone();
+        Arc::new(move || DateTime::from_timestamp_millis(now.load(Ordering::SeqCst)).unwrap())
+    };
+    let harness = Harness::with_clock(
+        &fixture,
+        |c| {
+            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            route.max_in_flight = 8;
+            route.new_session = Some(NewSessionConfig {
+                session_headers: vec!["session-id".into(), "thread-id".into()],
+            });
+        },
+        None,
+        Some(clock.clone()),
+    )
     .await;
     let seen = harness
         .connect("/v1/responses", b"{}", "session-id: seen\r\n")
@@ -1851,6 +1880,10 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
         .health_where(|h| !h["routes"][0]["new_session_hold_until"].is_null())
         .await;
     assert!(h["routes"][0]["cooldown_until"].is_null());
+    assert_eq!(
+        h["routes"][0]["new_session_hold_until"],
+        json!((clock() + chrono::Duration::seconds(1)).timestamp())
+    );
     let second = harness
         .connect(
             "/v1/responses",
@@ -1865,6 +1898,7 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
     assert!(fast.head.contains("session-id: seen\r\n"));
     fast.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&read(seen).await).0, 200);
+    now.fetch_add(1_000, Ordering::SeqCst);
     advance_clock(Duration::from_secs(1)).await;
     let probe = fixture.next().await;
     assert!(
@@ -1881,6 +1915,7 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
             .await
             .is_err()
     );
+    now.fetch_add(1_000, Ordering::SeqCst);
     advance_clock(Duration::from_secs(1)).await;
     let probe = fixture.next().await;
     assert!(

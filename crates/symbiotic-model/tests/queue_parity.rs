@@ -1431,14 +1431,27 @@ async fn an_abandoned_call_keeps_its_model_slot_until_it_finishes(
     queue: Arc<CountsRenewals>,
 ) {
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
-    let provider =
-        queued(raw.clone(), queue.clone(), leased()).with_admission(ModelAdmission::new());
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased())
+        .with_admission(ModelAdmission::new())
+        .with_receipt_sink(receipts.clone());
 
     abandon(&provider, "first", Duration::from_millis(300)).await;
-    tokio::time::timeout(Duration::from_secs(5), provider.chat(request("second")))
+    let answer = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("second")))
         .await
         .unwrap_or_else(|_| panic!("{backend}: the next call gets the model's slot"))
         .unwrap();
+    assert_eq!(answer.text, "second", "{backend}");
+    let first = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.status,
+        QueueStatus::Succeeded,
+        "{backend}: the abandoned call finishes before releasing its slot"
+    );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2, "{backend}");
     assert_eq!(
         raw.peak.load(Ordering::SeqCst),
@@ -1472,22 +1485,34 @@ async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
     backend: &str,
     queue: Arc<CountsRenewals>,
 ) {
+    let receipts = Arc::new(InMemoryReceiptSink::default());
     let provider = QueuedChatProvider::new(
         PanicsMidCall {
             descriptor: Loopback::new(unique_identity()).descriptor,
-            delay: Duration::from_millis(1_600),
+            delay: Duration::from_millis(4_200),
         },
         queue.clone(),
         "worker",
         leased(),
     )
-    .with_spend_ledger(test_spend::ledger(), None);
+    .with_spend_ledger(test_spend::ledger(), None)
+    .with_receipt_sink(receipts.clone());
     let call = tokio::spawn(async move { provider.chat(request("boom")).await });
     let err = call.await.expect_err("the call panics");
     assert!(err.is_panic(), "{backend}: {err:?}");
+    let item = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        item.status,
+        QueueStatus::Running,
+        "{backend}: panic leaves the claim for recovery"
+    );
     assert!(
-        queue.renewals() >= 1,
-        "{backend}: the lease is renewed while the provider works"
+        item.lease_until.unwrap() > queue.now(),
+        "{backend}: renewal kept the claim alive beyond its original three-second lease"
     );
     assert_no_more_renewals(&queue, backend).await;
 }
@@ -3006,7 +3031,8 @@ async fn a_reservation_storage_failure_preserves_the_last_provider_attempt(
     let raw = Loopback::new(unique_identity());
     let spend = ObservedSpend::new(Duration::ZERO);
     spend.fail_reservations.store(true, Ordering::SeqCst);
-    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
+    let provider =
+        queued_with_cache(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
     for _ in 0..2 {
         let err = provider
             .chat(request("storage recovers"))
@@ -3040,7 +3066,7 @@ async fn a_crash_before_reservation_preserves_the_last_provider_attempt(
     let raw = Loopback::new(unique_identity());
     let spend = ObservedSpend::new(Duration::ZERO);
     spend.panic_reservation.store(true, Ordering::SeqCst);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
@@ -3084,7 +3110,7 @@ async fn a_heartbeat_failure_before_transport_preserves_the_last_provider_attemp
         queue.fail_heartbeat_at.store(heartbeat, Ordering::SeqCst);
         let raw = Loopback::new(unique_identity());
         let spend = ObservedSpend::new(Duration::ZERO);
-        let provider = queued(
+        let provider = queued_with_cache(
             raw.clone(),
             queue,
             ModelQueueConfig {
@@ -3116,7 +3142,7 @@ async fn reconciliation_reopens_an_unknown_attempt_within_its_budget(
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
@@ -3182,7 +3208,7 @@ async fn restored_account_allowance_reconsiders_refusals_without_spending_attemp
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue,
         ModelQueueConfig {
@@ -3389,7 +3415,7 @@ async fn reconciliation_permits_an_explicit_budget_renewal(
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue,
         ModelQueueConfig {
@@ -3449,7 +3475,8 @@ async fn a_reclaimed_unknown_attempt_does_not_spend_a_second_attempt_on_refusal(
         "crashed-worker",
         policy.clone(),
     )
-    .with_spend_ledger(spend.clone(), None);
+    .with_spend_ledger(spend.clone(), None)
+    .with_response_cache(Arc::new(TextKeyedCache::default()));
     let crashed =
         tokio::spawn(async move { crashing.chat(request("lost accepted attempt")).await });
     assert!(crashed.await.unwrap_err().is_panic(), "{backend}");
@@ -3462,7 +3489,8 @@ async fn a_reclaimed_unknown_attempt_does_not_spend_a_second_attempt_on_refusal(
         1,
         "{backend}: old attempt reclaimed"
     );
-    let provider = queued(raw.clone(), queue, policy).with_spend_ledger(spend.clone(), None);
+    let provider =
+        queued_with_cache(raw.clone(), queue, policy).with_spend_ledger(spend.clone(), None);
     let err = provider
         .chat(request("lost accepted attempt"))
         .await
