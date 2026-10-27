@@ -1320,6 +1320,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn enqueue_finds_the_newest_item_when_its_timestamp_is_older() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        // Acceptance order must win when the host clock moves backwards.
+        let time = Arc::new(AtomicI64::new(Utc::now().timestamp_millis()));
+        let observed = time.clone();
+        let queue = SqliteQueue::in_memory()
+            .unwrap()
+            .with_clock(Arc::new(move || {
+                DateTime::from_timestamp_millis(observed.load(Ordering::SeqCst)).unwrap()
+            }));
+        let first = queue.enqueue(request("same")).await.unwrap().item;
+        queue
+            .claim_item(&first.item_id, "w1", 60, None)
+            .await
+            .unwrap()
+            .unwrap();
+        queue.complete(&first.item_id, "w1").await.unwrap();
+        time.fetch_sub(60_000, Ordering::SeqCst);
+        let mut forced = request("same");
+        forced.force = true;
+        let replacement = queue.enqueue(forced.clone()).await.unwrap().item;
+        assert!(replacement.created_at < first.created_at);
+
+        for request in [request("same"), forced] {
+            let outcome = queue.enqueue(request).await.unwrap();
+            assert_eq!(outcome.disposition, EnqueueDisposition::ActiveDuplicate);
+            assert_eq!(outcome.item.item_id, replacement.item_id);
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn overlapping_heartbeats_renew_in_write_transaction_order() {
         use std::time::Duration;

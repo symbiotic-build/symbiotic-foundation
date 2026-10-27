@@ -1485,7 +1485,7 @@ async fn runner_repeated_monitoring_errors_are_bounded_and_completion_is_separat
                 let monitoring = matches!(request, JobRequest::Heartbeat { .. })
                     && started.load(Ordering::SeqCst);
                 let completing = matches!(request, JobRequest::Complete { .. });
-                let failure = monitoring.then(|| {
+                let failure = (monitoring && failures.load(Ordering::SeqCst) < 8).then(|| {
                     let count = failures.fetch_add(1, Ordering::SeqCst) + 1;
                     if count == 8 {
                         finish.add_permits(1);
