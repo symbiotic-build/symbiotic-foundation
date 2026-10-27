@@ -190,6 +190,9 @@ pub struct RouteConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
+    /// EnvFilter directives; `SYMBIOTIC_LOG` overrides this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
     /// Must equal protocol version 4.
     pub version: u16,
     /// Owner-only runtime directory (queue plus permit replay metadata).
@@ -1231,6 +1234,7 @@ mod tests {
         }))
         .unwrap();
         let config = ProcessConfig {
+            log: None,
             version: PROTOCOL_VERSION,
             state_dir: state_dir.clone(),
             socket_path: dir.path().join("egress.sock"),

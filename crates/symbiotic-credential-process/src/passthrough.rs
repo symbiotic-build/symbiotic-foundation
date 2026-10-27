@@ -11,6 +11,7 @@ use crate::{
     stream::{ItemJoin, StreamDialect},
 };
 use chrono::{DateTime, Utc};
+use forward::RequestLog;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,12 +25,14 @@ use symbiotic_ai_runtime::{
     AccountAdmission, BindingIdentity, ModelQueueConfig, Runtime,
     model::{SecretValue, retry},
 };
+use symbiotic_core::logging::REQUEST_ID_HEADER;
 use symbiotic_egress::EgressError;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::{Notify, Semaphore},
 };
+use tracing::Instrument;
 
 #[path = "passthrough_retry.rs"]
 mod retry_policy;
@@ -190,7 +193,7 @@ fn forbidden_header(name: &str) -> bool {
             | "chatgpt-account-id"
             | "x-xai-token-auth"
             | "x-symbiotic-retry-policy"
-            | "x-symbiotic-request-id"
+            | symbiotic_core::logging::REQUEST_ID_HEADER
             | "x-symbiotic-queue-waited-ms"
     ) || name.starts_with("x-forwarded-")
 }
@@ -586,7 +589,8 @@ async fn serve_until(
                 let process = process.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = connection(&process, socket).await { tracing::warn!(code = %error, "passthrough connection ended"); }
+                    // The handler logs failures inside the request span.
+                    let _ = connection(&process, socket).await;
                 });
             }
         }
@@ -676,7 +680,24 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
         length,
     })
 }
-async fn connection(process: &CredentialProcess, mut socket: UnixStream) -> Result<()> {
+async fn connection(process: &CredentialProcess, socket: UnixStream) -> Result<()> {
+    let wait = RequestLog::new();
+    let span = wait.span.clone();
+    async {
+        let result = connection_request(process, socket, wait).await;
+        if let Err(error) = &result {
+            tracing::warn!(code = %error, "passthrough connection ended");
+        }
+        result
+    }
+    .instrument(span)
+    .await
+}
+async fn connection_request(
+    process: &CredentialProcess,
+    mut socket: UnixStream,
+    mut wait: RequestLog,
+) -> Result<()> {
     let timeout = Duration::from_secs(process.config().io_timeout_seconds);
     let request = match tokio::time::timeout(
         timeout,
@@ -685,22 +706,52 @@ async fn connection(process: &CredentialProcess, mut socket: UnixStream) -> Resu
     .await
     {
         Ok(Ok(request)) => request,
-        _ => return refuse(process, socket, 400, "invalid_request").await,
+        Ok(Err(EgressError::Transport)) => return Err(EgressError::Transport),
+        _ => return refuse(process, socket, 400, "invalid_request", wait).await,
     };
     let pass = process
         .inner
         .passthrough
         .as_ref()
         .ok_or(EgressError::InvalidRequest)?;
-    let Some(route) = pass.routes.iter().find(|route| {
+    let route = pass.routes.iter().find(|route| {
         path_valid(&request.path)
             && route.config.path == request.path
             && route.config.method.text() == request.method
-    }) else {
-        return refuse(process, socket, 404, "route_not_found").await;
+    });
+    let request_id = request
+        .headers
+        .iter()
+        .find(|(name, _)| name == REQUEST_ID_HEADER)
+        .map(|(_, value)| value);
+    let mut invalid_id = request_id.is_some_and(|value| !printable(value, 64));
+    if let Some(value) = request_id {
+        if let Some(route) = route {
+            let secrets = route.secrets().await;
+            invalid_id = !safe_value(value, &secrets, 64);
+        } else {
+            // An unmatched request still must not log a configured credential as its ID.
+            for route in &pass.routes {
+                let secrets = route.secrets().await;
+                invalid_id |= !safe_value(value, &secrets, 64);
+            }
+        }
+    }
+    let id = request_id
+        .filter(|_| !invalid_id)
+        .and_then(|value| std::str::from_utf8(value).ok());
+    if let Some(id) = id {
+        wait.span.record("request_id", id);
+    }
+    let Some(route) = route else {
+        return refuse(process, socket, 404, "route_not_found", wait).await;
     };
+    wait.route = Some(route.config.name.clone());
     if request.length > route.config.max_request_bytes {
-        return refuse(process, socket, 413, "request_too_large").await;
+        return refuse(process, socket, 413, "request_too_large", wait).await;
+    }
+    if invalid_id {
+        return refuse(process, socket, 400, "request_id_invalid", wait).await;
     }
     let mut body = vec![0; request.length];
     tokio::time::timeout(timeout, socket.read_exact(&mut body))
@@ -713,11 +764,16 @@ async fn connection(process: &CredentialProcess, mut socket: UnixStream) -> Resu
         let mut byte = [0];
         let _ = read.read(&mut byte).await;
     };
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         () = cancelled => Ok(()),
-        result = pass.forward(route, request, body, &mut write) => result,
+        result = pass.forward(route, &request, body, &mut write, id, &mut wait) => result,
+    };
+    if let Err(error) = &result {
+        // These errors carry only static diagnostics, never provider data.
+        wait.outcome = error.to_string();
     }
+    result
 }
 
 fn http_error(error: reqwest::Error) -> EgressError {
@@ -829,8 +885,12 @@ async fn refuse(
     mut socket: UnixStream,
     status: u16,
     code: &str,
+    mut wait: RequestLog,
 ) -> Result<()> {
+    wait.outcome = code.into();
     fixed(&mut socket, status, code, &[]).await?;
+    wait.status = Some(status);
+    drop(wait);
     let _ = socket.shutdown().await;
     let unread = u64::from(process.config().max_frame_bytes);
     let timeout = Duration::from_secs(process.config().io_timeout_seconds);

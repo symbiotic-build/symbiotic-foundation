@@ -121,10 +121,16 @@ where
 {
     wait_for_startup(
         || {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "child exited before accepting requests"
-            );
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.0.stderr.take() {
+                    std::io::Read::read_to_end(&mut pipe, &mut stderr).unwrap();
+                }
+                panic!(
+                    "child exited before accepting requests: {status:?} stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
         },
         probe,
     )
@@ -151,6 +157,27 @@ async fn wait_for_engine_startup(pid: u32, ready_path: &std::path::Path) {
         },
     )
     .await;
+}
+
+fn process_config(dir: &std::path::Path) -> ProcessConfig {
+    ProcessConfig {
+        log: None,
+        version: PROTOCOL_VERSION,
+        state_dir: dir.join("state"),
+        socket_path: dir.join("egress.sock"),
+        admission_key: SecretSource::OwnerOnlyFile {
+            path: dir.join("admission"),
+        },
+        max_secret_bytes: 4096,
+        max_frame_bytes: 262144,
+        max_connections: 8,
+        io_timeout_seconds: 2,
+        clock_rollback_warning_tolerance_seconds: 5,
+        jobs: Default::default(),
+        job_runner: Default::default(),
+        passthrough: None,
+        routes: Vec::new(),
+    }
 }
 
 struct Fixture {
@@ -318,52 +345,37 @@ impl Fixture {
                 });
             }
         });
-        let config = ProcessConfig {
-            version: PROTOCOL_VERSION,
-            state_dir: dir.path().join("state"),
-            socket_path: dir.path().join("egress.sock"),
-            admission_key: SecretSource::OwnerOnlyFile {
-                path: dir.path().join("admission"),
+        let mut config = process_config(dir.path());
+        config.routes = vec![RouteConfig {
+            answer_recovery: Default::default(),
+            tenant: "tenant".into(),
+            account: "account".into(),
+            account_sharing_key: None,
+            provider_request_limit: None,
+            max_attempts: 3,
+            request_budget: None,
+            route: "chat".into(),
+            secret_ref: "provider-key".into(),
+            secret: SecretSource::OwnerOnlyFile {
+                path: dir.path().join("provider"),
             },
-            max_secret_bytes: 4096,
-            max_frame_bytes: 262144,
-            max_connections: 8,
-            io_timeout_seconds: 2,
-            clock_rollback_warning_tolerance_seconds: 5,
-            jobs: Default::default(),
-            job_runner: Default::default(),
-            passthrough: None,
-            routes: vec![RouteConfig {
-                answer_recovery: Default::default(),
-                tenant: "tenant".into(),
-                account: "account".into(),
-                account_sharing_key: None,
-                provider_request_limit: None,
-                max_attempts: 3,
-                request_budget: None,
-                route: "chat".into(),
-                secret_ref: "provider-key".into(),
-                secret: SecretSource::OwnerOnlyFile {
-                    path: dir.path().join("provider"),
-                },
-                destination: format!("http://{address}/v1"),
-                model: "test-model".into(),
-                provider: RouteProvider::OpenAiChat {
-                    operator: "test".into(),
-                    thinking: None,
-                    reasoning_effort: None,
-                },
-                allow_loopback_http: true,
-                max_input_bytes: 32768,
-                max_response_bytes: 32768,
-                max_field_bytes: 1024,
-                max_output_tokens: 100,
-                max_in_flight: 4,
-                requests_per_minute: None,
-                input_units_per_minute: None,
-                timeout_seconds: 1,
-            }],
-        };
+            destination: format!("http://{address}/v1"),
+            model: "test-model".into(),
+            provider: RouteProvider::OpenAiChat {
+                operator: "test".into(),
+                thinking: None,
+                reasoning_effort: None,
+            },
+            allow_loopback_http: true,
+            max_input_bytes: 32768,
+            max_response_bytes: 32768,
+            max_field_bytes: 1024,
+            max_output_tokens: 100,
+            max_in_flight: 4,
+            requests_per_minute: None,
+            input_units_per_minute: None,
+            timeout_seconds: 1,
+        }];
         Self {
             clock: test_clock::clock(),
             dir,
@@ -1527,19 +1539,20 @@ async fn signed_attempt_time_warning(
 #[tokio::test]
 async fn signed_attempt_time_open_log_sink_reports_executable_warnings() {
     let logs = executable_dispatch(None, None, Some((3600, 5, false))).await;
-    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr.
-    assert_eq!(logs.matches("WARN").count(), 3);
-    assert_eq!(
-        logs.matches("event=\"signed_attempt_time_ahead\"").count(),
-        3
-    );
-    for field in [
-        "recorded_at=",
-        "foundation_now=",
-        "ahead_seconds=",
-        "tolerance_seconds=5",
-    ] {
-        assert_eq!(logs.matches(field).count(), 3);
+    // Fresh issuance, replayed issuance, and accepted dispatch each warn on stderr,
+    // one JSON line each.
+    let warnings: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|line: &serde_json::Value| line["event"] == "signed_attempt_time_ahead")
+        .collect();
+    assert_eq!(warnings.len(), 3, "{logs}");
+    for warning in &warnings {
+        assert_eq!(warning["level"], "WARN");
+        assert_eq!(warning["tolerance_seconds"], 5);
+        for field in ["recorded_at", "foundation_now", "ahead_seconds"] {
+            assert!(warning[field].is_u64(), "{warning}");
+        }
     }
     assert!(!logs.contains(SECRET));
     assert!(!logs.contains(&general_purpose::STANDARD.encode(SECRET)));
@@ -9085,4 +9098,138 @@ async fn regression_request_budget_lookup_failure_refuses_before_http() {
     })
     .await
     .expect("bounded budget storage-failure regression");
+}
+
+#[tokio::test]
+async fn logging_startup_prefers_environment_directives_and_refuses_invalid_ones() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, value) in [
+        ("admission", KEY),
+        ("provider", b"synthetic-passthrough-secret".as_slice()),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, value).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut config = process_config(dir.path());
+    let passthrough_path = dir.path().join("logging.sock");
+    // An unmatched passthrough request emits completion without a provider call.
+    config.passthrough = Some(
+        serde_json::from_value(serde_json::json!({
+            "socket_path": passthrough_path, "max_connections": 1,
+            "routes": [{"name": "logging", "tenant": "tenant", "account": "logging",
+                "account_sharing_key": null, "method": "post", "path": "/v1/responses",
+                "destination": "https://provider.invalid/answer",
+                "secret": {"backend": "owner_only_file", "path": dir.path().join("provider")},
+                "stream": "openai_responses", "forward_headers": [],
+                "max_request_bytes": 1024, "max_response_bytes": 1024,
+                "max_in_flight": 1, "requests_per_minute": null, "idle_timeout_seconds": 1}]
+        }))
+        .unwrap(),
+    );
+    let start = |configured: Option<&str>, environment: Option<&str>| {
+        let mut config = config.clone();
+        config.log = configured.map(str::to_owned);
+        let path = dir.path().join("logging-config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut command = std::process::Command::new(credential_process());
+        command.env_remove(symbiotic_core::logging::LOG_ENV);
+        if let Some(value) = environment {
+            command.env(symbiotic_core::logging::LOG_ENV, value);
+        }
+        Child(
+            command
+                .arg(&path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let refused = |mut child: Child| async move {
+        let status = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("invalid directives must refuse startup");
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!status.success());
+        assert!(stderr.contains("invalid logging directives"), "{stderr}");
+    };
+    refused(start(Some("invalid["), None)).await;
+    refused(start(Some("info"), Some("invalid["))).await;
+    refused(start(Some("invalid["), Some(""))).await;
+    for (configured, environment, info_expected) in [
+        (Some("invalid["), Some("warn"), false),
+        (Some("info"), Some("warn"), false),
+        (Some("warn"), None, false),
+        (None, None, true),
+    ] {
+        let mut child = start(configured, environment);
+        let mut caller = wait_for_child_startup(&mut child, || async {
+            tokio::net::UnixStream::connect(&passthrough_path)
+                .await
+                .map_err(|_| EgressError::Transport)
+        })
+        .await;
+        caller.write_all(b"POST /unknown HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 0\r\nx-symbiotic-request-id: synthetic-logging\r\n\r\n").await.unwrap();
+        caller.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(OBSERVATION_HANG_GUARD, caller.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("production diagnostics are JSON"))
+            .collect();
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        if info_expected {
+            assert_eq!(completed.len(), 1, "{stderr}");
+            assert_eq!(
+                (
+                    &completed[0]["level"],
+                    &completed[0]["outcome"],
+                    &completed[0]["spans"][0]["request_id"]
+                ),
+                (
+                    &serde_json::json!("INFO"),
+                    &serde_json::json!("route_not_found"),
+                    &serde_json::json!("synthetic-logging")
+                ),
+            );
+        } else {
+            assert!(completed.is_empty(), "{stderr}");
+            assert!(lines.iter().all(|line| line["level"] != "INFO"), "{stderr}");
+        }
+    }
 }
