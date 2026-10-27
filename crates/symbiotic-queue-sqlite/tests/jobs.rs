@@ -3253,28 +3253,20 @@ async fn jobs_completion_page_byte_bound_is_exact() {
     assert_eq!(s.deliveries(1, 100_000).await[0].completion.id, second);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn regression_runner_sqlite_lock_leaves_other_database_live() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = test_clock::clock();
     let mut a = Suite::new();
-    a.backend = Arc::new(
-        symbiotic_queue_sqlite::SqliteQueue::open(dir.path().join("a.sqlite"))
-            .unwrap()
-            .with_clock(clock.clone()),
-    );
-    a.now = clock();
+    a.backend =
+        Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(dir.path().join("a.sqlite")).unwrap());
+    a.now = Utc::now();
     a.config.claim_lease_seconds = 1;
     let mut spec = a.spec("independent");
     spec.limits.max_attempts = 1;
     let id = a.insert(spec).await;
     let mut b = Suite::new();
     let path_b = dir.path().join("b.sqlite");
-    b.backend = Arc::new(
-        symbiotic_queue_sqlite::SqliteQueue::open(&path_b)
-            .unwrap()
-            .with_clock(clock),
-    );
+    b.backend = Arc::new(symbiotic_queue_sqlite::SqliteQueue::open(&path_b).unwrap());
     let runner_b = b.runner(1, |_, bytes| async { Ok(bytes) }).await;
     let (entered, entry) = tokio::sync::oneshot::channel();
     let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
@@ -3312,7 +3304,6 @@ async fn regression_runner_sqlite_lock_leaves_other_database_live() {
             if renewed > initial {
                 break renewed;
             }
-            tokio::time::advance(std::time::Duration::from_millis(100)).await;
             tokio::task::yield_now().await;
         }
     })

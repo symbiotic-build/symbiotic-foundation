@@ -968,14 +968,7 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
         model::{ChatMessage, ChatRequest, OpenAiCompatibleChatProvider},
     };
     let mut fixture = Fixture::start().await;
-    let clock = test_clock::clock();
-    let harness = Harness::with_clock(
-        &fixture,
-        |_| {},
-        None,
-        Some(Arc::new(move || clock() + chrono::Duration::days(30))),
-    )
-    .await;
+    let harness = Harness::start(&fixture, |_| {}).await;
     let route = &harness.process.inner.passthrough.as_ref().unwrap().routes[0];
     let typed = harness
         .process
