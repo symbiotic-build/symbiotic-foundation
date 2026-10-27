@@ -794,6 +794,7 @@ mod tests {
             }))
             .unwrap();
             let config = crate::ProcessConfig {
+                log: None,
                 version: PROTOCOL_VERSION,
                 state_dir: dir.path().join("state"),
                 socket_path: dir.path().join("unused.sock"),

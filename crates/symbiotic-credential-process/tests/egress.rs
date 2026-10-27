@@ -385,6 +385,7 @@ impl Fixture {
             }
         });
         let config = ProcessConfig {
+            log: None,
             version: PROTOCOL_VERSION,
             state_dir: dir.path().join("state"),
             socket_path: dir.path().join("egress.sock"),

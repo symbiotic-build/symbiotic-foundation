@@ -713,6 +713,7 @@ same-user deployment; it is not an OS sandbox against a compromised same-UID pro
 
 `ProcessConfig` version 4 requires `state_dir`, `socket_path`, `admission_key`,
 `max_secret_bytes`, `max_frame_bytes`, `max_connections`, `io_timeout_seconds`, `routes`.
+Optional `log` sets EnvFilter directives; see [Logs](#logs).
 Each route names a concrete `account`; `account_sharing_key` is null for tenant/account
 isolation, or explicitly pools execution across routes or tenants. Shared bindings
 must agree on account limits. Each route requires the `RouteConfig` fields documented
@@ -1133,3 +1134,58 @@ with provider fixtures in
 Login fixtures are in
 [`login.rs`](../../crates/symbiotic-credential-process/tests/login.rs)
 and the login module's unit tests.
+
+## Logs
+
+The credential-process binary uses `symbiotic_core::logging` (feature `logging`).
+It writes one JSON object per line to stderr, which systemd sends to the journal.
+Event fields are at the top level, alongside `timestamp`, `level`, `target` and
+`spans`. A request event has this shape:
+
+```json
+{"timestamp":"2026-10-27T00:00:00Z","level":"INFO","message":"request completed","route":"responses","outcome":"complete","status":200,"attempts":2,"queue_waited_ms":1000,"elapsed_ms":1200,"target":"symbiotic_credential_process::passthrough::forward","spans":[{"name":"model_request","request_id":"synthetic-request"}]}
+```
+
+Passthrough events are `request admitted`, `queue wait`, `request sent`,
+`upstream status`, `upstream failure` and `request completed`.
+`upstream failure` remains a warning. Waits that round to zero milliseconds are
+debug events; other waits are info events. `request sent` reports the accumulated
+queue wait at info level.
+Completion reports the caller's HTTP status, attempt count, total queue wait,
+elapsed time and `complete` or an error code. If no HTTP status was sent,
+completion omits `status`. A disconnected caller has outcome `cancelled`.
+The request span uses the validated `x-symbiotic-request-id` header.
+Absent or invalid IDs use `local-` plus a generated UUID v4 in logs only.
+Health waiting entries still require a valid caller-supplied ID.
+Credentials, bodies and other header values are excluded from these events.
+
+The optional top-level config field `log` accepts EnvFilter directives, for example
+`"log": "warn,symbiotic_credential_process::passthrough::forward=debug"`.
+A nonempty `SYMBIOTIC_LOG` overrides it; the default is `info`.
+Invalid directives refuse startup. To override a systemd instance on build-i9,
+run `systemctl edit warden-model@codex` and add:
+
+```ini
+[Service]
+Environment="SYMBIOTIC_LOG=info,symbiotic_credential_process::passthrough::forward=debug"
+```
+
+Restart the instance to apply the override.
+Find one request across all instances by its exact span field
+(`-g` matches a regular expression against each line; build-i9 has no `jq`):
+
+```sh
+journalctl -u 'warden-model@*' --since '1 hour ago' -o cat -g '"request_id":"ID"'
+```
+
+Find every request whose ID starts with a prefix, such as one Warden job:
+
+```sh
+journalctl -u 'warden-model@*' --since today -o cat -g '"request_id":"JOB-'
+```
+
+Show only upstream failures of one instance:
+
+```sh
+journalctl -u warden-model@codex --since today -o cat -g '"message":"upstream failure"'
+```

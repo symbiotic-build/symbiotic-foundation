@@ -1,6 +1,8 @@
 //! One retry engine for HTTP failures, connection failures and interrupted items.
 use super::*;
 use std::sync::atomic::Ordering;
+use symbiotic_core::logging::REQUEST_ID_HEADER;
+use tracing::Instrument;
 
 struct AttemptLog<'a> {
     route: &'a str,
@@ -57,10 +59,58 @@ enum AnswerOutcome {
     Terminated(&'static str),
     Failure(Failure),
 }
-#[derive(Default)]
-struct WaitTime {
+// Request-scoped telemetry only; admission and health keep their existing state.
+struct RequestLog {
     total: Duration,
     cooldown: Duration,
+    route: String,
+    span: tracing::Span,
+    started_at: Instant,
+    outcome: String,
+    status: Option<u16>,
+    attempts: u32,
+}
+impl RequestLog {
+    fn new(route: &Route, started_at: Instant) -> Self {
+        Self {
+            total: Duration::ZERO,
+            cooldown: Duration::ZERO,
+            route: route.config.name.clone(),
+            span: tracing::Span::current(),
+            started_at,
+            outcome: "cancelled".into(),
+            status: None,
+            attempts: 0,
+        }
+    }
+    fn waited(&mut self, route: &Route, reason: &'static str, elapsed: Duration) {
+        self.total += elapsed;
+        if reason != "slot" {
+            self.cooldown += elapsed;
+        }
+        let waited_ms = elapsed.as_millis() as u64;
+        if waited_ms == 0 {
+            tracing::debug!(route = route.config.name, reason, waited_ms, "queue wait");
+        } else {
+            tracing::info!(route = route.config.name, reason, waited_ms, "queue wait");
+        }
+    }
+}
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        // Cancellation can drop the future outside Instrument's polling scope.
+        self.span.in_scope(|| {
+            tracing::info!(
+                route = self.route,
+                outcome = self.outcome,
+                status = self.status,
+                attempts = self.attempts,
+                queue_waited_ms = self.total.as_millis() as u64,
+                elapsed_ms = self.started_at.elapsed().as_millis() as u64,
+                "request completed"
+            )
+        });
+    }
 }
 impl Passthrough {
     async fn pause(
@@ -69,16 +119,13 @@ impl Passthrough {
         id: Option<&str>,
         reason: &'static str,
         duration: Duration,
-        wait: &mut WaitTime,
+        wait: &mut RequestLog,
     ) -> Result<()> {
         let _entry = self.waiting(route, id, reason)?;
         let start = Instant::now();
         tokio::time::sleep(duration).await;
         let elapsed = start.elapsed();
-        wait.total += elapsed;
-        if reason != "slot" {
-            wait.cooldown += elapsed;
-        }
+        wait.waited(route, reason, elapsed);
         Ok(())
     }
     async fn session_permit(
@@ -86,7 +133,7 @@ impl Passthrough {
         route: &Route,
         key: &Option<Vec<Option<Vec<u8>>>>,
         id: Option<&str>,
-        wait: &mut WaitTime,
+        wait: &mut RequestLog,
     ) -> Result<std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, DateTime<Utc>>> {
         let mut changes = route.retries.sessions.changes.subscribe();
         loop {
@@ -134,8 +181,8 @@ impl Passthrough {
                 p=route.retries.sessions.probe.clone().acquire_owned()=>Some(p.map_err(|_|EgressError::StateUnavailable)?),
                 r=changes.changed()=>{r.map_err(|_|EgressError::StateUnavailable)?;None},
             };
-            wait.total += started.elapsed();
-            wait.cooldown += started.elapsed();
+            let elapsed = started.elapsed();
+            wait.waited(route, "new_session", elapsed);
             route.usable().await?;
             if let Some(permit) = permit {
                 let s = route
@@ -154,7 +201,7 @@ impl Passthrough {
         &self,
         route: &Route,
         id: Option<&str>,
-        wait: &mut WaitTime,
+        wait: &mut RequestLog,
     ) -> Result<Option<DateTime<Utc>>> {
         loop {
             let until = route
@@ -193,9 +240,13 @@ impl Passthrough {
         started: bool,
         status: u16,
         code: &'static str,
-        wait: &WaitTime,
+        wait: &mut RequestLog,
         until: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        wait.outcome = code.into();
+        if !started {
+            wait.status = Some(status);
+        }
         if started {
             chunk(
                 write,
@@ -346,32 +397,70 @@ impl Passthrough {
         original: Vec<u8>,
         write: &mut (impl tokio::io::AsyncWrite + Unpin),
     ) -> Result<()> {
-        let named = request
+        let started_at = Instant::now();
+        let request_id = request
+            .headers
+            .iter()
+            .find(|(n, _)| n == REQUEST_ID_HEADER)
+            .map(|(_, v)| v);
+        let secrets = initial.secrets().await;
+        let invalid_id = request_id.is_some_and(|v| !safe_value(v, &secrets, 64));
+        let id = request_id
+            .filter(|_| !invalid_id)
+            .and_then(|v| std::str::from_utf8(v).ok());
+        let log_id = id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("local-{}", uuid::Uuid::new_v4()));
+        let span = tracing::info_span!("model_request", request_id = %log_id);
+        async {
+            let mut wait = RequestLog::new(initial, started_at);
+            if invalid_id {
+                wait.outcome = "request_id_invalid".into();
+                wait.status = Some(400);
+                return fixed(write, 400, "request_id_invalid", &[]).await;
+            }
+            let result = self
+                .forward_request(initial, &request, original, write, id, &mut wait)
+                .await;
+            if let Err(error) = &result {
+                // These errors carry only static diagnostics, never provider data.
+                wait.outcome = error.to_string();
+            }
+            result
+        }
+        .instrument(span)
+        .await
+    }
+    async fn forward_request(
+        &self,
+        initial: &Route,
+        request: &Request,
+        original: Vec<u8>,
+        write: &mut (impl tokio::io::AsyncWrite + Unpin),
+        id: Option<&str>,
+        wait: &mut RequestLog,
+    ) -> Result<()> {
+        let policy_name = request
             .headers
             .iter()
             .find(|(n, _)| n == "x-symbiotic-retry-policy")
             .map(|(_, v)| std::str::from_utf8(v));
-        let named = match named {
-            Some(Ok(n)) => match self.retry_policies.get(n) {
-                Some(p) => Some(p),
-                None => return fixed(write, 400, "retry_policy_unknown", &[]).await,
-            },
-            Some(Err(_)) => return fixed(write, 400, "retry_policy_unknown", &[]).await,
-            None => None,
+        let named = match policy_name {
+            Some(Ok(n)) => self.retry_policies.get(n),
+            _ => None,
         };
-        let request_id = request
-            .headers
-            .iter()
-            .find(|(n, _)| n == "x-symbiotic-request-id")
-            .map(|(_, v)| v);
-        let secrets = initial.secrets().await;
-        if request_id.is_some_and(|v| !safe_value(v, &secrets, 64)) {
-            return fixed(write, 400, "request_id_invalid", &[]).await;
+        if policy_name.is_some() && named.is_none() {
+            wait.outcome = "retry_policy_unknown".into();
+            wait.status = Some(400);
+            return fixed(write, 400, "retry_policy_unknown", &[]).await;
         }
-        let id = request_id.and_then(|v| std::str::from_utf8(v).ok());
+        tracing::info!(
+            route = initial.config.name,
+            retry_policy = policy_name.and_then(|n| n.ok()).unwrap_or("none"),
+            "request admitted"
+        );
         let mut route = initial;
         let mut fallback = initial.config.fallback_routes.iter();
-        let mut wait = WaitTime::default();
         let mut started = false;
         let mut join = ItemJoin::new(route.config.max_held_event_bytes);
         let mut buffered = reqwest::Request::new(
@@ -382,14 +471,13 @@ impl Passthrough {
         *buffered.body_mut() = Some(original.clone().into());
         let mut slot = None;
         let mut authentication: Option<(HeaderMap, Option<LoginRequest>)> = None;
-        let mut attempt = 0u32;
         loop {
             if route.usable().await.is_err() {
                 return self
-                    .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                    .local_error(write, started, 503, "credential_unavailable", wait, None)
                     .await;
             }
-            let key = route.session_key(&request);
+            let key = route.session_key(request);
             if route.is_new(&key)? {
                 let hold = route
                     .retries
@@ -401,16 +489,16 @@ impl Passthrough {
                     slot = None;
                 }
             }
-            let mut session = match self.session_permit(route, &key, id, &mut wait).await {
+            let mut session = match self.session_permit(route, &key, id, wait).await {
                 Ok(Ok(p)) => p,
                 Ok(Err(until)) => {
                     return self
-                        .local_error(write, started, 429, "rate_limited", &wait, Some(until))
+                        .local_error(write, started, 429, "rate_limited", wait, Some(until))
                         .await;
                 }
                 Err(EgressError::CredentialUnavailable) => {
                     return self
-                        .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                        .local_error(write, started, 503, "credential_unavailable", wait, None)
                         .await;
                 }
                 Err(error) => return Err(error),
@@ -425,25 +513,26 @@ impl Passthrough {
                         .await
                         .map_err(|_| EgressError::StateUnavailable)?,
                 );
-                wait.total += now.elapsed();
+                let elapsed = now.elapsed();
+                wait.waited(route, "slot", elapsed);
             }
-            let cooldown = match self.cooldown(route, id, &mut wait).await {
+            let cooldown = match self.cooldown(route, id, wait).await {
                 Ok(c) => c,
                 Err(EgressError::CredentialUnavailable) => {
                     return self
-                        .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                        .local_error(write, started, 503, "credential_unavailable", wait, None)
                         .await;
                 }
                 Err(error) => return Err(error),
             };
             if route.usable().await.is_err() {
                 return self
-                    .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                    .local_error(write, started, 503, "credential_unavailable", wait, None)
                     .await;
             }
             if let Some(until) = cooldown {
                 return self
-                    .local_error(write, started, 429, "rate_limited", &wait, Some(until))
+                    .local_error(write, started, 429, "rate_limited", wait, Some(until))
                     .await;
             }
             if authentication.is_none() {
@@ -451,7 +540,7 @@ impl Passthrough {
                     Ok(a) => Some(a),
                     Err(_) => {
                         return self
-                            .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                            .local_error(write, started, 503, "credential_unavailable", wait, None)
                             .await;
                     }
                 };
@@ -461,7 +550,7 @@ impl Passthrough {
             {
                 if login.refresh_request(login_request).await.is_err() {
                     return self
-                        .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                        .local_error(write, started, 503, "credential_unavailable", wait, None)
                         .await;
                 }
                 *injected = login_request.headers().clone();
@@ -516,7 +605,7 @@ impl Passthrough {
             {
                 model::ModelRequestAdmission::Cooldown => continue,
                 model::ModelRequestAdmission::Wait(d) => {
-                    self.pause(route, id, "slot", d, &mut wait).await?;
+                    self.pause(route, id, "slot", d, wait).await?;
                     continue;
                 }
                 model::ModelRequestAdmission::Ready(g) => g,
@@ -524,7 +613,7 @@ impl Passthrough {
             if route.usable().await.is_err() {
                 drop(grant);
                 return self
-                    .local_error(write, started, 503, "credential_unavailable", &wait, None)
+                    .local_error(write, started, 503, "credential_unavailable", wait, None)
                     .await;
             }
             // Reusable body storage is cloned only after admission succeeds.
@@ -550,6 +639,8 @@ impl Passthrough {
             let transport = async { route.client.execute(transport_request).await };
             let mut was_new = false;
             // Step 2: reserve a passthrough spend receipt immediately before sending.
+            let queue_waited_ms = wait.total.as_millis() as u64;
+            let next_attempt = wait.attempts.saturating_add(1);
             let sent = grant
                 .start_checked(
                     || {
@@ -566,6 +657,14 @@ impl Passthrough {
                             Ok(None)
                         } else {
                             was_new = new;
+                            // Logged inside the check, so it precedes the transport send.
+                            tracing::info!(
+                                route = route.config.name,
+                                attempt = next_attempt,
+                                new_session = new,
+                                queue_waited_ms,
+                                "request sent"
+                            );
                             Ok(Some(hold))
                         }
                     },
@@ -577,7 +676,15 @@ impl Passthrough {
                 slot = None;
                 continue;
             };
-            attempt = attempt.saturating_add(1);
+            wait.attempts = next_attempt;
+            let attempt = next_attempt;
+            tracing::info!(
+                route = route.config.name,
+                attempt,
+                status = sent.as_ref().ok().map(|r| r.status().as_u16()),
+                code = sent.as_ref().err().map(|_| "network"),
+                "upstream status"
+            );
             let log = AttemptLog {
                 route: &route.config.name,
                 attempt,
@@ -614,24 +721,18 @@ impl Passthrough {
                         }
                         drop(session.take());
                         match self
-                            .answer(
-                                route,
-                                &mut response,
-                                write,
-                                &mut started,
-                                &mut join,
-                                &mut wait,
-                            )
+                            .answer(route, &mut response, write, &mut started, &mut join, wait)
                             .await?
                         {
                             AnswerOutcome::Complete => {
                                 route.retries.failures.store(0, Ordering::Release);
+                                wait.outcome = "complete".into();
                                 return Ok(());
                             }
                             AnswerOutcome::Terminated(code) => {
                                 log.warn(code, ErrorClass::Final, started, "fail", None);
                                 return self
-                                    .local_error(write, started, 502, code, &wait, None)
+                                    .local_error(write, started, 502, code, wait, None)
                                     .await;
                             }
                             AnswerOutcome::Failure(f) => f,
@@ -640,7 +741,7 @@ impl Passthrough {
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
                             log.warn("upstream_status", ErrorClass::Final, started, "fail", None);
                             return self
-                                .local_error(write, false, 401, "upstream_status", &wait, None)
+                                .local_error(write, false, 401, "upstream_status", wait, None)
                                 .await;
                         }
                         if status == 401
@@ -673,7 +774,7 @@ impl Passthrough {
                                         started,
                                         503,
                                         "credential_unavailable",
-                                        &wait,
+                                        wait,
                                         None,
                                     )
                                     .await;
@@ -705,7 +806,7 @@ impl Passthrough {
                                         started,
                                         502,
                                         "response_too_large",
-                                        &wait,
+                                        wait,
                                         None,
                                     )
                                     .await;
@@ -735,6 +836,7 @@ impl Passthrough {
                         "x-symbiotic-queue-waited-ms".into(),
                         wait.total.as_millis().to_string(),
                     ));
+                    wait.status = Some(200);
                     head(write, 200, "text/event-stream", &headers).await?;
                     started = true;
                 }
@@ -743,6 +845,7 @@ impl Passthrough {
             match decision.action {
                 RetryAction::Fail => {
                     if started && let Some(event) = failure.event {
+                        wait.outcome = failure.code.clone();
                         let bytes = ResponsesAdapter::encode(&event)
                             .map_err(|_| EgressError::InvalidProviderJson)?;
                         chunk(write, &bytes).await?;
@@ -756,6 +859,8 @@ impl Passthrough {
                             "x-symbiotic-queue-waited-ms".into(),
                             wait.total.as_millis().to_string(),
                         ));
+                        wait.outcome = "upstream_status".into();
+                        wait.status = Some(failure.status);
                         return fixed(write, failure.status, "upstream_status", &h).await;
                     }
                     return self
@@ -764,7 +869,7 @@ impl Passthrough {
                             started,
                             failure.status,
                             "upstream_disconnect",
-                            &wait,
+                            wait,
                             None,
                         )
                         .await;
@@ -777,7 +882,7 @@ impl Passthrough {
                                 started,
                                 failure.status,
                                 "upstream_status",
-                                &wait,
+                                wait,
                                 None,
                             )
                             .await;
@@ -787,6 +892,7 @@ impl Passthrough {
                         .iter()
                         .find(|r| &r.config.name == name)
                         .ok_or(EgressError::InvalidRequest)?;
+                    wait.route = route.config.name.clone();
                     slot = None;
                     authentication = None;
                 }
@@ -812,7 +918,7 @@ impl Passthrough {
         write: &mut (impl tokio::io::AsyncWrite + Unpin),
         started: &mut bool,
         join: &mut ItemJoin,
-        wait: &mut WaitTime,
+        wait: &mut RequestLog,
     ) -> Result<AnswerOutcome> {
         let encoding = response.headers().get("content-encoding");
         let raw = response
@@ -945,7 +1051,7 @@ impl Passthrough {
         response: &reqwest::Response,
         write: &mut (impl tokio::io::AsyncWrite + Unpin),
         kind: &str,
-        wait: &WaitTime,
+        wait: &mut RequestLog,
     ) -> Result<()> {
         let mut headers = returned(
             &route.config,
@@ -957,6 +1063,7 @@ impl Passthrough {
             "x-symbiotic-queue-waited-ms".into(),
             wait.total.as_millis().to_string(),
         ));
+        wait.status = Some(response.status().as_u16());
         head(write, response.status().as_u16(), kind, &headers).await
     }
 }

@@ -190,7 +190,7 @@ fn forbidden_header(name: &str) -> bool {
             | "chatgpt-account-id"
             | "x-xai-token-auth"
             | "x-symbiotic-retry-policy"
-            | "x-symbiotic-request-id"
+            | symbiotic_core::logging::REQUEST_ID_HEADER
             | "x-symbiotic-queue-waited-ms"
     ) || name.starts_with("x-forwarded-")
 }

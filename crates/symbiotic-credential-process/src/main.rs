@@ -15,17 +15,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     use symbiotic_egress::EgressError;
     symbiotic_credential_process::protect_process().map_err(|_| EgressError::StateUnavailable)?;
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        // The default IO-error fallback uses eprintln!, which panics on closed stderr.
-        .log_internal_errors(false)
-        .try_init()
-        .map_err(|_| EgressError::StateUnavailable)?;
     let mut args = std::env::args_os().skip(1);
     let first = args.next().ok_or(EgressError::InvalidRequest)?;
     if first == "login" {
+        symbiotic_core::logging::init(None)?;
         return import_login(args).map_err(Into::into);
     }
     let path = if first == "--child" {
@@ -41,6 +34,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config: ProcessConfig = serde_json::from_slice(&bytes).map_err(
         |_| "invalid configuration: supported secret backends are `none`, `owner_only_file`, and `login_file`",
     )?;
+    symbiotic_core::logging::init(config.log.as_deref())?;
     let process = CredentialProcess::open(config)?;
     let listener = server::bind(&process)?;
     if process.config().passthrough.is_some() {
