@@ -1078,7 +1078,7 @@ cookies and hop headers are refused in configuration. Local responses carry no
 upstream headers. An unmatched method/path returns 404 `route_not_found`.
 
 `SecretSource::LoginFile { path, family }` is valid only for passthrough.
-`chatgpt_codex` and `xai_grok` are closed login families with fixed issuers,
+`chatgpt_codex`, `xai_grok` and `kimi_code` are closed login families with fixed issuers,
 client IDs, renewal encodings and credential headers. The version-1 JSON store
 refuses unknown fields, wrong family values and insecure files. Tokens use
 zeroizing storage and have no diagnostic representation. A lifetime-exclusive
@@ -1107,7 +1107,16 @@ or making a network request:
 symbiotic-credential-process login import --family chatgpt_codex --native native-login.json --store login.json
 ```
 
-Import validates the provider-specific subscription scope and expiry, takes the
+For Kimi Code, use `--family kimi_code` and the Kimi CLI's owner-only
+`~/.kimi-code/credentials/kimi-code.json` as `--native`. The process reads flat
+`access_token`, `refresh_token` and numeric `expires_at` fields. It rounds
+fractional Unix seconds down and renews with a form grant at
+`https://auth.kimi.com/api/oauth/token`, using public client ID
+`17e5f671-d194-4dfb-9706-5516cb48c098`. Kimi's provider destination is
+`https://api.kimi.com/coding/v1`; its route requires the Chat Completions dialect
+from [#162](https://github.com/symbiotic-build/symbiotic-foundation/issues/162).
+
+Import validates the family-specific fields and expiry, takes the
 same lifetime lock and atomically installs an owner-only store. Replacing a store
 requires `--replace`. A successful import clears the renewal fence. The native
 login file becomes stale after the first refresh-token rotation.

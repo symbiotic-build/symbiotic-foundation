@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 
 const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const GROK_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const KIMI_CLIENT: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const UNAVAILABLE: EgressError = EgressError::CredentialUnavailable;
 type Result<T> = std::result::Result<T, EgressError>;
 
@@ -34,12 +35,14 @@ impl LoginFamily {
         match self {
             Self::ChatgptCodex => "https://auth.openai.com",
             Self::XaiGrok => "https://auth.x.ai",
+            Self::KimiCode => "https://auth.kimi.com",
         }
     }
     fn client_id(self) -> &'static str {
         match self {
             Self::ChatgptCodex => CODEX_CLIENT,
             Self::XaiGrok => GROK_CLIENT,
+            Self::KimiCode => KIMI_CLIENT,
         }
     }
 }
@@ -120,6 +123,7 @@ impl Store {
             LoginFamily::XaiGrok => {
                 headers.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
             }
+            LoginFamily::KimiCode => {}
         }
         Ok(headers)
     }
@@ -556,7 +560,7 @@ fn jwt_exp(token: &str) -> Option<u64> {
     jwt_claims::<Claims>(token).map(|claims| claims.exp)
 }
 
-/// Import a native Codex auth.json or first-party scoped Grok session file.
+/// Import a native Codex auth.json, scoped Grok session, or Kimi Code login file.
 /// Runs no provider tool or network request. Import clears an uncertain renewal.
 /// Existing stores require `replace`; an active Login always refuses import.
 pub fn import_native(
@@ -657,6 +661,28 @@ fn parse_native(family: LoginFamily, bytes: &[u8]) -> Result<Store> {
             store.account_id = Some(native.tokens.account_id);
             Ok(store)
         }
+        LoginFamily::KimiCode => {
+            #[derive(Deserialize)]
+            struct Kimi {
+                access_token: Token,
+                refresh_token: Token,
+                expires_at: f64,
+            }
+            let native: Kimi = serde_json::from_slice(bytes).map_err(|_| UNAVAILABLE)?;
+            // The CLI stores Unix seconds, including fractional values. Round down
+            // into the shared store without accepting negative or overflowing times.
+            if !native.expires_at.is_finite()
+                || native.expires_at <= 0.0
+                || native.expires_at >= u64::MAX as f64
+            {
+                return Err(UNAVAILABLE);
+            }
+            let mut store = store();
+            store.expires_at = native.expires_at.floor() as u64;
+            store.access_token = native.access_token;
+            store.refresh_token = native.refresh_token;
+            Ok(store)
+        }
         LoginFamily::XaiGrok => {
             #[derive(Deserialize)]
             struct GrokFile {
@@ -741,8 +767,13 @@ impl Http {
         url
     }
     async fn endpoint(&self, family: LoginFamily, limit: usize) -> Result<Url> {
-        if family == LoginFamily::ChatgptCodex {
-            return Self::allowed(&format!("{}/oauth/token", family.issuer()), family);
+        let path = match family {
+            LoginFamily::ChatgptCodex => Some("/oauth/token"),
+            LoginFamily::KimiCode => Some("/api/oauth/token"),
+            LoginFamily::XaiGrok => None,
+        };
+        if let Some(path) = path {
+            return Self::allowed(&format!("{}{path}", family.issuer()), family);
         }
         let discovery = Self::allowed(
             &format!("{}/.well-known/openid-configuration", family.issuer()),
@@ -786,6 +817,11 @@ impl Http {
             principal_id: &store.principal_id,
         };
         let builder = self.client.post(self.wire_url(endpoint.clone()));
+        let builder = if store.family == LoginFamily::KimiCode {
+            builder.header("accept", "application/json")
+        } else {
+            builder
+        };
         let builder = if store.family == LoginFamily::ChatgptCodex {
             builder
                 .json(&grant)
@@ -982,6 +1018,76 @@ mod tests {
             wire_base: Some(fixture.base.clone()),
         };
         login
+    }
+
+    #[tokio::test]
+    async fn kimi_expired_login_renews_once_and_reopens_with_rotated_tokens() {
+        let family: LoginFamily = serde_json::from_str("\"kimi_code\"").unwrap();
+        let fixture = Fixture::start(200, "https://auth.x.ai/token").await;
+        let dir = tempfile::tempdir().unwrap();
+        let login = login(dir.path(), family, now().unwrap() - 1, &fixture);
+        for _ in 0..2 {
+            let request = login.request().await.unwrap();
+            assert_eq!(request.headers()[AUTHORIZATION], "Bearer new-access");
+            assert_eq!(request.headers().len(), 1);
+            let diagnostic = format!("{:?}", request.headers());
+            for secret in ["old-access", "old-refresh", "new-access", "new-refresh"] {
+                assert!(!diagnostic.contains(secret));
+            }
+        }
+        assert_eq!(fixture.count(), 1);
+        {
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let (headers, body) = &requests[0];
+            assert!(headers.starts_with("POST /api/oauth/token HTTP/1.1\r\n"));
+            assert!(headers.contains("content-type: application/x-www-form-urlencoded\r\n"));
+            assert!(headers.contains("accept: application/json\r\n"));
+            assert!(!headers.contains("authorization:"));
+            assert_eq!(
+                body,
+                &json!(
+                    "grant_type=refresh_token&client_id=17e5f671-d194-4dfb-9706-5516cb48c098&refresh_token=old-refresh"
+                )
+            );
+        }
+        let held = login.held_secrets().await;
+        for secret in ["old-access", "old-refresh", "new-access", "new-refresh"] {
+            assert!(held.iter().any(|value| value == secret));
+        }
+        drop(login);
+        let reopened = Login::open(&dir.path().join("login"), family, LIMIT).unwrap();
+        assert_eq!(
+            reopened.request().await.unwrap().headers()[AUTHORIZATION],
+            "Bearer new-access"
+        );
+        assert_eq!(fixture.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn kimi_renewal_failure_requires_login_without_secret_diagnostics() {
+        let family: LoginFamily = serde_json::from_str("\"kimi_code\"").unwrap();
+        for status in [400, 401, 500, 302] {
+            let fixture = Fixture::start(status, "https://auth.x.ai/token").await;
+            let dir = tempfile::tempdir().unwrap();
+            let login = login(dir.path(), family, now().unwrap() - 1, &fixture);
+            let error = login.request().await.err().unwrap();
+            assert_eq!(error, EgressError::CredentialUnavailable);
+            let diagnostic = format!("{error:?}: {error}");
+            for secret in ["old-access", "old-refresh", "synthetic secret error body"] {
+                assert!(!diagnostic.contains(secret));
+            }
+            assert_eq!(login.health().await.unwrap().0, LoginHealth::LoginRequired);
+            assert!(login.request().await.is_err());
+            assert_eq!(fixture.count(), 1);
+            drop(login);
+            let reopened = Login::open(&dir.path().join("login"), family, LIMIT).unwrap();
+            assert_eq!(
+                reopened.health().await.unwrap().0,
+                LoginHealth::LoginRequired
+            );
+            assert!(reopened.request().await.is_err());
+        }
     }
 
     #[tokio::test]

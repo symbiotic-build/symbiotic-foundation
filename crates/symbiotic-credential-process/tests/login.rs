@@ -372,3 +372,49 @@ fn codex_import_refuses_mismatched_issuer_and_client_claims() {
         assert!(!store.exists(), "installed mismatched {field}");
     }
 }
+
+#[test]
+fn kimi_import_command_parses_fractional_expiry_and_never_prints_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("kimi-code.json");
+    let path = dir.path().join("store");
+    let expiry = now() + 3600;
+    let native = json!({"access_token":"synthetic-kimi-access","refresh_token":"synthetic-kimi-refresh","expires_at":expiry as f64 + 0.75,"scope":"","token_type":"Bearer"});
+    write(&source, &native);
+    let run = || {
+        Command::new(credential_binary())
+            .args(["login", "import", "--family", "kimi_code", "--native"])
+            .arg(&source)
+            .arg("--store")
+            .arg(&path)
+            .arg("--replace")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    for secret in ["synthetic-kimi-access", "synthetic-kimi-refresh"] {
+        assert_secret_free_output(&first, secret);
+    }
+    assert!(first.status.success(), "Kimi native import refused");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        json!({"version":1,"family":"kimi_code","issuer":"https://auth.kimi.com","client_id":"17e5f671-d194-4dfb-9706-5516cb48c098","access_token":"synthetic-kimi-access","refresh_token":"synthetic-kimi-refresh","expires_at":expiry,"id_token":null,"account_id":null,"principal_type":null,"principal_id":null})
+    );
+    // Rejection still uses the command's static error, even for malformed credentials.
+    for expiry in [
+        json!("synthetic-kimi-refresh"),
+        json!(-1),
+        json!(0),
+        json!(1e30),
+        json!(now() - 1),
+    ] {
+        let mut invalid = native.clone();
+        invalid["expires_at"] = expiry;
+        write(&source, &invalid);
+        let refused = run();
+        assert!(!refused.status.success());
+        for secret in ["synthetic-kimi-access", "synthetic-kimi-refresh"] {
+            assert_secret_free_output(&refused, secret);
+        }
+    }
+}

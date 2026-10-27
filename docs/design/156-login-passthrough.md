@@ -201,6 +201,8 @@ pub enum LoginFamily {
     ChatgptCodex,
     /// xAI subscription login used by the Grok CLI.
     XaiGrok,
+    /// Kimi Code subscription login used by the Kimi CLI.
+    KimiCode,
 }
 ```
 
@@ -242,6 +244,16 @@ group or other permission bits, not a symlink, read with the `max_secret_bytes` 
 |---|---|---|---|
 | `chatgpt_codex` | `{issuer}/oauth/token` | JSON | `Authorization: Bearer`, `ChatGPT-Account-ID`, `originator` |
 | `xai_grok` | OIDC discovery at `{issuer}`, exact host only | form | `Authorization: Bearer`, `X-XAI-Token-Auth` |
+| `kimi_code` | `https://auth.kimi.com/api/oauth/token` | form | `Authorization: Bearer` |
+
+`kimi_code` uses issuer `https://auth.kimi.com` and public client ID
+`17e5f671-d194-4dfb-9706-5516cb48c098`, as Kimi CLI 2.2.0 does. Its renewal
+form carries `grant_type=refresh_token`, `client_id` and `refresh_token`.
+Its native file is `~/.kimi-code/credentials/kimi-code.json`, with flat
+`access_token`, `refresh_token` and numeric `expires_at` fields. Expiry is Unix
+seconds; fractional seconds round down in the version-1 store. Native `scope`,
+`token_type` and `expires_in` metadata do not enter the store. Kimi routes require
+the Chat Completions dialect from [#162](https://github.com/symbiotic-build/symbiotic-foundation/issues/162).
 
 Discovery accepts only a token endpoint on the issuer's exact HTTPS host. The token
 endpoint is never caller-supplied and never follows redirects. Discovery and token
@@ -283,8 +295,8 @@ owns each login store.
 
 **Import.** `symbiotic-credential-process login import --family <family> --native <file> --store <path>`
 reads the provider tool's own login file (the Codex CLI's `auth.json`, the Grok CLI's
-session file), checks its family, issuer, client ID, scope and token expiry, and
-writes a version-1 store. It refuses an existing store unless `--replace` is given.
+session file, or the Kimi CLI's `credentials/kimi-code.json`). It validates the
+family-specific fields and token expiry, then writes a version-1 store. It refuses an existing store unless `--replace` is given.
 It prints no token. It runs no provider tool and sends no request: the operator signs
 in with the provider's own tool first. After import, only the credential process may
 renew the login; the native file becomes stale at the first rotation.
