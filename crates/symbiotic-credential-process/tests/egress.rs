@@ -119,10 +119,16 @@ where
 {
     wait_for_startup(
         || {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "child exited before accepting requests"
-            );
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.0.stderr.take() {
+                    std::io::Read::read_to_end(&mut pipe, &mut stderr).unwrap();
+                }
+                panic!(
+                    "child exited before accepting requests: {status:?} stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
         },
         probe,
     )
@@ -9124,4 +9130,129 @@ async fn regression_request_budget_lookup_failure_refuses_before_http() {
     })
     .await
     .expect("bounded budget storage-failure regression");
+}
+
+#[tokio::test]
+async fn logging_startup_prefers_environment_directives_and_refuses_invalid_ones() {
+    use std::io::Read;
+    let fixture = Fixture::new(200, "unused".into(), Duration::ZERO).await;
+    let secret_path = fixture.dir.path().join("provider");
+    std::fs::write(&secret_path, b"synthetic-passthrough-secret").unwrap();
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let passthrough_path = fixture.dir.path().join("logging.sock");
+    let start = |configured: Option<&str>, environment: Option<&str>| {
+        let mut config = fixture.config.clone();
+        config.log = configured.map(str::to_owned);
+        // An unmatched passthrough request emits completion without a provider call.
+        config.passthrough = Some(serde_json::from_value(serde_json::json!({
+            "socket_path": passthrough_path, "max_connections": 1,
+            "routes": [{"name": "logging", "tenant": "tenant", "account": "logging",
+                "account_sharing_key": null, "method": "post", "path": "/v1/responses",
+                "destination": "https://provider.invalid/answer",
+                "secret": {"backend": "owner_only_file", "path": fixture.dir.path().join("provider")},
+                "stream": "openai_responses", "forward_headers": [],
+                "max_request_bytes": 1024, "max_response_bytes": 1024,
+                "max_in_flight": 1, "requests_per_minute": null, "idle_timeout_seconds": 1}]
+        })).unwrap());
+        let path = fixture.dir.path().join("logging-config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut command = std::process::Command::new(credential_process());
+        command.env_remove(symbiotic_core::logging::LOG_ENV);
+        if let Some(value) = environment {
+            command.env(symbiotic_core::logging::LOG_ENV, value);
+        }
+        Child(
+            command
+                .arg(&path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let refused = |mut child: Child| async move {
+        let status = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("invalid directives must refuse startup");
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!status.success());
+        assert!(stderr.contains("invalid logging directives"), "{stderr}");
+    };
+    refused(start(Some("invalid["), None)).await;
+    refused(start(Some("info"), Some("invalid["))).await;
+    refused(start(Some("invalid["), Some(""))).await;
+    for (configured, environment, info_expected) in [
+        (Some("invalid["), Some("warn"), false),
+        (Some("info"), Some("warn"), false),
+        (Some("warn"), None, false),
+        (None, None, true),
+    ] {
+        let mut child = start(configured, environment);
+        let mut caller = wait_for_child_startup(&mut child, || async {
+            tokio::net::UnixStream::connect(&passthrough_path)
+                .await
+                .map_err(|_| EgressError::Transport)
+        })
+        .await;
+        caller.write_all(b"POST /unknown HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 0\r\nx-symbiotic-request-id: synthetic-logging\r\n\r\n").await.unwrap();
+        caller.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(OBSERVATION_HANG_GUARD, caller.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("production diagnostics are JSON"))
+            .collect();
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        if info_expected {
+            assert_eq!(completed.len(), 1, "{stderr}");
+            assert_eq!(
+                (
+                    &completed[0]["level"],
+                    &completed[0]["outcome"],
+                    &completed[0]["spans"][0]["request_id"]
+                ),
+                (
+                    &serde_json::json!("INFO"),
+                    &serde_json::json!("route_not_found"),
+                    &serde_json::json!("synthetic-logging")
+                ),
+            );
+        } else {
+            assert!(completed.is_empty(), "{stderr}");
+            assert!(lines.iter().all(|line| line["level"] != "INFO"), "{stderr}");
+        }
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
 }

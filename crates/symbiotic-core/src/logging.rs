@@ -64,26 +64,3 @@ where
         .with_target(true)
         .finish())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn environment_directives_override_configuration_and_invalid_directives_fail() {
-        for (environment, configured, expected) in [
-            (Some("debug"), Some("warn"), "debug"),
-            (Some(""), Some("warn"), "warn"),
-            (None, Some("warn"), "warn"),
-            (None, None, "info"),
-            (Some(""), None, "info"),
-        ] {
-            assert_eq!(directives(environment, configured), expected);
-            assert!(subscriber(directives(environment, configured), std::io::sink).is_ok());
-        }
-        assert!(matches!(
-            subscriber(directives(Some("invalid["), Some("info")), std::io::sink),
-            Err(LoggingError::Directives(_))
-        ));
-    }
-}

@@ -1,8 +1,6 @@
 //! One retry engine for HTTP failures, connection failures and interrupted items.
 use super::*;
 use std::sync::atomic::Ordering;
-use symbiotic_core::logging::REQUEST_ID_HEADER;
-use tracing::Instrument;
 
 struct AttemptLog<'a> {
     route: &'a str,
@@ -60,26 +58,28 @@ enum AnswerOutcome {
     Failure(Failure),
 }
 // Request-scoped telemetry only; admission and health keep their existing state.
-struct RequestLog {
+pub(super) struct RequestLog {
     total: Duration,
     cooldown: Duration,
-    route: String,
-    span: tracing::Span,
+    pub(super) route: Option<String>,
+    pub(super) span: tracing::Span,
     started_at: Instant,
-    outcome: String,
-    status: Option<u16>,
+    pub(super) outcome: String,
+    pub(super) status: Option<u16>,
     attempts: u32,
     // Start of the wait in progress, so cancellation still counts it.
     waiting_since: Option<Instant>,
 }
 impl RequestLog {
-    fn new(route: &Route, started_at: Instant) -> Self {
+    pub(super) fn new() -> Self {
+        let log_id = format!("local-{}", uuid::Uuid::new_v4());
         Self {
             total: Duration::ZERO,
             cooldown: Duration::ZERO,
-            route: route.config.name.clone(),
-            span: tracing::Span::current(),
-            started_at,
+            route: None,
+            // ERROR keeps correlation on warnings under a warn-only filter.
+            span: tracing::error_span!("model_request", request_id = %log_id),
+            started_at: Instant::now(),
             outcome: "cancelled".into(),
             status: None,
             attempts: 0,
@@ -403,48 +403,6 @@ impl Passthrough {
         Ok(rule)
     }
     pub(super) async fn forward(
-        &self,
-        initial: &Route,
-        request: Request,
-        original: Vec<u8>,
-        write: &mut (impl tokio::io::AsyncWrite + Unpin),
-    ) -> Result<()> {
-        let started_at = Instant::now();
-        let request_id = request
-            .headers
-            .iter()
-            .find(|(n, _)| n == REQUEST_ID_HEADER)
-            .map(|(_, v)| v);
-        let secrets = initial.secrets().await;
-        let invalid_id = request_id.is_some_and(|v| !safe_value(v, &secrets, 64));
-        let id = request_id
-            .filter(|_| !invalid_id)
-            .and_then(|v| std::str::from_utf8(v).ok());
-        let log_id = id
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("local-{}", uuid::Uuid::new_v4()));
-        // ERROR level keeps the span, and so the request ID, under a warn-only filter.
-        let span = tracing::error_span!("model_request", request_id = %log_id);
-        async {
-            let mut wait = RequestLog::new(initial, started_at);
-            if invalid_id {
-                wait.outcome = "request_id_invalid".into();
-                wait.status = Some(400);
-                return fixed(write, 400, "request_id_invalid", &[]).await;
-            }
-            let result = self
-                .forward_request(initial, &request, original, write, id, &mut wait)
-                .await;
-            if let Err(error) = &result {
-                // These errors carry only static diagnostics, never provider data.
-                wait.outcome = error.to_string();
-            }
-            result
-        }
-        .instrument(span)
-        .await
-    }
-    async fn forward_request(
         &self,
         initial: &Route,
         request: &Request,
@@ -901,7 +859,7 @@ impl Passthrough {
                         .iter()
                         .find(|r| &r.config.name == name)
                         .ok_or(EgressError::InvalidRequest)?;
-                    wait.route = route.config.name.clone();
+                    wait.route = Some(route.config.name.clone());
                     slot = None;
                     authentication = None;
                 }

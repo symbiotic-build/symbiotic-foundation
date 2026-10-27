@@ -2525,21 +2525,93 @@ async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn passthrough_unmatched_route_logs_one_refusal_with_code() {
-    let (capture, _subscriber) =
-        LogCapture::install("off,symbiotic_credential_process::passthrough=info");
-    let fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |_| {}).await;
-    let caller = harness.connect("/v1/unknown", b"{}", "").await;
-    assert_eq!(decoded(&read(caller).await).0, 404);
-    let lines = capture.lines();
-    let refused: Vec<_> = lines
-        .iter()
-        .filter(|line| line["message"] == "request refused")
-        .collect();
-    assert_eq!(refused.len(), 1, "{lines:?}");
-    assert_eq!(
-        (refused[0]["status"].as_u64(), refused[0]["code"].as_str()),
-        (Some(404), Some("route_not_found"))
-    );
+async fn passthrough_early_refusals_and_body_disconnect_log_one_completion() {
+    for (request, status, outcome, expected_id) in [
+        ("MALFORMED\r\n\r\n", Some(400), "invalid_request", None),
+        (
+            "POST /v1/unknown HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 0\r\nx-symbiotic-request-id: synthetic-request\r\n\r\n",
+            Some(404),
+            "route_not_found",
+            Some("synthetic-request"),
+        ),
+        (
+            "POST /v1/responses HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 3\r\nx-symbiotic-request-id: synthetic-request\r\n\r\nabc",
+            Some(413),
+            "request_too_large",
+            Some("synthetic-request"),
+        ),
+        (
+            "POST /v1/responses HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 2\r\nx-symbiotic-request-id: synthetic-request\r\n\r\n{",
+            None,
+            "cancelled",
+            Some("synthetic-request"),
+        ),
+    ] {
+        let (capture, _subscriber) =
+            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |config| {
+            config.passthrough.as_mut().unwrap().routes[0].max_request_bytes = 2;
+        })
+        .await;
+        let mut caller = UnixStream::connect(harness.path()).await.unwrap();
+        caller.write_all(request.as_bytes()).await.unwrap();
+        if let Some(status) = status {
+            caller.shutdown().await.unwrap();
+            let (actual, _, body) = decoded(&read(caller).await);
+            assert_eq!(
+                (actual, serde_json::from_slice::<Value>(&body).unwrap()),
+                (status, json!({"error":{"code":outcome}})),
+            );
+        } else {
+            // EOF before Content-Length bytes cancels body receipt, before forwarding.
+            drop(caller);
+        }
+        let lines = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let lines = capture.lines();
+                if lines
+                    .iter()
+                    .any(|line| line["message"] == "request completed")
+                {
+                    break lines;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("early exit must complete its request record");
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        assert_eq!(completed.len(), 1, "{lines:?}");
+        let completed = completed[0];
+        assert_eq!(
+            (
+                completed["outcome"].as_str(),
+                completed["status"].as_u64(),
+                completed["attempts"].as_u64(),
+                completed["queue_waited_ms"].as_u64()
+            ),
+            (Some(outcome), status.map(u64::from), Some(0), Some(0)),
+        );
+        if status.is_none() {
+            assert!(completed.get("status").is_none());
+        }
+        assert!(completed["elapsed_ms"].is_u64());
+        let id = completed["spans"][0]["request_id"].as_str().unwrap();
+        if let Some(expected) = expected_id {
+            assert_eq!(id, expected);
+        } else {
+            let uuid = uuid::Uuid::parse_str(id.strip_prefix("local-").unwrap()).unwrap();
+            assert_eq!(uuid.get_version_num(), 4);
+        }
+        for line in &lines {
+            assert_ne!(line["message"], "request refused");
+            assert_eq!(line["spans"][0]["name"], "model_request");
+            assert_eq!(line["spans"][0]["request_id"], id);
+        }
+        assert!(fixture.incoming.try_recv().is_err());
+    }
 }
