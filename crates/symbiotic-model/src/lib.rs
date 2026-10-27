@@ -6136,6 +6136,7 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
+        let spend = test_spend::ledger();
         let provider = QueuedChatProvider::new(
             SlowCountingChat::new(active, max_seen, calls.clone()),
             queue.clone(),
@@ -6153,7 +6154,7 @@ mod tests {
                 ..ModelQueueConfig::default()
             },
         )
-        .with_spend_ledger(test_spend::ledger(), None);
+        .with_spend_ledger(spend.clone(), None);
 
         let first = provider.chat(request.clone()).await.unwrap();
         assert_eq!(first.text, "same request");
@@ -6172,6 +6173,23 @@ mod tests {
         let cached = scope.join(format!("{request_hash}.json"));
         assert!(cached.is_file());
         std::fs::remove_file(&cached).unwrap();
+
+        // SlowCountingChat reports no usage, leaving spend Unknown even on success.
+        // Reconcile with synthetic charge evidence before allowing another dispatch.
+        let reference: SpendReceiptRef =
+            serde_json::from_value(first.trace.metadata["spend_receipt"].clone()).unwrap();
+        spend
+            .finish(
+                &reference,
+                SpendState::Settled,
+                Some(UsageTrace {
+                    input_tokens: Some(1),
+                    ..UsageTrace::default()
+                }),
+                None,
+                None,
+            )
+            .unwrap();
 
         let response = provider.chat(request).await.unwrap();
         assert_eq!(response.text, "same request");
