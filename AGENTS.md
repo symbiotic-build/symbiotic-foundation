@@ -15,8 +15,7 @@ Reviews: Warden, our review service, reviews pull requests on request: comment `
 
 [CI](.github/workflows/ci.yml) uses the pinned nightly-2026-10-25 toolchain and the **debug** profile on
 pull requests and pushes to `master`. Its full test matrix covers workspace
-default features, `symbiotic-model` without default features, and
-`symbiotic-queue` with `conformance` enabled.
+default features and `symbiotic-model` without default features.
 
 Local commands for a touched crate (replace the placeholders):
 

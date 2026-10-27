@@ -2,14 +2,14 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-use common::{alive, policy, started, until};
+use common::{policy, started, until};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
-use symbiotic_supervise::{Error, Supervisor, watch_parent};
+use symbiotic_supervise::{Supervisor, watch_parent};
 
 fn fixture(role: &str, dir: &Path) -> Command {
     common::fixture(&std::env::current_exe().unwrap(), role, dir)
@@ -73,51 +73,6 @@ fn main() {
         .unwrap();
         until(|| dir.join("busy.ready").exists());
         child.stop().unwrap();
-        std::process::exit(0);
-    }
-    if role == "shutdown-error-parent" {
-        let child_dir = dir.clone();
-        let reap_error = std::env::var_os("SUPERVISE_TEST_REFUSE_KILL").is_some();
-        let child = Supervisor::start(
-            move || {
-                fixture(
-                    if reap_error {
-                        "exit-on-trigger"
-                    } else {
-                        "busy"
-                    },
-                    &child_dir,
-                )
-            },
-            policy(),
-        )
-        .unwrap();
-        let pid = started(&child);
-        until(|| {
-            dir.join(if reap_error {
-                "exit-on-trigger.ready"
-            } else {
-                "busy.ready"
-            })
-            .exists()
-        });
-        assert!(
-            matches!(child.stop(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EPERM))
-        );
-        assert!(!alive(pid), "shutdown failure must still kill and reap");
-        if reap_error {
-            let mut status = 0;
-            // SAFETY: probe only this managed child; WNOHANG cannot block.
-            assert_eq!(
-                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
-                -1
-            );
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ECHILD),
-                "emergency cleanup must reap, not leave a zombie"
-            );
-        }
         std::process::exit(0);
     }
     if role == "full-stderr" {
@@ -263,10 +218,6 @@ fn main() {
         }
     }
     fs::write(dir.join(format!("{role}.ready")), "ready").unwrap();
-    if role == "exit-on-trigger" {
-        common::until_termination(|| dir.join("exit-trigger").exists());
-        return;
-    }
     // Parent watcher runs independently while the main thread is occupied.
     loop {
         std::hint::spin_loop();

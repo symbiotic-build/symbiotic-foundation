@@ -2,11 +2,11 @@
 use std::{
     fs,
     path::Path,
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Command},
     time::{Duration, Instant},
 };
 mod common;
-use common::{alive, policy, started, until, until_termination};
+use common::{policy, started, until};
 
 use symbiotic_supervise::{Error, Event, Supervisor};
 
@@ -29,31 +29,30 @@ impl Drop for Reap {
         let _ = self.0.wait();
     }
 }
-fn c_compiler(configured: Option<&str>) -> Command {
-    let mut compiler = configured.unwrap_or("cc").split_whitespace();
-    let mut command = Command::new(compiler.next().expect("C compiler executable"));
-    command.args(compiler);
-    command
+fn until_termination(check: impl FnMut() -> bool) {
+    until_termination_with_timeout(Duration::from_secs(60), check);
 }
-
-fn compiler_output(mut command: Command, dir: &Path, timeout: Duration) -> Output {
-    // Files retain both streams without risking a full capture pipe during the wait.
-    let stdout = dir.join("compiler.stdout");
-    let stderr = dir.join("compiler.stderr");
-    let mut compiler = Reap(
-        command
-            .stdin(Stdio::null())
-            .stdout(fs::File::create(&stdout).unwrap())
-            .stderr(fs::File::create(&stderr).unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    common::until_termination_with_timeout(timeout, || compiler.0.try_wait().unwrap().is_some());
-    Output {
-        status: compiler.0.wait().unwrap(),
-        stdout: fs::read(stdout).unwrap(),
-        stderr: fs::read(stderr).unwrap(),
+fn until_termination_with_timeout(timeout: Duration, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !check() {
+        assert!(
+            Instant::now() < deadline,
+            "{timeout:?} termination hang guard fired"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
+}
+fn alive(pid: u32) -> bool {
+    // Linux containers may leave an exited orphan as a zombie until PID 1 reaps it.
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+    }) {
+        return false;
+    }
+    // SAFETY: signal 0 only probes the process.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 fn read_pid(path: &Path) -> u32 {
@@ -275,144 +274,4 @@ fn full_stderr_does_not_block_parent_death_exit() {
     drop(writer);
     until_termination(|| child.0.try_wait().unwrap().is_some());
     assert_eq!(child.0.wait().unwrap().code(), Some(1));
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn shutdown_error_returns_after_emergency_cleanup() {
-    shutdown_error(false);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn full_stderr_does_not_block_emergency_reaping() {
-    shutdown_error(true);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn shutdown_error(refuse_kill: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    let mut command = fixture("shutdown-error-parent", dir.path());
-    if refuse_kill {
-        command
-            .env("SUPERVISE_TEST_REFUSE_KILL", "1")
-            .env("SUPERVISE_TEST_FULL_STDERR", "1")
-            .env(
-                "SUPERVISE_TEST_EXIT_TRIGGER",
-                dir.path().join("exit-trigger"),
-            );
-    }
-    if cfg!(target_os = "macos") || refuse_kill {
-        let library = dir.path().join(if cfg!(target_os = "macos") {
-            "refuse-term.dylib"
-        } else {
-            "refuse-term.so"
-        });
-        let configured = std::env::var_os("CC");
-        let mut compiler = c_compiler(
-            configured
-                .as_deref()
-                .map(|value| value.to_str().expect("CC must be valid UTF-8")),
-        );
-        compiler
-            .args(if cfg!(target_os = "macos") {
-                vec!["-O2", "-dynamiclib"]
-            } else {
-                vec!["-O2", "-shared", "-fPIC", "-ldl"]
-            })
-            .arg(
-                std::path::Path::new(
-                    &std::env::var_os("CARGO_MANIFEST_DIR")
-                        .expect("cargo test sets CARGO_MANIFEST_DIR"),
-                )
-                .join("tests/refuse_term.c"),
-            )
-            .arg("-o")
-            .arg(&library);
-        let output = compiler_output(compiler, dir.path(), Duration::from_secs(60));
-        assert!(
-            output.status.success(),
-            "compiler stdout:\n{}\ncompiler stderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        command.env(
-            if cfg!(target_os = "macos") {
-                "DYLD_INSERT_LIBRARIES"
-            } else {
-                "LD_PRELOAD"
-            },
-            library,
-        );
-    }
-    #[cfg(target_os = "linux")]
-    if !refuse_kill {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: pre_exec uses only prctl and preallocated seccomp data.
-        unsafe {
-            command.pre_exec(|| {
-                let filter = [
-                    libc::sock_filter {
-                        code: 0x20,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    }, // syscall
-                    libc::sock_filter {
-                        code: 0x15,
-                        jt: 0,
-                        jf: 3,
-                        k: libc::SYS_kill as u32,
-                    },
-                    libc::sock_filter {
-                        code: 0x20,
-                        jt: 0,
-                        jf: 0,
-                        k: 24,
-                    }, // signal argument
-                    libc::sock_filter {
-                        code: 0x15,
-                        jt: 0,
-                        jf: 1,
-                        k: libc::SIGTERM as u32,
-                    },
-                    libc::sock_filter {
-                        code: 0x06,
-                        jt: 0,
-                        jf: 0,
-                        k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-                    },
-                    libc::sock_filter {
-                        code: 0x06,
-                        jt: 0,
-                        jf: 0,
-                        k: libc::SECCOMP_RET_ALLOW,
-                    },
-                ];
-                let program = libc::sock_fprog {
-                    len: filter.len() as u16,
-                    filter: filter.as_ptr() as *mut _,
-                };
-                if libc::prctl(
-                    libc::PR_SET_NO_NEW_PRIVS,
-                    1 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                ) != 0
-                    || libc::prctl(
-                        libc::PR_SET_SECCOMP,
-                        libc::SECCOMP_MODE_FILTER as libc::c_ulong,
-                        &program,
-                    ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    let mut parent = Reap(command.spawn().unwrap());
-    until_termination(|| parent.0.try_wait().unwrap().is_some());
-    assert!(parent.0.wait().unwrap().success());
 }

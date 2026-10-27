@@ -34,32 +34,6 @@ pub(super) fn until(mut check: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
-pub(super) fn until_termination(check: impl FnMut() -> bool) {
-    until_termination_with_timeout(Duration::from_secs(60), check);
-}
-pub(super) fn until_termination_with_timeout(timeout: Duration, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while !check() {
-        assert!(
-            Instant::now() < deadline,
-            "{timeout:?} termination hang guard fired"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-pub(super) fn alive(pid: u32) -> bool {
-    // Linux containers may leave an exited orphan as a zombie until PID 1 reaps it.
-    #[cfg(target_os = "linux")]
-    if std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.rsplit_once(") ")
-            .is_some_and(|(_, fields)| fields.starts_with('Z'))
-    }) {
-        return false;
-    }
-    // SAFETY: signal 0 only probes the process.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
 pub(super) fn started(supervisor: &Supervisor) -> u32 {
     match supervisor.next_event().unwrap() {
         Event::Started(pid) => pid,
