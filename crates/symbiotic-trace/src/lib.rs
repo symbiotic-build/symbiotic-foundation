@@ -72,9 +72,8 @@ pub struct TimingTrace {
     pub total_ms: Option<u64>,
     /// Split of `queued_ms` (whose semantics are unchanged): `throttle_wait_ms`
     /// is time waiting on cooldowns/rate buckets, `queue_wait_ms` is the rest —
-    /// claim/lease wait plus any failed attempts on retries. Names match
-    /// `symbiotic_queue::QueueTelemetryAccumulator`. Absent on traces recorded
-    /// before the split existed.
+    /// claim/lease wait plus any failed attempts on retries. Absent on traces
+    /// recorded before the split existed.
     pub queue_wait_ms: Option<u64>,
     pub throttle_wait_ms: Option<u64>,
 }
@@ -181,26 +180,6 @@ impl TraceSink for FanoutTraceSink {
     async fn record_model_invocation(&self, trace: ModelInvocationTrace) -> Result<(), TraceError> {
         for sink in &self.sinks {
             sink.record_model_invocation(trace.clone()).await?;
-        }
-        Ok(())
-    }
-}
-
-pub struct FanoutQueueTraceSink {
-    sinks: Vec<Box<dyn QueueTraceSink>>,
-}
-
-impl FanoutQueueTraceSink {
-    pub fn new(sinks: Vec<Box<dyn QueueTraceSink>>) -> Self {
-        Self { sinks }
-    }
-}
-
-#[async_trait]
-impl QueueTraceSink for FanoutQueueTraceSink {
-    async fn record_queue_event(&self, trace: QueueEventTrace) -> Result<(), TraceError> {
-        for sink in &self.sinks {
-            sink.record_queue_event(trace.clone()).await?;
         }
         Ok(())
     }

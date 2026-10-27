@@ -306,21 +306,6 @@ impl State {
         reclaimed
     }
 
-    /// A waiting item whose attempts are all used is dead, not claimable.
-    fn retire_if_exhausted(&mut self, item_id: &str, now: DateTime<Utc>) -> Option<QueueItem> {
-        let item = self.items.get_mut(item_id)?;
-        if !matches!(item.status, QueueStatus::Pending | QueueStatus::Failed)
-            || item.attempt < item.max_attempts
-        {
-            return None;
-        }
-        item.updated_at = now;
-        item.last_error
-            .get_or_insert(symbiotic_core::DiagnosticCode::AttemptBudgetExhausted);
-        self.set_status(item_id, QueueStatus::Dead);
-        self.items.get(item_id).cloned()
-    }
-
     fn lease(
         &mut self,
         item_id: &str,
@@ -445,7 +430,7 @@ impl QueueBackend for MemoryQueue {
         }
         let now = Utc::now();
         let lease_until = lease_deadline(now, lease_seconds)?;
-        let (reclaimed, retired, claimed, missing) = {
+        let (reclaimed, claimed, missing) = {
             let mut state = self.lock()?;
             let queue_id = state
                 .items
@@ -460,9 +445,8 @@ impl QueueBackend for MemoryQueue {
             // Reclaiming can end other items and push the requested one out
             // of the terminal window.
             if !state.items.contains_key(&item_id.0) {
-                (reclaimed, None, None, true)
+                (reclaimed, None, true)
             } else {
-                let retired = state.retire_if_exhausted(&item_id.0, now);
                 let current = &state.items[&item_id.0];
                 let claimable =
                     matches!(current.status, QueueStatus::Pending | QueueStatus::Failed)
@@ -476,14 +460,10 @@ impl QueueBackend for MemoryQueue {
                     state.lease(&item_id.0, worker_id, lease_until, now);
                     state.items[&item_id.0].clone()
                 });
-                (reclaimed, retired, claimed, false)
+                (reclaimed, claimed, false)
             }
         };
         let mut events = lease_events(reclaimed);
-        events.extend(retired.map(|item| {
-            let error = item.last_error;
-            (item, error)
-        }));
         events.extend(claimed.iter().cloned().map(|item| (item, None)));
         self.emit(events).await;
         if missing {

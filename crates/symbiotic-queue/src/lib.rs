@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use symbiotic_core::{QueueId, QueueItemId};
 use thiserror::Error;
 
@@ -35,14 +34,6 @@ pub enum QueueStatus {
     Dead,
     /// Explicit terminal refusal; automatic retries and budget renewal are forbidden.
     Stopped,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct QueuePolicy {
-    pub queue_id: QueueId,
-    pub max_in_flight: usize,
-    pub lease_seconds: u64,
-    pub max_attempts: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,148 +260,4 @@ pub trait QueueBackend: Send + Sync {
 #[async_trait]
 pub trait QueueEventSink: Send + Sync {
     async fn record_queue_event(&self, event: QueueEvent);
-}
-
-/// Latency distribution over millisecond samples (nearest-rank percentiles).
-///
-/// Additive-only: `serde(default)` so persisted summaries keep loading as
-/// fields are added.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LatencyStats {
-    pub count: u64,
-    pub p50_ms: u64,
-    pub p95_ms: u64,
-    pub max_ms: u64,
-}
-
-impl LatencyStats {
-    pub fn from_samples(samples: &[u64]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        let mut sorted = samples.to_vec();
-        sorted.sort_unstable();
-        Self {
-            count: sorted.len() as u64,
-            p50_ms: nearest_rank(&sorted, 50),
-            p95_ms: nearest_rank(&sorted, 95),
-            max_ms: *sorted.last().expect("non-empty samples"),
-        }
-    }
-}
-
-/// Nearest-rank percentile over an ascending-sorted, non-empty sample set.
-fn nearest_rank(sorted: &[u64], percentile: u64) -> u64 {
-    let rank = (percentile * sorted.len() as u64).div_ceil(100).max(1);
-    sorted[(rank - 1) as usize]
-}
-
-/// Per-queue latency summary separating the three phases of a queued provider
-/// call: semaphore wait (`queue_wait`), rate-bucket wait (`throttle_wait`), and
-/// the provider HTTP call itself (`provider`). Throttle-wait vs http-time is
-/// the split that matters when diagnosing slow/serial queues — measure it here
-/// instead of reasoning from configured rates.
-///
-/// Additive-only: `serde(default)` so persisted summaries keep loading as
-/// fields are added.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct QueueTelemetrySummary {
-    pub queue_id: String,
-    pub queue_wait: LatencyStats,
-    pub throttle_wait: LatencyStats,
-    pub provider: LatencyStats,
-}
-
-#[derive(Clone, Debug, Default)]
-struct QueueTelemetrySamples {
-    queue_wait_ms: Vec<u64>,
-    throttle_wait_ms: Vec<u64>,
-    provider_ms: Vec<u64>,
-}
-
-/// Accumulates per-queue latency samples and folds them into
-/// [`QueueTelemetrySummary`] rows. Pure in-memory math, deliberately decoupled
-/// from any recorded trace type so hosts can feed it from whatever telemetry
-/// they already persist (JSONL queue events, timing traces, ...). Keyed by the
-/// plain queue-id string so both `QueueId` newtypes and raw strings fit.
-#[derive(Clone, Debug, Default)]
-pub struct QueueTelemetryAccumulator {
-    queues: BTreeMap<String, QueueTelemetrySamples>,
-}
-
-impl QueueTelemetryAccumulator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn observe_queue_wait(&mut self, queue_id: &str, ms: u64) {
-        self.samples(queue_id).queue_wait_ms.push(ms);
-    }
-
-    pub fn observe_throttle_wait(&mut self, queue_id: &str, ms: u64) {
-        self.samples(queue_id).throttle_wait_ms.push(ms);
-    }
-
-    pub fn observe_provider(&mut self, queue_id: &str, ms: u64) {
-        self.samples(queue_id).provider_ms.push(ms);
-    }
-
-    /// Summaries for every observed queue, ordered by queue id.
-    pub fn summaries(&self) -> Vec<QueueTelemetrySummary> {
-        self.queues
-            .iter()
-            .map(|(queue_id, samples)| QueueTelemetrySummary {
-                queue_id: queue_id.clone(),
-                queue_wait: LatencyStats::from_samples(&samples.queue_wait_ms),
-                throttle_wait: LatencyStats::from_samples(&samples.throttle_wait_ms),
-                provider: LatencyStats::from_samples(&samples.provider_ms),
-            })
-            .collect()
-    }
-
-    fn samples(&mut self, queue_id: &str) -> &mut QueueTelemetrySamples {
-        self.queues.entry(queue_id.to_string()).or_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn queue_telemetry_summaries_report_nearest_rank_percentiles() {
-        let mut accumulator = QueueTelemetryAccumulator::new();
-        for ms in 1..=100 {
-            accumulator.observe_throttle_wait("chat:deepseek:pro", ms);
-        }
-        accumulator.observe_provider("chat:deepseek:pro", 40);
-        accumulator.observe_provider("chat:deepseek:pro", 10);
-        accumulator.observe_provider("chat:deepseek:pro", 20);
-        accumulator.observe_queue_wait("chat:acme:other", 7);
-
-        let summaries = accumulator.summaries();
-        assert_eq!(summaries.len(), 2);
-        // Ordered by queue id.
-        assert_eq!(summaries[0].queue_id, "chat:acme:other");
-        assert_eq!(summaries[1].queue_id, "chat:deepseek:pro");
-
-        let deepseek = &summaries[1];
-        assert_eq!(deepseek.throttle_wait.count, 100);
-        assert_eq!(deepseek.throttle_wait.p50_ms, 50);
-        assert_eq!(deepseek.throttle_wait.p95_ms, 95);
-        assert_eq!(deepseek.throttle_wait.max_ms, 100);
-        assert_eq!(deepseek.provider.count, 3);
-        assert_eq!(deepseek.provider.p50_ms, 20);
-        assert_eq!(deepseek.provider.p95_ms, 40);
-        assert_eq!(deepseek.provider.max_ms, 40);
-        // No queue-wait samples observed for this queue: empty stats, not a panic.
-        assert_eq!(deepseek.queue_wait, LatencyStats::default());
-
-        let other = &summaries[0];
-        assert_eq!(other.queue_wait.count, 1);
-        assert_eq!(other.queue_wait.p50_ms, 7);
-        assert_eq!(other.queue_wait.p95_ms, 7);
-    }
 }
