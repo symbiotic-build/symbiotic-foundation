@@ -40,3 +40,8 @@ thiserror = "2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["fs", "macros", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Every reqwest client parses the system root bundle through this crate. Unoptimized,
+# that parse took most of the egress tests' CPU (12.75 s → 4.23 s on the build host).
+[profile.dev.package.rustls-pki-types]
+opt-level = 3

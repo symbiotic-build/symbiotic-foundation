@@ -1745,6 +1745,7 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
+                stream.set_nodelay(true).unwrap();
                 let mut buffer = Vec::new();
                 let mut chunk = [0u8; 4096];
                 let head_end = loop {
@@ -2452,14 +2453,18 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_classifier_cache_is_scoped_to_the_provider_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Some(dir.path().join("cache"));
         let queued = |provider: NamedClassifier| {
             QueuedClassifierProvider::new(
                 provider,
-                Arc::new(SqliteQueue::in_memory().unwrap()),
+                Arc::new(
+                    SqliteQueue::in_memory()
+                        .unwrap()
+                        .with_clock(crate::test_clock::clock()),
+                ),
                 "worker",
                 queue_config(cache.clone()),
             )
@@ -3248,7 +3253,7 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_classifier_reuses_exact_response_cache_and_traces() {
         let dir = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3259,7 +3264,11 @@ mod tests {
                 calls: calls.clone(),
                 failures: 0,
             },
-            Arc::new(SqliteQueue::in_memory().unwrap()),
+            Arc::new(
+                SqliteQueue::in_memory()
+                    .unwrap()
+                    .with_clock(crate::test_clock::clock()),
+            ),
             "worker",
             queue_config(Some(dir.path().join("cache"))),
         )
@@ -3289,7 +3298,7 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_classifier_retries_retryable_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider: Arc<dyn ClassifierProvider> = Arc::new(CountingClassifier {
@@ -3300,7 +3309,11 @@ mod tests {
         // An `Arc<dyn ClassifierProvider>` is itself a provider and can be queued.
         let queued = QueuedClassifierProvider::new(
             provider,
-            Arc::new(SqliteQueue::in_memory().unwrap()),
+            Arc::new(
+                SqliteQueue::in_memory()
+                    .unwrap()
+                    .with_clock(crate::test_clock::clock()),
+            ),
             "worker",
             queue_config(None),
         )
@@ -3314,7 +3327,7 @@ mod tests {
     }
 
     #[cfg(feature = "queue")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_classifier_traces_a_terminal_failure_with_its_typed_class() {
         let trace_sink = Arc::new(InMemoryTraceSink::default());
         let provider = QueuedClassifierProvider::new(
@@ -3323,7 +3336,11 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 failures: 1,
             },
-            Arc::new(SqliteQueue::in_memory().unwrap()),
+            Arc::new(
+                SqliteQueue::in_memory()
+                    .unwrap()
+                    .with_clock(crate::test_clock::clock()),
+            ),
             "worker",
             ModelQueueConfig {
                 logical_retry_attempts: 1,

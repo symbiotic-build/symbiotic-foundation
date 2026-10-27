@@ -371,6 +371,7 @@ impl RequestBudgetDispatch {
 
 struct Inner {
     config: ProcessConfig,
+    clock: registry::Clock,
     key: AdmissionKey,
     routes: HashMap<(String, String), RouteConfig>,
     registry: Mutex<Registry>,
@@ -395,6 +396,14 @@ impl CredentialProcess {
     /// Embedded callers must also call [`protect_process`] before reading configuration.
     /// For resolver sources, first initialize [`secrets::initialize_resolver_panic_hook`].
     pub fn open(config: ProcessConfig) -> Result<Self, EgressError> {
+        Self::open_with_clock(config, Arc::new(chrono::Utc::now))
+    }
+
+    /// Open with a trusted host clock for authorization, runtime and passthrough deadlines.
+    pub fn open_with_clock(
+        config: ProcessConfig,
+        clock: symbiotic_queue::jobs::JobClock,
+    ) -> Result<Self, EgressError> {
         #[cfg(unix)]
         protect_process().map_err(|_| EgressError::StateUnavailable)?;
         if config.version != PROTOCOL_VERSION {
@@ -421,6 +430,7 @@ impl CredentialProcess {
         let process_lock = lock_process(&config.state_dir)?;
         let key = AdmissionKey::new(config.admission_key.load(config.max_secret_bytes)?.to_vec())?;
         let runtime = Runtime::open(RuntimeConfig {
+            clock: clock.clone(),
             registry: configured_registry,
             state_dir: Some(config.state_dir.clone()),
             ..RuntimeConfig::default()
@@ -429,13 +439,19 @@ impl CredentialProcess {
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
-        let passthrough = passthrough::Passthrough::open(&config, &runtime)?;
+        let passthrough = passthrough::Passthrough::open(&config, &runtime, clock.clone())?;
         // Replay and ledger acceptance share the runtime operational database.
-        let registry =
-            Registry::open(&config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE))?;
+        let clock: registry::Clock = Arc::new(move || {
+            u64::try_from(clock().timestamp()).map_err(|_| EgressError::StateUnavailable)
+        });
+        let registry = Registry::open_with_clock(
+            &config.state_dir.join(symbiotic_ai_runtime::QUEUE_DATABASE),
+            clock.clone(),
+        )?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
+                clock,
                 key,
                 routes,
                 registry: Mutex::new(registry),
@@ -537,7 +553,7 @@ impl CredentialProcess {
             | Operation::PurgeOwner(signed) => self.jobs_operation(*signed).await,
             Operation::IssuePermit(signed) => {
                 self.inner.key.verify_attempt(&signed)?;
-                let foundation_now = registry::now()?;
+                let foundation_now = (self.inner.clock)()?;
                 // Release the registry mutex before invoking a tracing subscriber.
                 let existing = self
                     .inner
@@ -566,7 +582,7 @@ impl CredentialProcess {
                     .registry
                     .lock()
                     .map_err(|_| EgressError::StateUnavailable)?
-                    .attempt_status(&signed.attempt_id, registry::now()?)?;
+                    .attempt_status(&signed.attempt_id, (self.inner.clock)()?)?;
                 Ok(Reply::AttemptStatus(status))
             }
             Operation::PublishGrantRevision(signed) => {
@@ -601,7 +617,7 @@ impl CredentialProcess {
                     return Err(EgressError::Version);
                 }
                 self.inner.key.verify_attempt(&request.admission)?;
-                let foundation_now = registry::now()?;
+                let foundation_now = (self.inner.clock)()?;
                 let route = self.validate_attempt(&request.admission.attempt)?.clone();
                 validate_payload(&route, &request.payload)?;
                 if request.payload.digest()? != request.admission.attempt.input_digest {
@@ -672,7 +688,7 @@ impl CredentialProcess {
             .registry
             .lock()
             .map_err(|_| EgressError::StateUnavailable)?
-            .purge_expired(registry::now()?)
+            .purge_expired((self.inner.clock)()?)
     }
 
     fn validate_attempt(&self, a: &DurableAttempt) -> Result<&RouteConfig, EgressError> {

@@ -6,6 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use symbiotic_core::DiagnosticCode;
 use symbiotic_model::{DirResponseCache, ModelError};
+use symbiotic_queue::QueueBackend;
 use symbiotic_queue_sqlite::SqliteQueue;
 use tokio::sync::watch;
 
@@ -50,7 +51,7 @@ impl Sweep {
         self.responses
             .cache
             .prune(self.responses.max_age, self.responses.max_bytes)?;
-        let cutoff = chrono::Utc::now() - self.retention;
+        let cutoff = self.queue.now() - self.retention;
         self.queue
             .retire_stale_active(cutoff, ORPHANED)
             .and_then(|_| self.queue.prune_terminal_before(cutoff))
@@ -295,24 +296,41 @@ mod tests {
         let ledger = crate::spend::SqliteSpendLedger::open(&path)
             .unwrap()
             .with_retention(Duration::from_secs(60));
-        for n in 0..129 {
-            let r = SpendReservation {
-                reference: SpendReceiptRef::new(format!("paid-{n}")).unwrap(),
-                account: "account".into(),
-                invocation: format!("explicit-{n}"),
-                binding: "input".into(),
-                request_limit: None,
-            };
-            ledger.reserve_explicit(&r, 3).unwrap();
-            ledger
-                .finish(
+        // Commit the 129-row setup once; maintenance still drains the real file.
+        {
+            let mut conn = ledger.0.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            for n in 0..129 {
+                let r = SpendReservation {
+                    reference: SpendReceiptRef::new(format!("paid-{n}")).unwrap(),
+                    account: "account".into(),
+                    invocation: format!("explicit-{n}"),
+                    binding: "input".into(),
+                    request_limit: None,
+                };
+                crate::spend::SqliteSpendLedger::reserve_with_limit_in(&tx, &r, Some(3), false)
+                    .unwrap();
+                let output = Some(serde_json::json!({"answer":"private"}));
+                crate::spend::SqliteSpendLedger::save_recovery_in(
+                    &tx,
+                    &r.reference,
+                    &output,
+                    Duration::from_secs(60),
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                crate::spend::SqliteSpendLedger::finish_in(
+                    &tx,
                     &r.reference,
                     SpendState::Unknown,
                     None,
-                    Some(serde_json::json!({"answer":"private"})),
-                    None,
+                    output,
                 )
                 .unwrap();
+            }
+            tx.commit().unwrap();
         }
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute(

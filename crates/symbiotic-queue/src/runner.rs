@@ -2,7 +2,6 @@
 
 use crate::{QueueBackend, jobs::*};
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use symbiotic_core::DiagnosticCode;
@@ -170,8 +169,14 @@ impl Shared {
     }
 
     async fn op(&self, request: JobRequest) -> Result<JobResponse, JobError> {
+        let backend = self.backend.clone();
         self.backend
-            .jobs(&self.scope, &self.jobs, Arc::new(Utc::now), request)
+            .jobs(
+                &self.scope,
+                &self.jobs,
+                Arc::new(move || backend.now()),
+                request,
+            )
             .await
     }
 

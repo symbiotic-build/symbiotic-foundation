@@ -17,7 +17,7 @@ use std::{
 
 // Queued diagnostics beyond this are dropped while stderr does not drain.
 const DIAGNOSTIC_QUEUE: usize = 16;
-// The parent-death watcher waits at most this long for its diagnostic before exit.
+// Default wait for the parent-death diagnostic before exit.
 const EXIT_DIAGNOSTIC_WAIT: Duration = Duration::from_secs(1);
 
 type Diagnostic = (Vec<u8>, Option<mpsc::SyncSender<()>>);
@@ -32,12 +32,11 @@ pub(crate) fn diagnostic(message: std::fmt::Arguments<'_>) {
     queue_diagnostic(message, None);
 }
 
-/// Like `diagnostic`, but waits up to `EXIT_DIAGNOSTIC_WAIT` for the write
-/// because the process exits next and the writer thread ends with it.
-fn diagnostic_before_exit(message: std::fmt::Arguments<'_>) {
+/// Like `diagnostic`, but waits for the supplied duration before process exit.
+fn diagnostic_before_exit(message: std::fmt::Arguments<'_>, wait: Duration) {
     let (written, done) = mpsc::sync_channel(1);
     if queue_diagnostic(message, Some(written)) {
-        let _ = done.recv_timeout(EXIT_DIAGNOSTIC_WAIT);
+        let _ = done.recv_timeout(wait);
     }
 }
 
@@ -315,6 +314,16 @@ unsafe fn arm_parent_death(parent: libc::pid_t) -> io::Result<()> {
 pub fn watch_parent(
     cleanup: impl FnOnce() -> io::Result<()> + Send + 'static,
 ) -> Result<(), Error> {
+    watch_parent_with_diagnostic_wait(cleanup, EXIT_DIAGNOSTIC_WAIT)
+}
+
+/// Watch the parent pipe with a host-supplied wait for the final failure diagnostic.
+/// Cleanup runs before this wait. A blocked stderr cannot delay exit beyond it.
+/// The pipe validation, cleanup and exit codes follow [`watch_parent`].
+pub fn watch_parent_with_diagnostic_wait(
+    cleanup: impl FnOnce() -> io::Result<()> + Send + 'static,
+    diagnostic_wait: Duration,
+) -> Result<(), Error> {
     let fd: i32 = std::env::var(PARENT_FD)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -351,7 +360,10 @@ pub fn watch_parent(
                 }
             };
             if let Err(error) = cleanup() {
-                diagnostic_before_exit(format_args!("parent-death cleanup failed: {error}"));
+                diagnostic_before_exit(
+                    format_args!("parent-death cleanup failed: {error}"),
+                    diagnostic_wait,
+                );
                 std::process::exit(1);
             }
             std::process::exit(code);

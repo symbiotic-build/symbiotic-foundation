@@ -35,6 +35,7 @@ zeroize = "1"
 libc = "0.2"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rusqlite.workspace = true
 # Tests run the queued providers on the SQLite backend.
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }

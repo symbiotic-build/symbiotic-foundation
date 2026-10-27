@@ -24,6 +24,7 @@ pub const DEFAULT_RETAINED_TERMINAL_ITEMS: usize = 10_000;
 pub struct MemoryQueue {
     state: Arc<Mutex<State>>,
     event_sink: Option<Arc<dyn QueueEventSink>>,
+    clock: crate::jobs::JobClock,
 }
 
 #[derive(Default)]
@@ -58,7 +59,14 @@ impl MemoryQueue {
                 ..State::default()
             })),
             event_sink: None,
+            clock: Arc::new(Utc::now),
         }
+    }
+
+    /// Use a trusted host clock for queue deadlines and events.
+    pub fn with_clock(mut self, clock: crate::jobs::JobClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn with_event_sink(mut self, sink: Arc<dyn QueueEventSink>) -> Self {
@@ -92,7 +100,7 @@ impl MemoryQueue {
                 kind: item.kind,
                 status: item.status,
                 attempt: item.attempt,
-                timestamp: Utc::now(),
+                timestamp: self.now(),
                 error,
             })
             .await;
@@ -111,7 +119,7 @@ impl MemoryQueue {
                 symbiotic_core::DiagnosticCode::QueueItemKindMustNotBeEmpty,
             ));
         }
-        let now = Utc::now();
+        let now = self.now();
         let item = {
             let mut state = self.lock()?;
             if let Some(key) = &request.idempotency_key
@@ -186,7 +194,7 @@ impl MemoryQueue {
         worker_id: &str,
         update: impl FnOnce(&mut State, DateTime<Utc>) -> Result<(), QueueError>,
     ) -> Result<QueueItem, QueueError> {
-        let now = Utc::now();
+        let now = self.now();
         let mut state = self.lock()?;
         let current = state.items.get(&item_id.0).ok_or({
             QueueError::NotFound(symbiotic_core::DiagnosticCode::InvalidConfiguration)
@@ -341,6 +349,10 @@ fn lease_events(items: Vec<QueueItem>) -> Vec<(QueueItem, Option<symbiotic_core:
 
 #[async_trait]
 impl QueueBackend for MemoryQueue {
+    fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
+    }
+
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.enqueue_inner(request, None).await
     }
@@ -360,7 +372,7 @@ impl QueueBackend for MemoryQueue {
                 symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
-        let now = Utc::now();
+        let now = self.now();
         let lease_until = lease_deadline(now, request.lease_seconds)?;
         let (reclaimed, claimed) = {
             let mut state = self.lock()?;
@@ -368,7 +380,7 @@ impl QueueBackend for MemoryQueue {
             if state
                 .cooldowns
                 .get(queue_id)
-                .is_some_and(|until| *until > Utc::now())
+                .is_some_and(|until| *until > self.now())
             {
                 return Ok(Vec::new());
             }
@@ -428,7 +440,7 @@ impl QueueBackend for MemoryQueue {
                 symbiotic_core::DiagnosticCode::WorkerIdMustNotBeEmpty,
             ));
         }
-        let now = Utc::now();
+        let now = self.now();
         let lease_until = lease_deadline(now, lease_seconds)?;
         let (reclaimed, claimed, missing) = {
             let mut state = self.lock()?;
@@ -454,7 +466,7 @@ impl QueueBackend for MemoryQueue {
                         && state
                             .cooldowns
                             .get(&queue_id)
-                            .is_none_or(|until| *until <= Utc::now())
+                            .is_none_or(|until| *until <= self.now())
                         && max_in_flight.is_none_or(|cap| state.running_count(&queue_id) < cap);
                 let claimed = claimable.then(|| {
                     state.lease(&item_id.0, worker_id, lease_until, now);
@@ -523,7 +535,7 @@ impl QueueBackend for MemoryQueue {
         retry_after_seconds: Option<u64>,
     ) -> Result<FailOutcome, QueueError> {
         let run_after =
-            Utc::now() + ChronoDuration::seconds(retry_after_seconds.unwrap_or(1) as i64);
+            self.now() + ChronoDuration::seconds(retry_after_seconds.unwrap_or(1) as i64);
         self.fail_with(
             item_id,
             worker_id,
@@ -574,7 +586,7 @@ impl QueueBackend for MemoryQueue {
     }
 
     async fn reclaim_expired_leases(&self, queue_id: &QueueId) -> Result<usize, QueueError> {
-        let reclaimed = self.lock()?.reclaim_expired(&queue_id.0, Utc::now());
+        let reclaimed = self.lock()?.reclaim_expired(&queue_id.0, self.now());
         let count = reclaimed.len();
         self.emit(lease_events(reclaimed)).await;
         Ok(count)
@@ -602,9 +614,12 @@ impl QueueBackend for MemoryQueue {
 }
 
 #[cfg(test)]
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn request(key: &str) -> EnqueueRequest {
         EnqueueRequest {
@@ -668,9 +683,9 @@ mod tests {
         assert_eq!(duplicate.item.item_id, second.item_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn claiming_an_item_evicted_by_reclamation_is_not_found_and_keeps_the_queue_usable() {
-        let queue = MemoryQueue::with_terminal_retention(1);
+        let queue = MemoryQueue::with_terminal_retention(1).with_clock(test_clock::clock());
         let finished = run_to_success(&queue, "finished").await;
         let mut crashing = request("crashing");
         crashing.max_attempts = Some(1);
@@ -701,20 +716,52 @@ mod tests {
         run_to_success(&queue, "after").await;
     }
 
-    struct CountingSink(AtomicUsize);
+    struct RecordingSink(Mutex<Vec<QueueEvent>>);
 
     #[async_trait]
-    impl QueueEventSink for CountingSink {
-        async fn record_queue_event(&self, _event: QueueEvent) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+    impl QueueEventSink for RecordingSink {
+        async fn record_queue_event(&self, event: QueueEvent) {
+            self.0.lock().unwrap().push(event);
         }
     }
 
     #[tokio::test]
     async fn event_sink_receives_transitions() {
-        let sink = Arc::new(CountingSink(AtomicUsize::new(0)));
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
         let queue = MemoryQueue::new().with_event_sink(sink.clone());
-        run_to_success(&queue, "event").await;
-        assert_eq!(sink.0.load(Ordering::SeqCst), 3);
+        let item_id = run_to_success(&queue, "event").await;
+        let events = sink.0.lock().unwrap();
+        let transitions: Vec<_> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.item_id.clone(),
+                    event.queue_id.clone(),
+                    event.kind.as_str(),
+                    event.status,
+                    event.attempt,
+                    event.error,
+                )
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            [
+                QueueStatus::Pending,
+                QueueStatus::Running,
+                QueueStatus::Succeeded
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| (
+                item_id.clone(),
+                QueueId::new("chat:test:model"),
+                "chat",
+                status,
+                u32::from(index > 0),
+                None,
+            ))
+            .collect::<Vec<_>>()
+        );
     }
 }

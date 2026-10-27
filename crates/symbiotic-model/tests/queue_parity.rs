@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use symbiotic_core::{ModelIdentity, QueueId, QueueItemId, TraceId};
 use symbiotic_model::{
     CacheEntry, ChatMessage, ChatProvider, ChatRequest, ChatResponse, InMemoryReceiptSink,
@@ -24,6 +24,7 @@ use symbiotic_queue_sqlite::SqliteQueue;
 use symbiotic_trace::{
     CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
+use tokio::time::Instant;
 
 static MODEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -34,6 +35,13 @@ fn unique_identity() -> ModelIdentity {
         "loopback",
         format!("parity-{}", MODEL_COUNTER.fetch_add(1, Ordering::SeqCst)),
     )
+}
+
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
+
+fn memory_queue() -> MemoryQueue {
+    MemoryQueue::new().with_clock(test_clock::clock())
 }
 
 fn config() -> ModelQueueConfig {
@@ -221,7 +229,7 @@ fn queued_with_cache(
 
 #[tokio::test]
 async fn providers_sharing_admission_share_one_model_cap() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let admission = ModelAdmission::new();
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(20));
     let policy = ModelQueueConfig {
@@ -249,7 +257,7 @@ async fn providers_sharing_admission_share_one_model_cap() {
 
 #[tokio::test]
 async fn a_second_cap_for_an_admitted_model_is_a_configuration_error() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let admission = ModelAdmission::new();
     let raw = Loopback::new(unique_identity());
     let two = queued(
@@ -278,7 +286,7 @@ async fn a_second_cap_for_an_admitted_model_is_a_configuration_error() {
 #[tokio::test]
 async fn receipts_cover_each_step_and_a_cache_hit_keeps_the_original_receipt() {
     let dir = tempfile::tempdir().unwrap();
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let sink = Arc::new(InMemoryReceiptSink::default());
     let raw = Loopback::new(unique_identity());
     let provider = queued(
@@ -329,7 +337,7 @@ async fn receipts_cover_each_step_and_a_cache_hit_keeps_the_original_receipt() {
 
 #[tokio::test]
 async fn retry_base_delay_allows_sub_second_backoff_and_receipts_record_the_failure() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let sink = Arc::new(InMemoryReceiptSink::default());
     let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Unavailable(
         symbiotic_core::DiagnosticCode::HttpUnavailable,
@@ -360,7 +368,7 @@ async fn retry_base_delay_allows_sub_second_backoff_and_receipts_record_the_fail
 
 #[tokio::test]
 async fn provider_errors_retry_only_when_the_policy_opts_in() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let strict = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
         symbiotic_core::DiagnosticCode::ProviderFailure,
     )]);
@@ -443,6 +451,9 @@ impl EvictsOnce {
 
 #[async_trait]
 impl QueueBackend for EvictsOnce {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        self.inner.now()
+    }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.inner.enqueue(request).await
     }
@@ -541,7 +552,7 @@ async fn an_evicted_queue_item_is_queued_again_instead_of_failing() {
 #[tokio::test]
 async fn request_debug_capture_writes_the_serialized_request() {
     let dir = tempfile::tempdir().unwrap();
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let raw = Loopback::new(unique_identity());
     queued(
         raw,
@@ -613,7 +624,7 @@ impl ResponseCache for TextKeyedCache {
 
 #[tokio::test]
 async fn a_host_response_cache_answers_before_the_queue() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let raw = Loopback::new(unique_identity());
     let cache = Arc::new(TextKeyedCache::default());
     let provider = queued(raw.clone(), queue, config()).with_response_cache(cache.clone());
@@ -635,7 +646,7 @@ async fn a_host_response_cache_answers_before_the_queue() {
 
 #[tokio::test]
 async fn known_zero_retries_stop_at_an_uncertain_timeout() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue: Arc<dyn QueueBackend> = Arc::new(memory_queue());
     let raw = Loopback::new(unique_identity()).failing_first(vec![
         ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
         ModelError::RateLimited(symbiotic_core::DiagnosticCode::HttpRateLimited),
@@ -682,7 +693,7 @@ impl symbiotic_model::ClassifierProvider for CountingClassifier {
 #[tokio::test]
 async fn an_invalid_classify_request_takes_no_queue_slot() {
     use symbiotic_model::ClassifierProvider as _;
-    let queue = Arc::new(MemoryQueue::new());
+    let queue = Arc::new(memory_queue());
     let raw = CountingClassifier {
         inner: symbiotic_model::StaticClassifierProvider::new([
             symbiotic_model::ClassifierAnswer::noul("goal", 0.7),
@@ -723,7 +734,7 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     };
 
     let kept = down();
-    let provider = queued_with_cache(kept.clone(), Arc::new(MemoryQueue::new()), once.clone());
+    let provider = queued_with_cache(kept.clone(), Arc::new(memory_queue()), once.clone());
     provider.chat(request("same")).await.unwrap_err();
     let err = provider.chat(request("same")).await.unwrap_err();
     assert!(matches!(
@@ -735,7 +746,7 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     let renewed = down();
     let provider = queued_with_cache(
         renewed.clone(),
-        Arc::new(MemoryQueue::new()),
+        Arc::new(memory_queue()),
         ModelQueueConfig {
             budget_renewal_seconds: Some(0),
             ..once
@@ -750,15 +761,15 @@ async fn an_exhausted_budget_blocks_repeats_unless_the_policy_renews_it() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
-    let queue: Arc<dyn QueueBackend> = Arc::new(MemoryQueue::new());
+    let queue = counted(Arc::new(memory_queue()));
     let raw = Loopback::new(unique_identity()).failing_first(vec![ModelError::Provider(
         symbiotic_core::DiagnosticCode::ProviderFailure,
     )]);
     let provider = queued(
         raw.clone(),
-        queue,
+        queue.clone(),
         ModelQueueConfig {
             retry_base_delay_ms: 1_500,
             retry_provider_errors: true,
@@ -772,14 +783,33 @@ async fn a_retry_waits_the_whole_delay_for_every_caller_of_the_request() {
     .with_invocation("retry-waiters".into());
     // Two callers of the same request: one runs the failing attempt, the
     // other waits on the same queue item.
-    let (first, second) = tokio::join!(
-        provider.chat(request("fractional")),
-        provider.chat(request("fractional"))
+    let queue_id = raw.descriptor.queue_id();
+    let began = tokio::time::Instant::now();
+    queue
+        .note_cooldown(&queue_id, queue.now() + chrono::Duration::milliseconds(100))
+        .await
+        .unwrap();
+    let caller = provider.clone();
+    let first = tokio::spawn(async move { caller.chat(request("fractional")).await });
+    // Observe the real backend's deadline read before extending the sleeping request.
+    queue.cooldown_read.notified().await;
+    let extended = queue.now() + chrono::Duration::milliseconds(250);
+    queue.note_cooldown(&queue_id, extended).await.unwrap();
+    // Drive the caller through the original deadline before checking for early dispatch.
+    tokio::time::sleep(Duration::from_millis(249)).await;
+    assert!(
+        raw.starts.lock().unwrap().is_empty(),
+        "dispatch preceded the extended cooldown"
     );
-    first.unwrap();
-    second.unwrap();
+    let (first, second) = tokio::join!(first, provider.chat(request("fractional")));
+    assert_eq!(first.unwrap().unwrap().text, "fractional");
+    assert_eq!(second.unwrap().text, "fractional");
     let starts = raw.starts.lock().unwrap().clone();
     assert!(starts.len() >= 2, "{starts:?}");
+    assert!(
+        starts[0].duration_since(began) >= Duration::from_millis(250),
+        "dispatch preceded the extended cooldown"
+    );
     let waited = starts[1].duration_since(starts[0]);
     assert!(
         waited >= Duration::from_millis(1_490),
@@ -800,6 +830,9 @@ struct PausesOneEnqueue {
 
 #[async_trait]
 impl QueueBackend for PausesOneEnqueue {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        self.inner.now()
+    }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         let outcome = self.inner.enqueue(request).await;
         if self.armed.swap(false, Ordering::SeqCst) {
@@ -869,10 +902,10 @@ impl QueueBackend for PausesOneEnqueue {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_delayed_caller_cannot_renew_over_a_budget_renewed_meanwhile() {
     let backend = Arc::new(PausesOneEnqueue {
-        inner: MemoryQueue::new(),
+        inner: memory_queue(),
         armed: std::sync::atomic::AtomicBool::new(false),
         reached: tokio::sync::Notify::new(),
         resume: tokio::sync::Notify::new(),
@@ -952,6 +985,7 @@ struct CountsRenewals {
     heartbeat_entered: tokio::sync::Notify,
     completion_state: AtomicUsize,
     running_read: tokio::sync::Notify,
+    cooldown_read: tokio::sync::Notify,
     pause_claim: std::sync::atomic::AtomicBool,
     claim_reached: tokio::sync::Notify,
     resume_claim: tokio::sync::Notify,
@@ -977,38 +1011,30 @@ fn counted(inner: Arc<dyn QueueBackend>) -> Arc<CountsRenewals> {
         heartbeat_entered: tokio::sync::Notify::new(),
         completion_state: AtomicUsize::new(0),
         running_read: tokio::sync::Notify::new(),
+        cooldown_read: tokio::sync::Notify::new(),
         pause_claim: std::sync::atomic::AtomicBool::new(false),
         claim_reached: tokio::sync::Notify::new(),
         resume_claim: tokio::sync::Notify::new(),
     })
 }
 
-/// One test per backend for each scenario below.
-macro_rules! on_both_backends {
+/// Wrapper behavior is backend-independent; backend contracts have their own conformance suite.
+macro_rules! on_memory_backend {
     ($($scenario:ident),* $(,)?) => {
         mod memory {
             use super::*;
             $(
-                #[tokio::test]
+                #[tokio::test(start_paused = true)]
                 async fn $scenario() {
-                    super::$scenario("memory", counted(Arc::new(MemoryQueue::new()))).await;
+                    super::$scenario("memory", counted(Arc::new(memory_queue()))).await;
                 }
             )*
         }
-        mod sqlite {
-            use super::*;
-            $(
-                #[tokio::test]
-                async fn $scenario() {
-                    let queue = SqliteQueue::in_memory().unwrap();
-                    super::$scenario("sqlite", counted(Arc::new(queue))).await;
-                }
-            )*
-        }
+
     };
 }
 
-on_both_backends!(
+on_memory_backend!(
     close_storage_failures_preserve_provider_error,
     post_claim_recovery_errors_release_capacity_without_changing_accounting,
     an_abandoned_call_completes_and_answers_the_next_identical_request,
@@ -1051,6 +1077,9 @@ on_both_backends!(
 
 #[async_trait]
 impl QueueBackend for CountsRenewals {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        self.inner.now()
+    }
     async fn enqueue(&self, request: EnqueueRequest) -> Result<EnqueueOutcome, QueueError> {
         self.inner.enqueue(request).await
     }
@@ -1186,7 +1215,9 @@ impl QueueBackend for CountsRenewals {
         &self,
         queue_id: &QueueId,
     ) -> Result<Option<chrono::DateTime<Utc>>, QueueError> {
-        self.inner.cooldown_until(queue_id).await
+        let result = self.inner.cooldown_until(queue_id).await;
+        self.cooldown_read.notify_one();
+        result
     }
     async fn note_cooldown(
         &self,
@@ -1400,14 +1431,27 @@ async fn an_abandoned_call_keeps_its_model_slot_until_it_finishes(
     queue: Arc<CountsRenewals>,
 ) {
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(1_000));
-    let provider =
-        queued(raw.clone(), queue.clone(), leased()).with_admission(ModelAdmission::new());
+    let receipts = Arc::new(InMemoryReceiptSink::default());
+    let provider = queued(raw.clone(), queue.clone(), leased())
+        .with_admission(ModelAdmission::new())
+        .with_receipt_sink(receipts.clone());
 
     abandon(&provider, "first", Duration::from_millis(300)).await;
-    tokio::time::timeout(Duration::from_secs(5), provider.chat(request("second")))
+    let answer = tokio::time::timeout(Duration::from_secs(5), provider.chat(request("second")))
         .await
         .unwrap_or_else(|_| panic!("{backend}: the next call gets the model's slot"))
         .unwrap();
+    assert_eq!(answer.text, "second", "{backend}");
+    let first = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.status,
+        QueueStatus::Succeeded,
+        "{backend}: the abandoned call finishes before releasing its slot"
+    );
     assert_eq!(raw.calls.load(Ordering::SeqCst), 2, "{backend}");
     assert_eq!(
         raw.peak.load(Ordering::SeqCst),
@@ -1441,22 +1485,34 @@ async fn a_provider_panic_reaches_its_caller_and_ends_lease_renewal(
     backend: &str,
     queue: Arc<CountsRenewals>,
 ) {
+    let receipts = Arc::new(InMemoryReceiptSink::default());
     let provider = QueuedChatProvider::new(
         PanicsMidCall {
             descriptor: Loopback::new(unique_identity()).descriptor,
-            delay: Duration::from_millis(1_600),
+            delay: Duration::from_millis(4_200),
         },
         queue.clone(),
         "worker",
         leased(),
     )
-    .with_spend_ledger(test_spend::ledger(), None);
+    .with_spend_ledger(test_spend::ledger(), None)
+    .with_receipt_sink(receipts.clone());
     let call = tokio::spawn(async move { provider.chat(request("boom")).await });
     let err = call.await.expect_err("the call panics");
     assert!(err.is_panic(), "{backend}: {err:?}");
+    let item = queue
+        .get_item(&queued_item(&receipts))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        item.status,
+        QueueStatus::Running,
+        "{backend}: panic leaves the claim for recovery"
+    );
     assert!(
-        queue.renewals() >= 1,
-        "{backend}: the lease is renewed while the provider works"
+        item.lease_until.unwrap() > queue.now(),
+        "{backend}: renewal kept the claim alive beyond its original three-second lease"
     );
     assert_no_more_renewals(&queue, backend).await;
 }
@@ -1490,7 +1546,11 @@ async fn provider_panic_drains_a_contended_sqlite_heartbeat_before_propagating()
     tokio::time::timeout(Duration::from_secs(5), async {
         let dir = tempfile::tempdir_in(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).unwrap();
         let path = dir.path().join("queue.sqlite");
-        let queue = counted(Arc::new(SqliteQueue::open(&path).unwrap()));
+        let queue = counted(Arc::new(
+            SqliteQueue::open(&path)
+                .unwrap()
+                .with_clock(test_clock::clock()),
+        ));
         let entered = Arc::new(tokio::sync::Notify::new());
         let panic_now = Arc::new(tokio::sync::Notify::new());
         let panicked = Arc::new(tokio::sync::Notify::new());
@@ -1521,6 +1581,10 @@ async fn provider_panic_drains_a_contended_sqlite_heartbeat_before_propagating()
             released
         });
         locked_rx.await.unwrap();
+        // The real lock holder is ready before virtual time reaches the heartbeat.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
         queue.heartbeat_entered.notified().await;
         panic_now.notify_one();
         panicked.notified().await;
@@ -1548,6 +1612,40 @@ async fn provider_panic_drains_a_contended_sqlite_heartbeat_before_propagating()
     })
     .await
     .expect("contended provider panic test exceeded its bound");
+}
+
+/// A synchronous collaborator held until the test has exercised lease renewal.
+#[derive(Default)]
+struct BlockingGate {
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+impl BlockingGate {
+    fn wait(&self) {
+        self.entered.notify_one();
+        let (released, _) = self
+            .wake
+            .wait_timeout_while(
+                self.released.lock().unwrap(),
+                Duration::from_secs(5),
+                |released| !*released,
+            )
+            .unwrap();
+        assert!(*released, "blocking fixture was not released");
+    }
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+async fn advance_while_blocked(duration: Duration) {
+    // Advance through each heartbeat deadline while a blocking collaborator is parked.
+    for _ in 0..duration.as_millis().div_ceil(100) {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+    }
 }
 
 /// A trace sink whose first write takes `delay`.
@@ -1904,8 +2002,8 @@ async fn failed_cooldown_is_terminal(
 /// The directory cache, whose first store blocks its thread for `delay`, as
 /// a slow disk would.
 struct SlowFirstStore {
+    gate: Arc<BlockingGate>,
     inner: symbiotic_model::DirResponseCache,
-    delay: Duration,
     slowed: std::sync::atomic::AtomicBool,
 }
 
@@ -1916,7 +2014,7 @@ impl ResponseCache for SlowFirstStore {
 
     fn store(&self, entry: &CacheEntry<'_>, response: &Value) -> Result<(), ModelError> {
         if !self.slowed.swap(true, Ordering::SeqCst) {
-            std::thread::sleep(self.delay);
+            self.gate.wait();
         }
         self.inner.store(entry, response)
     }
@@ -1927,6 +2025,7 @@ async fn a_slow_cache_write_keeps_the_lease_until_the_item_completes(
     queue: Arc<CountsRenewals>,
 ) {
     let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(BlockingGate::default());
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(100));
     let queue_id = raw.descriptor.queue_id();
     let receipts = Arc::new(InMemoryReceiptSink::default());
@@ -1941,8 +2040,8 @@ async fn a_slow_cache_write_keeps_the_lease_until_the_item_completes(
     )
     .with_receipt_sink(receipts.clone())
     .with_response_cache(Arc::new(SlowFirstStore {
+        gate: gate.clone(),
         inner: symbiotic_model::DirResponseCache::new(dir.path()),
-        delay: Duration::from_millis(4_000),
         slowed: std::sync::atomic::AtomicBool::new(false),
     }));
 
@@ -1950,9 +2049,12 @@ async fn a_slow_cache_write_keeps_the_lease_until_the_item_completes(
         let provider = provider.clone();
         async move { provider.chat(request("stored")).await }
     });
+    gate.entered.notified().await;
+    advance_while_blocked(Duration::from_millis(3_500)).await;
+    let reclaimed = queue.reclaim_expired_leases(&queue_id).await.unwrap();
+    gate.release();
     assert_eq!(
-        reclaimable_after_the_lease(&queue, &queue_id).await,
-        0,
+        reclaimed, 0,
         "{backend}: the lease expired while the response was stored"
     );
     let answer = tokio::time::timeout(Duration::from_secs(10), call)
@@ -1984,15 +2086,15 @@ async fn a_slow_cache_write_keeps_the_lease_until_the_item_completes(
 /// The directory cache, whose next read after `slow_next_read` is set
 /// blocks its thread for `delay`.
 struct SlowNextRead {
+    gate: Arc<BlockingGate>,
     inner: symbiotic_model::DirResponseCache,
-    delay: Duration,
     slow_next_read: std::sync::atomic::AtomicBool,
 }
 
 impl ResponseCache for SlowNextRead {
     fn load(&self, entry: &CacheEntry<'_>) -> Result<Option<Value>, ModelError> {
         if self.slow_next_read.swap(false, Ordering::SeqCst) {
-            std::thread::sleep(self.delay);
+            self.gate.wait();
         }
         self.inner.load(entry)
     }
@@ -2007,11 +2109,12 @@ async fn a_waiters_slow_cache_read_does_not_stall_lease_renewal(
     queue: Arc<CountsRenewals>,
 ) {
     let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(BlockingGate::default());
     let raw = Loopback::new(unique_identity()).slow(Duration::from_millis(5_000));
     let queue_id = raw.descriptor.queue_id();
     let cache = Arc::new(SlowNextRead {
+        gate: gate.clone(),
         inner: symbiotic_model::DirResponseCache::new(dir.path()),
-        delay: Duration::from_millis(4_000),
         slow_next_read: std::sync::atomic::AtomicBool::new(false),
     });
     let provider = queued(raw.clone(), queue.clone(), leased()).with_response_cache(cache.clone());
@@ -2028,9 +2131,12 @@ async fn a_waiters_slow_cache_read_does_not_stall_lease_renewal(
         let provider = provider.clone();
         async move { provider.chat(request("read")).await }
     });
+    gate.entered.notified().await;
+    advance_while_blocked(Duration::from_millis(3_500)).await;
+    let reclaimed = queue.reclaim_expired_leases(&queue_id).await.unwrap();
+    gate.release();
     assert_eq!(
-        reclaimable_after_the_lease(&queue, &queue_id).await,
-        0,
+        reclaimed, 0,
         "{backend}: the lease expired while a waiter read the cache"
     );
     // A waiter that reclaimed the expired lease would make the first call's
@@ -2456,7 +2562,7 @@ mod test_spend;
 struct ObservedSpend {
     inner: Arc<dyn symbiotic_model::SpendLedger>,
     reservations: Mutex<Vec<symbiotic_model::SpendReservation>>,
-    delay: Duration,
+    gate: Option<Arc<BlockingGate>>,
     fail_reservations: std::sync::atomic::AtomicBool,
     panic_reservation: std::sync::atomic::AtomicBool,
     fail_settlement: std::sync::atomic::AtomicBool,
@@ -2470,7 +2576,7 @@ impl ObservedSpend {
         Arc::new(Self {
             inner: test_spend::ledger(),
             reservations: Mutex::new(Vec::new()),
-            delay,
+            gate: (!delay.is_zero()).then(|| Arc::new(BlockingGate::default())),
             fail_reservations: std::sync::atomic::AtomicBool::new(false),
             panic_reservation: std::sync::atomic::AtomicBool::new(false),
             fail_settlement: std::sync::atomic::AtomicBool::new(false),
@@ -2511,7 +2617,9 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
         self.inner.release_before_dispatch(reference)
     }
     fn reserve(&self, reservation: &symbiotic_model::SpendReservation) -> Result<bool, ModelError> {
-        std::thread::sleep(self.delay);
+        if let Some(gate) = &self.gate {
+            gate.wait();
+        }
         assert!(
             !self.panic_reservation.load(Ordering::SeqCst),
             "crashed before reservation"
@@ -2602,7 +2710,7 @@ impl symbiotic_model::SpendLedger for ObservedSpend {
 #[tokio::test]
 async fn refused_explicit_replay_returns_parallel_completed_answer_and_receipt() {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let queue = Arc::new(MemoryQueue::new());
+        let queue = Arc::new(memory_queue());
         let receipts = Arc::new(InMemoryReceiptSink::default());
         let mut spend = ObservedSpend::new(Duration::ZERO);
         let ledger = spend.inner.clone();
@@ -2844,8 +2952,13 @@ async fn a_slow_reservation_renews_its_lease_before_dispatch(
             ..leased()
         },
     )
-    .with_spend_ledger(spend, None);
-    provider.chat(request("slow accounting")).await.unwrap();
+    .with_spend_ledger(spend.clone(), None);
+    let call = tokio::spawn(async move { provider.chat(request("slow accounting")).await });
+    let gate = spend.gate.as_ref().unwrap();
+    gate.entered.notified().await;
+    advance_while_blocked(Duration::from_millis(1_400)).await;
+    gate.release();
+    call.await.unwrap().unwrap();
     assert!(
         queue.renewals() > 0,
         "{backend}: reservation must renew even on a current-thread executor"
@@ -2866,7 +2979,14 @@ async fn lease_loss_during_reservation_refuses_dispatch(backend: &str, queue: Ar
         },
     )
     .with_spend_ledger(spend.clone(), None);
-    let result = provider.chat(request("lost reservation lease")).await;
+    let call_provider = provider.clone();
+    let call =
+        tokio::spawn(async move { call_provider.chat(request("lost reservation lease")).await });
+    let gate = spend.gate.as_ref().unwrap();
+    gate.entered.notified().await;
+    advance_while_blocked(Duration::from_millis(1_400)).await;
+    gate.release();
+    let result = call.await.unwrap();
     assert!(
         matches!(result, Err(ModelError::Queue(_))),
         "{backend}: {result:?}"
@@ -2911,7 +3031,8 @@ async fn a_reservation_storage_failure_preserves_the_last_provider_attempt(
     let raw = Loopback::new(unique_identity());
     let spend = ObservedSpend::new(Duration::ZERO);
     spend.fail_reservations.store(true, Ordering::SeqCst);
-    let provider = queued(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
+    let provider =
+        queued_with_cache(raw.clone(), queue, leased()).with_spend_ledger(spend.clone(), None);
     for _ in 0..2 {
         let err = provider
             .chat(request("storage recovers"))
@@ -2945,7 +3066,7 @@ async fn a_crash_before_reservation_preserves_the_last_provider_attempt(
     let raw = Loopback::new(unique_identity());
     let spend = ObservedSpend::new(Duration::ZERO);
     spend.panic_reservation.store(true, Ordering::SeqCst);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
@@ -2989,7 +3110,7 @@ async fn a_heartbeat_failure_before_transport_preserves_the_last_provider_attemp
         queue.fail_heartbeat_at.store(heartbeat, Ordering::SeqCst);
         let raw = Loopback::new(unique_identity());
         let spend = ObservedSpend::new(Duration::ZERO);
-        let provider = queued(
+        let provider = queued_with_cache(
             raw.clone(),
             queue,
             ModelQueueConfig {
@@ -3021,7 +3142,7 @@ async fn reconciliation_reopens_an_unknown_attempt_within_its_budget(
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue.clone(),
         ModelQueueConfig {
@@ -3087,7 +3208,7 @@ async fn restored_account_allowance_reconsiders_refusals_without_spending_attemp
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
     let receipts = Arc::new(InMemoryReceiptSink::default());
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue,
         ModelQueueConfig {
@@ -3294,7 +3415,7 @@ async fn reconciliation_permits_an_explicit_budget_renewal(
     )]);
     raw.uncertain_failures = true;
     let spend = ObservedSpend::new(Duration::ZERO);
-    let provider = queued(
+    let provider = queued_with_cache(
         raw.clone(),
         queue,
         ModelQueueConfig {
@@ -3354,7 +3475,8 @@ async fn a_reclaimed_unknown_attempt_does_not_spend_a_second_attempt_on_refusal(
         "crashed-worker",
         policy.clone(),
     )
-    .with_spend_ledger(spend.clone(), None);
+    .with_spend_ledger(spend.clone(), None)
+    .with_response_cache(Arc::new(TextKeyedCache::default()));
     let crashed =
         tokio::spawn(async move { crashing.chat(request("lost accepted attempt")).await });
     assert!(crashed.await.unwrap_err().is_panic(), "{backend}");
@@ -3367,7 +3489,8 @@ async fn a_reclaimed_unknown_attempt_does_not_spend_a_second_attempt_on_refusal(
         1,
         "{backend}: old attempt reclaimed"
     );
-    let provider = queued(raw.clone(), queue, policy).with_spend_ledger(spend.clone(), None);
+    let provider =
+        queued_with_cache(raw.clone(), queue, policy).with_spend_ledger(spend.clone(), None);
     let err = provider
         .chat(request("lost accepted attempt"))
         .await
@@ -3520,7 +3643,7 @@ struct ReferenceIds {
 impl ReferenceIds {
     fn new(id: String, advertise_at_enqueue: bool, fail_settlement: bool) -> Self {
         Self {
-            inner: MemoryQueue::new(),
+            inner: memory_queue(),
             reference_id: QueueItemId(id),
             original_id: Mutex::new(None),
             refusal: Mutex::new(None),
@@ -3891,7 +4014,7 @@ async fn trial_provider_and_trace_failures_visible_without_receipts() {
         symbiotic_core::DiagnosticCode::ProviderFailure,
     )]);
     let provider =
-        queued(raw, Arc::new(MemoryQueue::new()), config()).with_trace_sink(Arc::new(BrokenTrace));
+        queued(raw, Arc::new(memory_queue()), config()).with_trace_sink(Arc::new(BrokenTrace));
     let error = provider.chat(request("both failures")).await.unwrap_err();
     assert!(matches!(&error, ModelError::Diagnostics { primary, .. }
         if matches!(primary.as_ref(), ModelError::Provider(symbiotic_core::DiagnosticCode::ProviderFailure))));
@@ -3995,7 +4118,7 @@ async fn request_admission_renews_job_lease_before_transport() {
         renewed: (Mutex::new(false), std::sync::Condvar::new()),
         finished: std::sync::atomic::AtomicBool::new(false),
     });
-    let provider = queued(raw.clone(), Arc::new(MemoryQueue::new()), config())
+    let provider = queued(raw.clone(), Arc::new(memory_queue()), config())
         .with_admission(ModelAdmission::new())
         .with_binding_identity(symbiotic_core::BindingIdentity::new(
             "tenant", "provider", "1", "account",
@@ -4089,7 +4212,7 @@ async fn trial_heartbeat_provider_and_trace_failures_all_visible() {
         recovered,
         finished: std::sync::atomic::AtomicBool::new(false),
     });
-    let provider = queued(raw, Arc::new(MemoryQueue::new()), config())
+    let provider = queued(raw, Arc::new(memory_queue()), config())
         .with_admission(ModelAdmission::new())
         .with_binding_identity(symbiotic_core::BindingIdentity::new(
             "tenant", "provider", "1", "account",
@@ -4261,7 +4384,7 @@ async fn regression_keyless_runtime_discards_raw_before_cache_and_recovery() {
             let cache = Arc::new(TextKeyedCache::default());
             let receipts = Arc::new(InMemoryReceiptSink::default());
             let spend = test_spend::ledger();
-            let mut provider = queued(raw.clone(), Arc::new(MemoryQueue::new()), config())
+            let mut provider = queued(raw.clone(), Arc::new(memory_queue()), config())
                 .with_spend_ledger(spend.clone(), None)
                 .with_response_cache(cache.clone())
                 .with_receipt_sink(receipts.clone())

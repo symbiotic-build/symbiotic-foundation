@@ -89,6 +89,8 @@ pub const RESPONSES_DIR: &str = "responses";
 /// How the runtime is opened.
 #[derive(Clone)]
 pub struct RuntimeConfig {
+    /// Trusted host clock for deadlines; defaults to UTC.
+    pub clock: symbiotic_queue::jobs::JobClock,
     /// Validated deployment registry; no provider is inferred when absent.
     pub registry: Option<Arc<model::ModelRegistry>>,
     /// Private directory required for dispatch. `None` refuses dispatch with
@@ -123,6 +125,7 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            clock: Arc::new(chrono::Utc::now),
             registry: None,
             state_dir: None,
             worker_id: None,
@@ -340,9 +343,13 @@ impl Runtime {
                 (Arc::new(queue), Some(maintenance))
             }
             None => (
-                Arc::new(SqliteQueue::in_memory().map_err(|_| {
-                    ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
-                })?),
+                Arc::new(
+                    SqliteQueue::in_memory()
+                        .map_err(|_| {
+                            ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure)
+                        })?
+                        .with_clock(config.clock.clone()),
+                ),
                 None,
             ),
         };
@@ -350,8 +357,13 @@ impl Runtime {
             .state_dir
             .as_ref()
             .map(|dir| {
-                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE))
-                    .map(|ledger| Arc::new(ledger.with_retention(config.retention)))
+                spend::SqliteSpendLedger::open(&dir.join(QUEUE_DATABASE)).map(|ledger| {
+                    Arc::new(
+                        ledger
+                            .with_retention(config.retention)
+                            .with_clock(config.clock.clone()),
+                    )
+                })
             })
             .transpose()?;
         let spend: Arc<dyn SpendLedger> = match &job_ledger {
@@ -1161,7 +1173,8 @@ fn open_persistent_queue(
         }
     }
     let queue = SqliteQueue::open(&path)
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?;
+        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?
+        .with_clock(config.clock.clone());
     let sweep = Sweep::new(
         queue.clone(),
         config.retention,
@@ -1170,7 +1183,9 @@ fn open_persistent_queue(
             max_age: config.response_max_age,
             max_bytes: config.response_max_bytes,
         },
-        spend::SqliteSpendLedger::open(&path)?.with_retention(config.retention),
+        spend::SqliteSpendLedger::open(&path)?
+            .with_retention(config.retention)
+            .with_clock(config.clock.clone()),
     );
     // Recovery expiry must run even when the cache path refuses this open.
     // Keep the existing path diagnostic and permission tightening at startup.

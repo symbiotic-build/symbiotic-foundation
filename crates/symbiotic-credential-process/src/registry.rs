@@ -5,7 +5,8 @@ use symbiotic_ai_runtime::{model::AcceptedSpendHandoff, spend::SqliteSpendLedger
 use symbiotic_egress::*;
 use uuid::Uuid;
 
-pub(crate) struct Registry(Connection);
+pub(crate) type Clock = std::sync::Arc<dyn Fn() -> Result<u64, EgressError> + Send + Sync>;
+pub(crate) struct Registry(Connection, Clock);
 
 /// A committed debit held under the budget dispatch lock through completion.
 /// Previous state is needed only to undo a durably recorded trusted pre-send failure.
@@ -55,7 +56,15 @@ fn state(_: rusqlite::Error) -> EgressError {
 }
 
 impl Registry {
+    #[cfg(test)]
     pub(crate) fn open(path: &std::path::Path) -> Result<Self, EgressError> {
+        Self::open_with_clock(path, std::sync::Arc::new(now))
+    }
+
+    pub(crate) fn open_with_clock(
+        path: &std::path::Path,
+        clock: Clock,
+    ) -> Result<Self, EgressError> {
         symbiotic_ai_runtime::model::private_fs::ensure_private_file(path)
             .map_err(|_| EgressError::StateUnavailable)?;
         let mut conn = Connection::open(path).map_err(state)?;
@@ -174,8 +183,8 @@ impl Registry {
             .map_err(state)?;
         }
         tx.commit().map_err(state)?;
-        let mut registry = Self(conn);
-        registry.purge_expired(now()?)?;
+        let mut registry = Self(conn, clock);
+        registry.purge_expired((registry.1)()?)?;
         Ok(registry)
     }
 
@@ -191,7 +200,7 @@ impl Registry {
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        let grant = Self::issue_in(&tx, a, max_attempts)?;
+        let grant = Self::issue_in(&tx, a, max_attempts, &self.1)?;
         tx.commit().map_err(state)?;
         Ok(grant)
     }
@@ -200,6 +209,7 @@ impl Registry {
         tx: &rusqlite::Transaction<'_>,
         a: &DurableAttempt,
         max_attempts: u32,
+        clock: &Clock,
     ) -> Result<PermitGrant, EgressError> {
         let attempt_digest = digest(a)?;
         let invocation_key = a.attempt_id().invocation_key()?;
@@ -231,7 +241,7 @@ impl Registry {
             // Revision publication or expiry invalidates a pending permit without a handoff.
             // It has no charge or receipt and leaves the invocation allowance intact.
             if previous.consumed
-                || (previous.grant_revision == a.grant_revision && now()? < previous.expires_at)
+                || (previous.grant_revision == a.grant_revision && clock()? < previous.expires_at)
             {
                 let receipt = previous
                     .receipt
@@ -261,7 +271,7 @@ impl Registry {
         if accepted_attempts >= max_attempts {
             return Err(EgressError::BudgetRefused);
         }
-        if now()? >= a.expires_at {
+        if clock()? >= a.expires_at {
             return Err(EgressError::AuthorityExpired);
         }
         let token = Uuid::new_v4().to_string();
@@ -322,6 +332,7 @@ impl Registry {
             permit,
             &handoff.reservation.reference,
             max_attempts,
+            &self.1,
         )?;
         if !SqliteSpendLedger::reserve_handoff_in(&tx, handoff).map_err(ledger_error)? {
             return Err(EgressError::PermitRefused);
@@ -335,6 +346,7 @@ impl Registry {
         attempt: &DurableAttempt,
         reference: &SpendReceiptRef,
         max_attempts: u32,
+        clock: &Clock,
     ) -> Result<(), EgressError> {
         let key = attempt.attempt_id().invocation_key()?;
         let existing: Option<(String, String)> = tx.query_row(
@@ -347,9 +359,9 @@ impl Registry {
                 token,
             }
         } else {
-            Self::issue_in(tx, attempt, max_attempts)?.permit
+            Self::issue_in(tx, attempt, max_attempts, clock)?.permit
         };
-        Self::accept_in(tx, attempt, &permit, reference, max_attempts)?;
+        Self::accept_in(tx, attempt, &permit, reference, max_attempts, clock)?;
         Ok(())
     }
 
@@ -361,6 +373,7 @@ impl Registry {
         permit: &DispatchPermit,
         reference: &SpendReceiptRef,
         max_attempts: u32,
+        clock: &Clock,
     ) -> Result<DispatchReceipt, EgressError> {
         let attempt_digest = digest(attempt)?;
         if attempt_digest != permit.attempt_digest {
@@ -403,7 +416,7 @@ impl Registry {
         // Sample Foundation's clock after acquiring the writer transaction and
         // immediately before consumption/reservation. IPC or admission lock
         // delays must never turn an expired signed authority into a handoff.
-        if now()? >= attempt.expires_at {
+        if clock()? >= attempt.expires_at {
             return Err(EgressError::AuthorityExpired);
         }
         let changed = tx.execute("UPDATE egress_permits SET consumed=1, receipt=?1, accepted_attempts=accepted_attempts+1 WHERE attempt_digest=?2 AND token=?3 AND consumed=0", params![json, attempt_digest, permit.token]).map_err(state)?;
@@ -425,7 +438,7 @@ impl Registry {
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(state)?;
-        let admission = Self::admit_request_in(&tx, attempt_digest, key, policy)?;
+        let admission = Self::admit_request_in(&tx, attempt_digest, key, policy, &self.1)?;
         tx.commit().map_err(state)?;
         Ok(admission)
     }
@@ -436,6 +449,7 @@ impl Registry {
         attempt_digest: &str,
         key: String,
         policy: Option<&RequestBudget>,
+        clock: &Clock,
     ) -> Result<Option<RequestBudgetAdmission>, EgressError> {
         let unresolved: Option<Option<String>> = tx
             .query_row(
@@ -469,7 +483,7 @@ impl Registry {
             return Err(EgressError::PermitRefused);
         }
         let admission = policy
-            .map(|policy| Self::admit_request_budget_in(tx, key, policy))
+            .map(|policy| Self::admit_request_budget_in(tx, key, policy, clock))
             .transpose()?;
         Ok(admission)
     }
@@ -498,8 +512,9 @@ impl Registry {
         tx: &rusqlite::Transaction<'_>,
         key: String,
         policy: &RequestBudget,
+        clock: &Clock,
     ) -> Result<RequestBudgetAdmission, EgressError> {
-        let current_time = now()?;
+        let current_time = clock()?;
         let previous: Option<(u32, u64)> = tx.query_row(
             "SELECT failed_sends, last_failure FROM egress_request_failures WHERE request_key=?1",
             [&key], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -566,7 +581,7 @@ impl Registry {
                     receipt,
                     json,
                     result.receipt.attempt_digest,
-                    now()?,
+                    (self.1)()?,
                     mode == AnswerRecovery::Off
                 ],
             )
@@ -620,7 +635,7 @@ impl Registry {
                 tx.execute(
                     "UPDATE egress_request_failures SET last_failure=MAX(last_failure, ?2)
                      WHERE request_key=?1",
-                    params![budget.key, now()?],
+                    params![budget.key, (self.1)()?],
                 )
                 .map_err(state)?;
             }
@@ -644,7 +659,7 @@ impl Registry {
                         token,
                         attempt_digest,
                     },
-                    status: self.attempt_status(&a.attempt_id(), now()?)?,
+                    status: self.attempt_status(&a.attempt_id(), (self.1)()?)?,
                 })
             })
             .transpose()
@@ -807,6 +822,7 @@ impl Registry {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn now() -> Result<u64, EgressError> {
     #[cfg(test)]
     if let Some(time) = tests::CLOCK.with(std::cell::Cell::get) {
@@ -1546,7 +1562,12 @@ mod tests {
         let path = dir.path().join("registry.sqlite");
         let mut registry = open(&path);
         let mut first = attempt();
-        first.recorded_at = now().unwrap();
+        let time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let observed = time.clone();
+        let clock: Clock =
+            std::sync::Arc::new(move || Ok(observed.load(std::sync::atomic::Ordering::SeqCst)));
+        registry.1 = clock.clone();
+        first.recorded_at = 1_000;
         first.expires_at = first.recorded_at + 2;
         let granted = registry.issue(&first, 1).unwrap();
         assert!(matches!(
@@ -1565,16 +1586,29 @@ mod tests {
         let attempt = first.clone();
         let permit = granted.permit.clone();
         let (started, ready) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        registry
+            .0
+            .authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Begin,
+                    }
+                ) && let Some(started) = started.take()
+                {
+                    started.send(()).unwrap();
+                }
+                rusqlite::hooks::Authorization::Allow
+            }));
         let worker = std::thread::spawn(move || {
-            assert!(now().unwrap() < attempt.expires_at);
-            started.send(()).unwrap();
             let result = registry.consume(&attempt, &permit, &reservation(&attempt), 1);
             (registry, result)
         });
-        ready.recv().unwrap();
-        while now().unwrap() < first.expires_at {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        time.store(first.expires_at, std::sync::atomic::Ordering::SeqCst);
         lock.commit().unwrap();
         let (mut registry, result) = worker.join().unwrap();
         assert!(
@@ -1610,7 +1644,7 @@ mod tests {
             );
         }
         drop(registry);
-        registry = open(&path);
+        registry = Registry::open_with_clock(&path, clock).unwrap();
         let reattached = registry.issue(&first, 1).unwrap();
         assert_eq!(reattached.permit.token, granted.permit.token);
         assert!(matches!(reattached.status, AttemptStatus::Invalidated));
@@ -1621,7 +1655,7 @@ mod tests {
         // Reauthorization renews this attempt's deadline, without a revision
         // publication or spending the one accepted-attempt allowance.
         let mut second = first.clone();
-        second.recorded_at = now().unwrap();
+        second.recorded_at = (registry.1)().unwrap();
         second.expires_at = second.recorded_at + 3600;
         assert!(matches!(
             registry.issue(&second, 1),

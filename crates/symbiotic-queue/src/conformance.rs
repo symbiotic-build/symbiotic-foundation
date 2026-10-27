@@ -10,12 +10,14 @@ use crate::{
     ClaimRequest, EnqueueDisposition, EnqueueRequest, FailOutcome, Failure, QueueBackend,
     QueueError, QueueStatus,
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
 use std::collections::HashSet;
 use std::sync::Arc;
 use symbiotic_core::{QueueId, QueueItemId};
 
 /// Expand one `#[tokio::test]` per conformance check.
+/// `pause_time = true` pauses only checks that wait for a deadline; the factory
+/// must supply a queue clock synchronized with Tokio time.
 ///
 /// ```ignore
 /// symbiotic_queue::queue_backend_conformance!(|| std::sync::Arc::new(MyQueue::new()));
@@ -23,41 +25,50 @@ use symbiotic_core::{QueueId, QueueItemId};
 #[macro_export]
 macro_rules! queue_backend_conformance {
     ($make:expr) => {
+        $crate::queue_backend_conformance!(@checks $make; []);
+    };
+    ($make:expr, pause_time = true) => {
+        $crate::queue_backend_conformance!(@checks $make; [start_paused = true]);
+    };
+    (@checks $make:expr; $time_options:tt) => {
         $crate::queue_backend_conformance!(@tests $make;
-            enqueue_deduplicates_active_and_terminal_items,
-            enqueue_rejects_empty_kind,
-            enqueue_applies_attempt_and_schedule_defaults,
-            idempotency_is_scoped_to_the_queue,
-            claim_orders_ready_items_and_skips_future_items,
-            claim_respects_max_in_flight,
-            claim_item_claims_only_the_requested_item,
-            claim_item_respects_max_in_flight,
-            claim_item_of_an_unknown_item_is_not_found,
-            claim_rejects_an_empty_worker,
-            concurrent_claims_never_double_lease,
-            lease_owner_and_running_state_are_enforced,
-            heartbeat_extends_the_lease,
-            fail_retries_until_dead_and_complete_clears_the_error,
-            fail_schedules_the_retry_delay,
-            expired_lease_cannot_complete_and_is_reclaimed,
-            an_expired_final_attempt_is_dead_not_claimable,
-            fail_with_records_the_class_and_the_exact_deadline,
-            failure_without_retry_deadline_stops_with_attempts_remaining,
-            enqueue_replacing_supersedes_only_the_current_item,
-            cooldown_only_moves_forward,
-            regression_claims_observe_extended_cooldowns,
-            regression_unrepresentable_leases_are_refused,
-            unknown_item_is_absent,
+            enqueue_deduplicates_active_and_terminal_items [],
+            enqueue_rejects_empty_kind [],
+            enqueue_applies_attempt_and_schedule_defaults [],
+            idempotency_is_scoped_to_the_queue [],
+            claim_orders_ready_items_and_skips_future_items [],
+            claim_respects_max_in_flight [],
+            claim_item_claims_only_the_requested_item [],
+            claim_item_respects_max_in_flight [],
+            claim_item_of_an_unknown_item_is_not_found [],
+            claim_rejects_an_empty_worker [],
+            concurrent_claims_never_double_lease [],
+            lease_owner_and_running_state_are_enforced [],
+            heartbeat_extends_the_lease [],
+            fail_retries_until_dead_and_complete_clears_the_error [],
+            fail_schedules_the_retry_delay [],
+            expired_lease_cannot_complete_and_is_reclaimed $time_options,
+            an_expired_final_attempt_is_dead_not_claimable $time_options,
+            fail_with_records_the_class_and_the_exact_deadline $time_options,
+            failure_without_retry_deadline_stops_with_attempts_remaining [],
+            enqueue_replacing_supersedes_only_the_current_item [],
+            cooldown_only_moves_forward [],
+            regression_claims_observe_extended_cooldowns [],
+            regression_unrepresentable_leases_are_refused [],
+            unknown_item_is_absent [],
         );
     };
-    (@tests $make:expr; $($check:ident),+ $(,)?) => {
+    (@tests $make:expr; $($check:ident $options:tt),+ $(,)?) => {
         $(
-            #[tokio::test]
-            async fn $check() {
-                let make: fn() -> ::std::sync::Arc<dyn $crate::QueueBackend> = $make;
-                $crate::conformance::$check(make()).await;
-            }
+            $crate::queue_backend_conformance!(@test $make; $options; $check);
         )+
+    };
+    (@test $make:expr; [$($options:tt)*]; $check:ident) => {
+        #[tokio::test($($options)*)]
+        async fn $check() {
+            let make: fn() -> ::std::sync::Arc<dyn $crate::QueueBackend> = $make;
+            $crate::conformance::$check(make()).await;
+        }
     };
 }
 
@@ -136,7 +147,7 @@ pub async fn enqueue_rejects_empty_kind(queue: Arc<dyn QueueBackend>) {
 }
 
 pub async fn enqueue_applies_attempt_and_schedule_defaults(queue: Arc<dyn QueueBackend>) {
-    let before = Utc::now();
+    let before = queue.now();
     let mut defaulted = request("defaults");
     defaulted.max_attempts = None;
     let item = queue.enqueue(defaulted).await.unwrap().item;
@@ -144,7 +155,7 @@ pub async fn enqueue_applies_attempt_and_schedule_defaults(queue: Arc<dyn QueueB
     assert_eq!(item.attempt, 0);
     assert_eq!(item.status, QueueStatus::Pending);
     assert!(item.run_after >= before - ChronoDuration::seconds(1));
-    assert!(item.run_after <= Utc::now());
+    assert!(item.run_after <= queue.now());
 
     let mut zero = request("zero-attempts");
     zero.max_attempts = Some(0);
@@ -161,11 +172,11 @@ pub async fn idempotency_is_scoped_to_the_queue(queue: Arc<dyn QueueBackend>) {
 
 pub async fn claim_orders_ready_items_and_skips_future_items(queue: Arc<dyn QueueBackend>) {
     let mut later = request("later");
-    later.run_after = Some(Utc::now() - ChronoDuration::seconds(5));
+    later.run_after = Some(queue.now() - ChronoDuration::seconds(5));
     let mut earlier = request("earlier");
-    earlier.run_after = Some(Utc::now() - ChronoDuration::seconds(10));
+    earlier.run_after = Some(queue.now() - ChronoDuration::seconds(10));
     let mut future = request("future");
-    future.run_after = Some(Utc::now() + ChronoDuration::hours(1));
+    future.run_after = Some(queue.now() + ChronoDuration::hours(1));
     let later = queue.enqueue(later).await.unwrap().item;
     let earlier = queue.enqueue(earlier).await.unwrap().item;
     let future = queue.enqueue(future).await.unwrap().item;
@@ -426,7 +437,7 @@ pub async fn fail_schedules_the_retry_delay(queue: Arc<dyn QueueBackend>) {
         .await
         .unwrap();
     let failed = queue.get_item(&item.item_id).await.unwrap().unwrap();
-    assert!(failed.run_after > Utc::now() + ChronoDuration::minutes(59));
+    assert!(failed.run_after > queue.now() + ChronoDuration::minutes(59));
     assert!(
         queue
             .claim_item(&item.item_id, "worker", 60, None)
@@ -479,8 +490,8 @@ pub async fn expired_lease_cannot_complete_and_is_reclaimed(queue: Arc<dyn Queue
 
 pub async fn cooldown_only_moves_forward(queue: Arc<dyn QueueBackend>) {
     assert_eq!(queue.cooldown_until(&queue_id()).await.unwrap(), None);
-    let later = Utc::now() + ChronoDuration::seconds(30);
-    let earlier = Utc::now() + ChronoDuration::seconds(10);
+    let later = queue.now() + ChronoDuration::seconds(30);
+    let earlier = queue.now() + ChronoDuration::seconds(10);
     queue.note_cooldown(&queue_id(), later).await.unwrap();
     queue.note_cooldown(&queue_id(), earlier).await.unwrap();
     let until = queue.cooldown_until(&queue_id()).await.unwrap().unwrap();
@@ -540,7 +551,7 @@ pub async fn an_expired_final_attempt_is_dead_not_claimable(queue: Arc<dyn Queue
 pub async fn fail_with_records_the_class_and_the_exact_deadline(queue: Arc<dyn QueueBackend>) {
     let item = queue.enqueue(request("classified")).await.unwrap().item;
     claim_one(queue.as_ref(), &item.item_id, 60).await;
-    let deadline = Utc::now() + ChronoDuration::milliseconds(400);
+    let deadline = queue.now() + ChronoDuration::milliseconds(400);
     let outcome = queue
         .fail_with(
             &item.item_id,
@@ -690,12 +701,12 @@ pub async fn failure_without_retry_deadline_stops_with_attempts_remaining(
 /// A cooldown extension accepted before a claim must keep both claim APIs pending.
 pub async fn regression_claims_observe_extended_cooldowns(queue: Arc<dyn QueueBackend>) {
     let item = queue.enqueue(request("cooldown-claim")).await.unwrap().item;
-    let now = Utc::now();
+    let now = queue.now();
     queue
         .note_cooldown(&queue_id(), now - ChronoDuration::seconds(1))
         .await
         .unwrap();
-    assert!(queue.cooldown_until(&queue_id()).await.unwrap().unwrap() < Utc::now());
+    assert!(queue.cooldown_until(&queue_id()).await.unwrap().unwrap() < queue.now());
     // Simulate the extension between a caller's final read and claim acceptance.
     queue
         .note_cooldown(&queue_id(), now + ChronoDuration::seconds(60))

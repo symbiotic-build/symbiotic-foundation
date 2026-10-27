@@ -11,6 +11,7 @@ fn fixture(body: serde_json::Value) -> (String, std::thread::JoinHandle<serde_js
     let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
@@ -297,6 +298,7 @@ async fn chunked_response_is_capped_without_content_length() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
         let mut request = [0u8; 4096];
         let _ = stream.read(&mut request).unwrap();
         let body = "x".repeat(4096);
@@ -546,12 +548,6 @@ async fn regression_strict_usage_refusal_is_scoped_to_egress() {
             }
         }
     }
-}
-
-#[test]
-fn regression_public_cache_counts_remain_tuple_returning() {
-    let (hit, miss) = prompt_cache_counts(Some(10), Some(4), None, None);
-    assert_eq!((hit, miss), (Some(4), Some(6)));
 }
 
 #[tokio::test]

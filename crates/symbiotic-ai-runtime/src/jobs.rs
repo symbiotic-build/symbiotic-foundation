@@ -300,7 +300,7 @@ impl ModelJobs {
         let mut tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| JobError::Storage)?;
-        let now = Utc::now();
+        let now = self.ledger.now();
         let result = f(&mut tx, now)?;
         tx.commit().map_err(|_| JobError::Storage)?;
         Ok(result)
@@ -474,7 +474,7 @@ impl ModelJobs {
                     break;
                 }
                 let output = match reference {
-                    Some(reference) if !delivery.completion.result_expired && !delivery.completion.purged => spend::receipt_in(tx, &crate::SpendReceiptRef::new(reference).map_err(|_| JobError::Storage)?).map_err(|_| JobError::Storage)?.and_then(|r| r.recovery),
+                    Some(reference) if !delivery.completion.result_expired && !delivery.completion.purged => spend::receipt_in(tx, &crate::SpendReceiptRef::new(reference).map_err(|_| JobError::Storage)?, now).map_err(|_| JobError::Storage)?.and_then(|r| r.recovery),
                     _ => None,
                 };
                 if output.is_none() && delivery.completion.origin == Some(ResultOrigin::Paid)
@@ -525,7 +525,7 @@ impl ModelJobs {
                 let last = rows.last().map(|r| r.id.id.clone());
                 for row in rows {
                     let reference = crate::SpendReceiptRef::new(row.receipt.as_deref().ok_or(JobError::Storage)?).map_err(|_| JobError::Storage)?;
-                    let receipt = spend::receipt_in(tx, &reference).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
+                    let receipt = spend::receipt_in(tx, &reference, now).map_err(|_| JobError::Storage)?.ok_or(JobError::Storage)?;
                     let resolution = receipt_resolution(tx, &receipt, &jobs.invocation_key(&row.key)?, now, jobs.config.max_result_bytes)?;
                     jobs.op(tx, now, JobRequest::Resolve { job: row.id.clone(), generation: row.generation, resolution })?;
                     if row.recovery_until.is_some_and(|until| until <= now) && receipt.output.is_some() {
@@ -581,7 +581,7 @@ impl ClaimOwner {
         if current.state != JobState::Pending {
             return Ok((true, None));
         }
-        let previous = spend::invocation_in(tx, &reservation.account, &reservation.invocation)
+        let previous = spend::invocation_in(tx, &reservation.account, &reservation.invocation, now)
             .map_err(|_| JobError::Storage)?;
         if previous
             .as_ref()
@@ -917,7 +917,7 @@ impl model::ModelJob for ClaimOwner {
                         recovery_until: Some(now),
                     }
                 } else if output.is_some() {
-                    let receipt = spend::receipt_in(tx, &reference)
+                    let receipt = spend::receipt_in(tx, &reference, now)
                         .map_err(|_| JobError::Storage)?
                         .ok_or(JobError::Storage)?;
                     paid_resolution(
@@ -1017,10 +1017,10 @@ impl model::ModelJob for ClaimOwner {
             return Ok(false);
         }
         self.jobs
-            .transaction(|tx, _| {
+            .transaction(|tx, now| {
                 let reference =
                     crate::SpendReceiptRef::new(&claim.receipt).map_err(|_| JobError::Storage)?;
-                let receipt = spend::receipt_in(tx, &reference)
+                let receipt = spend::receipt_in(tx, &reference, now)
                     .map_err(|_| JobError::Storage)?
                     .ok_or(JobError::Storage)?;
                 Ok(receipt
@@ -1324,6 +1324,7 @@ mod review_tests {
             let receipt = spend::receipt_in(
                 &jobs.ledger.0.lock().expect("ledger"),
                 &reservation.reference,
+                chrono::Utc::now(),
             )
             .expect("receipt")
             .expect("present");
@@ -1634,12 +1635,16 @@ mod review_tests {
             {
                 let mut conn = jobs.ledger.0.lock().expect("ledger");
                 let tx = conn.transaction().expect("transaction");
-                for id in previous..retained {
-                    tx.execute(
+                {
+                    let scope = serde_json::to_string(&scope).expect("scope");
+                    let mut insert = tx.prepare(
                         "INSERT INTO jobs(scope,id,key,digest,kind,state,delivery_generation) VALUES (?1,?2,?2,'digest','chat','\"Accepted\"',1)",
-                        params![serde_json::to_string(&scope).expect("scope"), id.to_string()],
-                    )
-                    .expect("tombstone");
+                    ).expect("prepare tombstones");
+                    for id in previous..retained {
+                        insert
+                            .execute(params![scope, id.to_string()])
+                            .expect("tombstone");
+                    }
                 }
                 tx.commit().expect("commit");
                 let steps = steps.clone();
@@ -1934,6 +1939,7 @@ mod review_tests {
         let receipt = spend::receipt_in(
             &jobs.ledger.0.lock().expect("ledger"),
             &reservation.reference,
+            chrono::Utc::now(),
         )
         .expect("receipt")
         .expect("present");

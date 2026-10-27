@@ -10,7 +10,6 @@ use symbiotic_model::{
 use symbiotic_trace::UsageTrace;
 struct Fixture {
     ledger: sqlite::SqliteSpendLedger,
-    _state: tempfile::TempDir,
     after_reserve: Option<Box<dyn Fn() + Send + Sync>>,
 }
 pub fn ledger() -> Arc<dyn SpendLedger> {
@@ -19,12 +18,8 @@ pub fn ledger() -> Arc<dyn SpendLedger> {
 pub fn ledger_with_after_reserve(
     after_reserve: Option<Box<dyn Fn() + Send + Sync>>,
 ) -> Arc<dyn SpendLedger> {
-    let state = tempfile::tempdir().unwrap();
-    let path = state.path().join("queue.sqlite");
-    symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
     Arc::new(Fixture {
-        ledger: sqlite::SqliteSpendLedger::open(&path).unwrap(),
-        _state: state,
+        ledger: sqlite::SqliteSpendLedger::in_memory(),
         after_reserve,
     })
 }

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use unix::watch_parent;
+pub use unix::{watch_parent, watch_parent_with_diagnostic_wait};
 
 /// Explicit versioned policy; values are supplied by the app, with no hidden defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]

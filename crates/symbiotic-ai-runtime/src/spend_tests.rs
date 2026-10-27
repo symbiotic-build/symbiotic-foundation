@@ -72,12 +72,7 @@ fn zero_retention_is_swept_but_expired_job_deadlines_never_save_answers() {
 }
 
 fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<usize> {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("queue.sqlite");
-    symbiotic_queue_sqlite::SqliteQueue::open(&path).unwrap();
-    let ledger = SqliteSpendLedger::open(&path)
-        .unwrap()
-        .with_retention(retention);
+    let ledger = SqliteSpendLedger::in_memory().with_retention(retention);
     {
         let mut conn = ledger.0.lock().unwrap();
         let tx = conn.transaction().unwrap();
@@ -86,11 +81,21 @@ fn steps(history: usize, explicit: bool, retention: std::time::Duration) -> Vec<
             [if explicit { 0 } else { history }],
         )
         .unwrap();
-        for n in 0..history {
-            let r = reservation(&format!("runtime:old-item-{n}:1"));
-            tx.execute("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state, output, pre_dispatch_released, attempt_limit, attempts_used) VALUES (?1,'account','invocation','binding',?2,?3,?4,?5,?6,0)",
-                params![r.reference.as_str(), serde_json::to_string(&r).unwrap(), if explicit { "released" } else { "settled" },
-                    (!explicit).then_some("{\"output_received\":true}"), explicit, explicit.then_some(3)]).unwrap();
+        {
+            let mut insert = tx.prepare("INSERT INTO spend_receipts(reference, account, invocation, binding, reservation, state, output, pre_dispatch_released, attempt_limit, attempts_used) VALUES (?1,'account','invocation','binding',?2,?3,?4,?5,?6,0)").unwrap();
+            for n in 0..history {
+                let r = reservation(&format!("runtime:old-item-{n}:1"));
+                insert
+                    .execute(params![
+                        r.reference.as_str(),
+                        serde_json::to_string(&r).unwrap(),
+                        if explicit { "released" } else { "settled" },
+                        (!explicit).then_some("{\"output_received\":true}"),
+                        explicit,
+                        explicit.then_some(3)
+                    ])
+                    .unwrap();
+            }
         }
         tx.commit().unwrap();
     }
@@ -196,8 +201,11 @@ fn settlement_work_does_not_grow_with_confirmed_purge_history() {
         let scope = serde_json::to_string(&job_scope).unwrap();
         let identity = symbiotic_core::BindingIdentity::new("tenant", "provider", "1", "account");
         let invocation = crate::spend::job_invocation_key(&job_scope, "unrelated").unwrap();
-        for n in 0..history {
-            tx.execute("INSERT INTO jobs(scope,id,key,digest,state,final_state,delivery_generation) VALUES (?1,?2,?2,'digest','\"Discarded\"','\"Purged\"',0)", params![scope, n.to_string()]).unwrap();
+        {
+            let mut insert = tx.prepare("INSERT INTO jobs(scope,id,key,digest,state,final_state,delivery_generation) VALUES (?1,?2,?2,'digest','\"Discarded\"','\"Purged\"',0)").unwrap();
+            for n in 0..history {
+                insert.execute(params![scope, n.to_string()]).unwrap();
+            }
         }
         tx.commit().unwrap();
         drop(conn);

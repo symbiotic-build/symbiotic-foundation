@@ -70,6 +70,7 @@ fn fixture(
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .unwrap();

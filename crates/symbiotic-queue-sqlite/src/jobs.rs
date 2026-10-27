@@ -1562,6 +1562,130 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn regression_sqlite_completion_lock_wait_cannot_revive_expired_claim() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI64, Ordering},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expiry.sqlite");
+        let queue = Arc::new(SqliteQueue::open(&path).unwrap());
+        let scope = scope();
+        let config = JobConfig {
+            claim_lease_seconds: 1,
+            ..JobConfig::default()
+        };
+        let now = Utc::now();
+        let clock: JobClock = Arc::new(move || now);
+        let JobResponse::Enqueued(rows) = queue
+            .jobs(
+                &scope,
+                &config,
+                clock.clone(),
+                JobRequest::Enqueue(vec![spec("expiry")]),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("enqueue")
+        };
+        let id = match &rows[0] {
+            Enqueued::Inserted(id) => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        let JobResponse::Job(Some(claim)) = queue
+            .jobs(
+                &scope,
+                &config,
+                clock,
+                JobRequest::Claim {
+                    kinds: vec!["handler".into()],
+                    slots_available: 1,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("claim")
+        };
+        let mut blocker = Connection::open(path).unwrap();
+        let lock = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let time = Arc::new(AtomicI64::new(now.timestamp_millis()));
+        let observed = time.clone();
+        let (started, ready) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        queue.conn.lock().unwrap().authorizer(Some(
+            move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    rusqlite::hooks::AuthAction::Transaction {
+                        operation: rusqlite::hooks::TransactionOperation::Begin,
+                    }
+                ) && let Some(started) = started.take()
+                {
+                    started.send(()).unwrap();
+                }
+                rusqlite::hooks::Authorization::Allow
+            },
+        ));
+        let worker_queue = queue.clone();
+        let worker_scope = scope.clone();
+        let worker_config = config.clone();
+        let worker_id = id.clone();
+        let generation = claim.generation;
+        let lease_until = claim.lease_until.unwrap();
+        let worker = tokio::spawn(async move {
+            worker_queue
+                .jobs(
+                    &worker_scope,
+                    &worker_config,
+                    Arc::new(move || {
+                        DateTime::from_timestamp_millis(observed.load(Ordering::SeqCst)).unwrap()
+                    }),
+                    JobRequest::Complete {
+                        job: worker_id,
+                        generation,
+                        state: JobState::Succeeded,
+                        origin: ResultOrigin::Handler,
+                        output: Some(b"late".to_vec()),
+                        receipt: None,
+                        diagnostic: None,
+                    },
+                )
+                .await
+        });
+        // The callback runs while preparing BEGIN, before the held writer lock can be acquired.
+        tokio::task::spawn_blocking(move || {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        time.store(
+            (lease_until + Duration::milliseconds(1)).timestamp_millis(),
+            Ordering::SeqCst,
+        );
+        lock.commit().unwrap();
+        let result = worker.await.unwrap();
+        assert!(
+            matches!(result, Err(JobError::StaleClaim)),
+            "late completion accepted: {result:?}"
+        );
+        let JobResponse::Job(Some(row)) = queue
+            .jobs(&scope, &config, Arc::new(move || now), JobRequest::Get(id))
+            .await
+            .unwrap()
+        else {
+            panic!("get")
+        };
+        assert_eq!(row.state, JobState::Running);
+        assert!(row.output.is_none());
+    }
+
     #[test]
     fn jobs_heartbeat_never_decodes_or_rewrites_content() {
         let queue = SqliteQueue::in_memory().unwrap();
@@ -2207,7 +2331,7 @@ mod tests {
             .unwrap();
             let mut store = SqlRows::new(&tx);
             let template = store.by_key(&scope(), "template").unwrap().unwrap();
-            for i in 0..retained + 8 {
+            for i in [0, 1, retained] {
                 let mut row = template.clone();
                 row.id.id = if i < retained && i % 2 == 1 {
                     format!("zz-tail-{i:08}")
@@ -2231,6 +2355,41 @@ mod tests {
                 row.delivery_until = (i >= retained).then_some(now + chrono::Duration::seconds(30));
                 store.save(row).unwrap();
             }
+            // Clone three canonical examples in native SQL. The population and selector
+            // assertions are unchanged; serializing and probing 10,000 fixture rows is setup.
+            let columns: Vec<String> = tx
+                .prepare("PRAGMA table_info(jobs)")
+                .unwrap()
+                .query_map([], |r| r.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let id = "CASE WHEN n < ?1 AND n % 2 = 1 THEN printf('zz-tail-%08d',n) ELSE printf('%08d',n) END";
+            let projection = columns
+                .iter()
+                .map(|column| {
+                    if column == "id" || column == "key" {
+                        id.to_owned()
+                    } else {
+                        format!("seed.{column}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(&format!(
+                "WITH RECURSIVE fixture(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM fixture WHERE n+1<?1+8)
+                 INSERT INTO jobs ({}) SELECT {projection} FROM fixture
+                 JOIN jobs seed ON seed.scope=?2 AND seed.id=CASE WHEN n>=?1 THEN printf('%08d',?1) WHEN n%2=1 THEN 'zz-tail-00000001' ELSE '00000000' END
+                 WHERE n NOT IN (0,1,?1)", columns.join(",")
+            ), params![retained, json(&scope()).unwrap()]).unwrap();
+            tx.execute("INSERT INTO job_owners(scope,owner,job_id)
+                SELECT j.scope,o.value,j.id FROM jobs j,json_each(j.owners) o
+                WHERE NOT EXISTS(SELECT 1 FROM job_owners WHERE scope=j.scope AND job_id=j.id AND owner=o.value)", []).unwrap();
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, usize>(0))
+                    .unwrap(),
+                retained as usize + 9
+            );
             let mut eligible = template.clone();
             eligible.id.id = "zz-eligible".into();
             eligible.key = "eligible".into();

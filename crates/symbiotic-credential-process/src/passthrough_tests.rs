@@ -1,8 +1,17 @@
 //! Real Unix sockets and loopback providers. Only URL/TLS mapping is test injected.
 use super::*;
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::Ordering};
 use tokio::sync::{mpsc, oneshot};
+
+#[path = "../../test-support/clock.rs"]
+mod test_clock;
+
+async fn advance_clock(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
 
 const KEY: &str = "synthetic-passthrough-secret";
 struct Reply {
@@ -42,6 +51,7 @@ struct Upstream {
     reply: oneshot::Sender<Reply>,
 }
 struct Fixture {
+    idle_timeout: Option<Duration>,
     base: String,
     incoming: mpsc::Receiver<Upstream>,
     task: tokio::task::JoinHandle<()>,
@@ -55,6 +65,7 @@ impl Fixture {
     fn without_provider() -> Self {
         let (send, incoming) = mpsc::channel(1);
         Self {
+            idle_timeout: None,
             base: "http://127.0.0.1:1".into(),
             incoming,
             task: tokio::spawn(async move {
@@ -76,6 +87,7 @@ impl Fixture {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.unwrap();
+                        stream.set_nodelay(true).unwrap();
                         let send = send.clone();
                         tasks.spawn(async move {
                             let mut bytes = Vec::new();
@@ -99,6 +111,7 @@ impl Fixture {
             }
         });
         Self {
+            idle_timeout: None,
             base,
             incoming,
             task,
@@ -143,6 +156,12 @@ pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
     })).unwrap()
 }
 pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
+    open_with_clock(config, test_clock::clock())
+}
+fn open_with_clock(
+    config: ProcessConfig,
+    clock: symbiotic_queue::jobs::JobClock,
+) -> Result<CredentialProcess> {
     let key = config.state_dir.parent().unwrap().join("key");
     if config
         .passthrough
@@ -154,7 +173,7 @@ pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
     {
         write_private(&key, KEY.as_bytes());
     }
-    CredentialProcess::open(config)
+    CredentialProcess::open_with_clock(config, clock)
 }
 impl Harness {
     async fn start(fixture: &Fixture, change: impl FnOnce(&mut ProcessConfig)) -> Self {
@@ -176,7 +195,7 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config(dir.path());
         change(&mut config);
-        let mut process = open(config).unwrap();
+        let mut process = open_with_clock(config, clock.unwrap_or_else(test_clock::clock)).unwrap();
         let pass = Arc::get_mut(&mut process.inner)
             .unwrap()
             .passthrough
@@ -184,7 +203,6 @@ impl Harness {
             .unwrap();
         pass.wire_base = Some(fixture.base.clone());
         pass.retry_hook = hook;
-        pass.clock = clock;
         for route in &mut pass.routes {
             route.client = reqwest::Client::builder()
                 .no_proxy()
@@ -195,12 +213,19 @@ impl Harness {
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
-                .read_timeout(Duration::from_secs(route.config.idle_timeout_seconds))
+                .read_timeout(
+                    fixture
+                        .idle_timeout
+                        .unwrap_or(Duration::from_secs(route.config.idle_timeout_seconds)),
+                )
                 .connect_timeout(Duration::from_secs(route.config.idle_timeout_seconds))
                 .build()
                 .unwrap();
             if let Credential::Login(login) = &mut route.credential {
-                Arc::get_mut(login).unwrap().test_transport(&fixture.base);
+                Arc::get_mut(login).unwrap().test_transport(
+                    &fixture.base,
+                    fixture.idle_timeout.unwrap_or(Duration::from_secs(2)),
+                );
             }
         }
         let listener = bind(&process).unwrap();
@@ -461,6 +486,7 @@ async fn rate_limit_waits_and_resends_identical_body_without_exposing_429() {
             .await
             .is_err()
     );
+    advance_clock(Duration::from_secs(1)).await;
     let resend = fixture.next().await;
     assert!(before.elapsed() >= Duration::from_millis(900));
     assert_eq!(resend.body, body);
@@ -481,13 +507,14 @@ async fn concurrent_429s_both_wait_and_resend_under_the_shared_deadline() {
     first.reply.send(Reply::rate(1)).ok().unwrap();
     second.reply.send(Reply::rate(1)).ok().unwrap();
     harness
-        .health_where(|h| !h["routes"][0]["cooldown_until"].is_null())
+        .health_where(|h| h["routes"][0]["retried_events"]["429"] == 2)
         .await;
     assert!(
         tokio::time::timeout(Duration::from_millis(40), fixture.incoming.recv())
             .await
             .is_err()
     );
+    advance_clock(Duration::from_secs(1)).await;
     for _ in 0..2 {
         fixture.next().await.reply.send(Reply::json()).ok().unwrap();
     }
@@ -542,6 +569,7 @@ async fn a_cooldown_recorded_during_slot_wait_is_checked_before_dispatch() {
             .await
             .is_err()
     );
+    advance_clock(Duration::from_secs(1)).await;
     fixture.next().await.reply.send(Reply::json()).ok().unwrap();
     fixture.next().await.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&first.await.unwrap()).0, 200);
@@ -583,7 +611,15 @@ async fn maximum_cooldown_wait_returns_fixed_429_and_rounded_remaining_retry_aft
         c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(1)
     })
     .await;
-    let call = harness.call().await;
+    let call = tokio::spawn(read(
+        harness
+            .connect(
+                "/v1/responses",
+                b"{}",
+                "x-symbiotic-request-id: synthetic-wait\r\n",
+            )
+            .await,
+    ));
     let upstream = fixture.next().await;
     let mut answer = Reply::rate(10);
     answer.headers.push(("set-cookie".into(), KEY.into()));
@@ -591,6 +627,10 @@ async fn maximum_cooldown_wait_returns_fixed_429_and_rounded_remaining_retry_aft
         .headers
         .push(("x-codex-turn-state".into(), "held-answer".into()));
     upstream.reply.send(answer).ok().unwrap();
+    harness
+        .health_where(|h| !h["routes"][0]["waiting"].as_array().unwrap().is_empty())
+        .await;
+    advance_clock(Duration::from_secs(1)).await;
     let (status, head, body) = decoded(&call.await.unwrap());
     assert_eq!(status, 429);
     assert_eq!(body, br#"{"error":{"code":"rate_limited"}}"#);
@@ -606,14 +646,13 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
     let directory = tempfile::tempdir().unwrap();
     let mut settings = config(directory.path());
     settings.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
-    let mut process = open(settings).unwrap();
     let frozen_at = Utc::now() + chrono::Duration::seconds(60);
+    let mut process = open_with_clock(settings, Arc::new(move || frozen_at)).unwrap();
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
         .as_mut()
         .unwrap();
-    pass.clock = Some(Arc::new(move || frozen_at));
     let account = pass.routes[0].account.clone();
     for (nanoseconds, seconds) in [(1, 1), (1_000_000_000, 1), (1_000_000_001, 2)] {
         account
@@ -667,6 +706,7 @@ async fn invalid_content_encoding_and_type_and_response_overflow_end_without_fin
 #[tokio::test]
 async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
     let mut fixture = Fixture::start().await;
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, |c| {
         c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1;
         c.passthrough.as_mut().unwrap().routes[0]
@@ -683,6 +723,7 @@ async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
     .await;
     let call = harness.call().await;
     let held = fixture.next().await;
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     assert_eq!(decoded(&call.await.unwrap()).0, 502);
     drop(held);
     let next = harness.call().await;
@@ -693,15 +734,28 @@ async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
 #[tokio::test]
 async fn cooldown_is_durable_across_runtime_restart() {
     let mut fixture = Fixture::start().await;
-    let mut harness = Harness::start(&fixture, |_| {}).await;
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(
+        (Utc::now() + chrono::Duration::days(1)).timestamp_millis(),
+    ));
+    let clock: symbiotic_queue::jobs::JobClock = {
+        let now = now.clone();
+        Arc::new(move || DateTime::from_timestamp_millis(now.load(Ordering::SeqCst)).unwrap())
+    };
+    let mut harness = Harness::with_clock(
+        &fixture,
+        |config| config.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0),
+        None,
+        Some(clock.clone()),
+    )
+    .await;
     let config = harness.process.config().clone();
-    let until = Utc::now() + chrono::Duration::seconds(1);
+    let until = clock() + chrono::Duration::seconds(1);
     harness.account().note_cooldown(until).await.unwrap();
     harness.task.abort();
     let _ = (&mut harness.task).await;
     let retained = std::mem::replace(&mut harness._dir, tempfile::tempdir().unwrap());
     drop(harness);
-    let mut process = open(config).unwrap();
+    let mut process = open_with_clock(config, clock).unwrap();
     let pass = Arc::get_mut(&mut process.inner)
         .unwrap()
         .passthrough
@@ -741,15 +795,20 @@ async fn cooldown_is_durable_across_runtime_restart() {
             .timestamp(),
         until.timestamp()
     );
-    let call = restarted.call().await;
+    let refused = restarted.call().await;
+    let (status, headers, body) = decoded(&refused.await.unwrap());
+    assert_eq!(status, 429);
+    assert!(headers.contains("retry-after: 1\r\n"), "{headers}");
+    assert_eq!(body, br#"{"error":{"code":"rate_limited"}}"#);
+    assert!(fixture.incoming.try_recv().is_err());
+    now.fetch_add(1_000, Ordering::SeqCst);
+    let mut call = restarted.call().await;
+    let upstream = tokio::select! {
+        upstream = fixture.next() => upstream,
+        response = &mut call => panic!("expired durable cooldown refused dispatch: {:?}", decoded(&response.unwrap())),
+    };
     assert!(
-        tokio::time::timeout(Duration::from_millis(40), fixture.incoming.recv())
-            .await
-            .is_err()
-    );
-    let upstream = fixture.next().await;
-    assert!(
-        Utc::now() >= until,
+        restarted.process.inner.passthrough.as_ref().unwrap().now() >= until,
         "restarted process dispatched inside its durable cooldown"
     );
     upstream.reply.send(Reply::json()).ok().unwrap();
@@ -982,6 +1041,7 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
             .await
             .is_err()
     );
+    advance_clock(Duration::from_secs(1)).await;
     for _ in 0..2 {
         let upstream = fixture.next().await;
         if upstream.head.starts_with("POST /answer ") {
@@ -995,6 +1055,11 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
     }
     assert_eq!(decoded(&passthrough.await.unwrap()).0, 200);
     assert_eq!(typed.await.unwrap().unwrap().text, "typed answer");
+    // Health republishes on the heartbeat and reads cooldown expiry on the process clock.
+    advance_clock(Duration::from_secs(10)).await;
+    harness
+        .health_where(|h| h["routes"][0]["cooldown_until"].is_null())
+        .await;
 }
 
 #[tokio::test]
@@ -1055,6 +1120,7 @@ async fn missing_retry_after_uses_account_backoff_and_resends() {
     harness
         .health_where(|h| !h["routes"][0]["cooldown_until"].is_null())
         .await;
+    advance_clock(Duration::from_secs(1)).await;
     let retry = fixture.next().await;
     assert!(started.elapsed() >= Duration::from_millis(900));
     retry.reply.send(Reply::json()).ok().unwrap();
@@ -1091,33 +1157,80 @@ async fn stream_progress_can_exceed_the_idle_timeout_without_a_total_deadline() 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (send, incoming) = mpsc::channel::<Upstream>(1);
+    let (progress, mut chunks) = mpsc::channel::<Vec<u8>>(1);
     let task = tokio::spawn(async move {
         let _send = send;
         let (mut stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             head.push(stream.read_u8().await.unwrap());
         }
         let mut body = [0; 2];
         stream.read_exact(&mut body).await.unwrap();
-        let response = br#"{"text":"slow answer"}"#;
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).as_bytes()).await.unwrap();
-        for part in response.chunks(8) {
-            stream.write_all(part).await.unwrap();
-            if part.len() == 8 {
-                tokio::time::sleep(Duration::from_millis(550)).await;
-            }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        while let Some(bytes) = chunks.recv().await {
+            stream.write_all(&bytes).await.unwrap();
         }
     });
     let fixture = Fixture {
+        idle_timeout: None,
         base,
         incoming,
         task,
     };
     let harness = Harness::start(&fixture, |_| {}).await;
-    let (status, _, body) = decoded(&harness.call().await.await.unwrap());
+    let mut caller = harness.connect("/v1/responses", b"{}", "").await;
+    let mut received = Vec::new();
+    let types = [
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+    ];
+    for (index, kind) in types.iter().enumerate() {
+        if index != 0 {
+            // Each gap is below the one-second idle limit. Together they exceed it.
+            // Advance only after the caller receives the preceding complete event.
+            advance_clock(Duration::from_millis(600)).await;
+        }
+        let event = json!({"type":kind,"response":{"id":"slow-answer"}});
+        progress
+            .send(format!("data: {event}\n\n").into_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                received.push(
+                    caller
+                        .read_u8()
+                        .await
+                        .expect("stream ended before progress"),
+                );
+                if received.ends_with(b"\n\n\r\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("each complete event must reach the caller");
+    }
+    drop(progress);
+    received.extend(read(caller).await);
+    let (status, _, body) = decoded(&received);
     assert_eq!(status, 200);
-    assert_eq!(body, br#"{"text":"slow answer"}"#);
+    let events = ResponsesAdapter::default().feed(&body, 100_000).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.record().value["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        types
+    );
 }
 
 #[tokio::test]
@@ -1154,6 +1267,7 @@ async fn account_slot_stays_held_after_response_headers_until_the_stream_finishe
         second.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":\"ok\"}").await.unwrap();
     });
     let mut fixture = Fixture {
+        idle_timeout: None,
         base,
         incoming,
         task,
@@ -1232,6 +1346,7 @@ async fn typed_provider_and_passthrough_spend_the_same_request_pacing_bucket() {
             .await
             .is_err()
     );
+    advance_clock(Duration::from_secs(1)).await;
     let next = fixture.next().await;
     assert!(started.elapsed() >= Duration::from_millis(900));
     next.reply.send(Reply::json()).ok().unwrap();
@@ -1291,6 +1406,7 @@ async fn route_event_hold_limit_returns_a_visible_error_for_oversized_items() {
 #[tokio::test]
 async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
     let mut fixture = Fixture::start().await;
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, login_config).await;
     let call = harness.call().await;
     fixture
@@ -1302,6 +1418,8 @@ async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
         .unwrap();
     let exchange = fixture.next().await;
     assert!(exchange.head.starts_with("POST /oauth/token HTTP/1.1\r\n"));
+    // Drive the timeout only after the server has received the request bytes.
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     let (status, _, body) = decoded(&call.await.unwrap());
     assert_eq!(status, 503);
     assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
@@ -1320,6 +1438,7 @@ async fn token_exchange_timeout_after_request_bytes_keeps_the_durable_fence() {
 #[tokio::test]
 async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
     let mut fixture = Fixture::start().await;
+    fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, |config| {
         login_config(config);
         let path = config.state_dir.parent().unwrap().join("login.json");
@@ -1342,6 +1461,8 @@ async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
             .head
             .starts_with("GET /.well-known/openid-configuration HTTP/1.1\r\n")
     );
+    // Drive the timeout only after the server has received the request bytes.
+    advance_clock(fixture.idle_timeout.unwrap()).await;
     let (status, _, body) = decoded(&call.await.unwrap());
     assert_eq!(status, 503);
     assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
@@ -1370,7 +1491,15 @@ async fn rate_limit_and_unauthorized_resends_charge_pacing_while_keeping_the_slo
             route.max_in_flight = 1;
         })
         .await;
-        let call = harness.call().await;
+        let call = tokio::spawn(read(
+            harness
+                .connect(
+                    "/v1/responses",
+                    b"{}",
+                    "x-symbiotic-request-id: synthetic-wait\r\n",
+                )
+                .await,
+        ));
         let first = fixture.next().await;
         let body = first.body.clone();
         let started = Instant::now();
@@ -1394,6 +1523,10 @@ async fn rate_limit_and_unauthorized_resends_charge_pacing_while_keeping_the_slo
                 .await
                 .is_err()
         );
+        harness
+            .health_where(|h| !h["routes"][0]["waiting"].as_array().unwrap().is_empty())
+            .await;
+        advance_clock(Duration::from_secs(1)).await;
         let resend = fixture.next().await;
         assert!(started.elapsed() >= Duration::from_millis(900));
         assert_eq!(resend.body, body);
@@ -1422,7 +1555,15 @@ async fn unusable_login_after_slot_cooldown_pacing_or_gate_wait_never_dispatches
                 }
             })
             .await;
-            let first = harness.call().await;
+            let first = tokio::spawn(read(
+                harness
+                    .connect(
+                        "/v1/responses",
+                        b"{}",
+                        "x-symbiotic-request-id: synthetic-wait\r\n",
+                    )
+                    .await,
+            ));
             fixture
                 .next()
                 .await
@@ -1431,6 +1572,12 @@ async fn unusable_login_after_slot_cooldown_pacing_or_gate_wait_never_dispatches
                 .ok()
                 .unwrap();
             fixture.next().await.reply.send(renewal()).ok().unwrap();
+            if waiting == "pacing" {
+                harness
+                    .health_where(|h| !h["routes"][0]["waiting"].as_array().unwrap().is_empty())
+                    .await;
+                advance_clock(Duration::from_secs(1)).await;
+            }
             let rejected = fixture.next().await;
             if waiting == "cooldown" {
                 harness
@@ -1469,6 +1616,12 @@ async fn unusable_login_after_slot_cooldown_pacing_or_gate_wait_never_dispatches
                 if state == "login_required" { 200 } else { 401 }
             );
             drop(held_gate);
+            if waiting == "pacing" {
+                advance_clock(Duration::from_secs(1)).await;
+            }
+            if waiting == "cooldown" {
+                advance_clock(Duration::from_millis(200)).await;
+            }
             let (status, _, body) = decoded(&waiting_call.await.unwrap());
             assert_eq!(status, 503);
             assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
@@ -1621,6 +1774,7 @@ async fn throttle_503_and_429_resend_before_first_byte_and_health_counts_codes()
         assert!(
             health["routes"][0]["waiting"][0]["since"].as_i64().unwrap() <= Utc::now().timestamp()
         );
+        advance_clock(Duration::from_secs(1)).await;
         fixture.next().await.reply.send(Reply::json()).ok().unwrap();
         let (status, headers, body) = decoded(&read(caller).await);
         assert_eq!((status, body), (200, br#"{"result":"ok"}"#.to_vec()));
@@ -1706,13 +1860,25 @@ async fn provider_rate_headers_on_success_reach_health_and_caller_without_promot
 #[tokio::test]
 async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sessions() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        let route = &mut c.passthrough.as_mut().unwrap().routes[0];
-        route.max_in_flight = 8;
-        route.new_session = Some(NewSessionConfig {
-            session_headers: vec!["session-id".into(), "thread-id".into()],
-        });
-    })
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(
+        (Utc::now() + chrono::Duration::days(1)).timestamp_millis(),
+    ));
+    let clock: symbiotic_queue::jobs::JobClock = {
+        let now = now.clone();
+        Arc::new(move || DateTime::from_timestamp_millis(now.load(Ordering::SeqCst)).unwrap())
+    };
+    let harness = Harness::with_clock(
+        &fixture,
+        |c| {
+            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            route.max_in_flight = 8;
+            route.new_session = Some(NewSessionConfig {
+                session_headers: vec!["session-id".into(), "thread-id".into()],
+            });
+        },
+        None,
+        Some(clock.clone()),
+    )
     .await;
     let seen = harness
         .connect("/v1/responses", b"{}", "session-id: seen\r\n")
@@ -1759,6 +1925,10 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
         .health_where(|h| !h["routes"][0]["new_session_hold_until"].is_null())
         .await;
     assert!(h["routes"][0]["cooldown_until"].is_null());
+    assert_eq!(
+        h["routes"][0]["new_session_hold_until"],
+        json!((clock() + chrono::Duration::seconds(1)).timestamp())
+    );
     let second = harness
         .connect(
             "/v1/responses",
@@ -1773,6 +1943,8 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
     assert!(fast.head.contains("session-id: seen\r\n"));
     fast.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&read(seen).await).0, 200);
+    now.fetch_add(1_000, Ordering::SeqCst);
+    advance_clock(Duration::from_secs(1)).await;
     let probe = fixture.next().await;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), fixture.incoming.recv())
@@ -1788,6 +1960,8 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
             .await
             .is_err()
     );
+    now.fetch_add(1_000, Ordering::SeqCst);
+    advance_clock(Duration::from_secs(1)).await;
     let probe = fixture.next().await;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), fixture.incoming.recv())
@@ -2086,6 +2260,10 @@ async fn completed_item_behind_partial_before_headers_survives_disconnect() {
         })
         .ok()
         .unwrap();
+    harness
+        .health_where(|h| !h["routes"][0]["cooldown_until"].is_null())
+        .await;
+    advance_clock(Duration::from_secs(1)).await;
     let continuation = fixture.next().await;
     let mut expected = original;
     expected["input"]
@@ -2147,11 +2325,13 @@ async fn account_gate_wait_does_not_consume_the_upstream_timeout() {
     let call = harness.call().await;
     // A pending receive proves no provider dispatch while holding the gate.
     // Its duration exceeds the configured one-second upstream read timeout.
+    tokio::time::pause();
     assert!(
         tokio::time::timeout(Duration::from_millis(1100), fixture.incoming.recv())
             .await
             .is_err()
     );
+    tokio::time::resume();
     drop(grant);
     fixture.next().await.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&call.await.unwrap()).2, br#"{"result":"ok"}"#);
