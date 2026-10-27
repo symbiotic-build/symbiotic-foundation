@@ -1038,6 +1038,8 @@ async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
     }
     assert_eq!(decoded(&passthrough.await.unwrap()).0, 200);
     assert_eq!(typed.await.unwrap().unwrap().text, "typed answer");
+    // Health reports the cooldown in whole seconds on the process clock.
+    advance_clock(Duration::from_secs(1)).await;
     harness
         .health_where(|h| h["routes"][0]["cooldown_until"].is_null())
         .await;
