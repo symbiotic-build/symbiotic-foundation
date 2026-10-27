@@ -2,6 +2,36 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+struct AttemptLog<'a> {
+    route: &'a str,
+    attempt: u32,
+    new_session: bool,
+    observed: Option<u16>,
+}
+impl AttemptLog<'_> {
+    fn warn(
+        &self,
+        code: &str,
+        class: ErrorClass,
+        bytes_reached_caller: bool,
+        action: &str,
+        delay_ms: Option<u128>,
+    ) {
+        tracing::warn!(
+            route = self.route,
+            status = self.observed,
+            code,
+            ?class,
+            attempt = self.attempt,
+            new_session = self.new_session,
+            bytes_reached_caller,
+            action,
+            delay_ms,
+            "upstream failure"
+        );
+    }
+}
+
 struct Failure {
     status: u16,
     code: String,
@@ -24,7 +54,7 @@ impl Failure {
 }
 enum AnswerOutcome {
     Complete,
-    Terminated,
+    Terminated(&'static str),
     Failure(Failure),
 }
 #[derive(Default)]
@@ -196,8 +226,8 @@ impl Passthrough {
         &self,
         route: &Route,
         failure: &Failure,
+        log: &AttemptLog<'_>,
         policy: &RetryPolicy,
-        attempt: u32,
         started: bool,
         fallback_available: bool,
     ) -> Result<RetryDecision> {
@@ -213,7 +243,7 @@ impl Passthrough {
         let context = RetryContext {
             class,
             code: failure.code.clone(),
-            attempt,
+            attempt: log.attempt,
             bytes_reached_caller: started,
             route_name: route.config.name.clone(),
         };
@@ -240,14 +270,14 @@ impl Passthrough {
             *n = n.checked_add(1).ok_or(EgressError::StateUnavailable)?;
             self.changed.notify_one();
         }
-        if rule.action == RetryAction::RetrySame {
+        let delay = if rule.action == RetryAction::RetrySame {
             let count = route.retries.failures.load(Ordering::Acquire);
             let retry_after = (failure.headers.get_all("retry-after").iter().count() == 1)
                 .then(|| failure.headers.get("retry-after"))
                 .flatten()
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| retry::parse_retry_after(v, self.now().timestamp()).ok());
-            let delay = match retry_after {
+            Some(match retry_after {
                 Some(s) => Duration::from_secs(s),
                 None => Duration::from_millis(
                     retry::delay_ms(
@@ -260,7 +290,23 @@ impl Passthrough {
                     )
                     .map_err(|_| EgressError::StateUnavailable)?,
                 ),
-            };
+            })
+        } else {
+            None
+        };
+        // One journal line per retry decision, before the hold or cooldown is recorded.
+        log.warn(
+            &failure.code,
+            class,
+            started,
+            match rule.action {
+                RetryAction::RetrySame => "retry_same",
+                RetryAction::Switch => "switch",
+                RetryAction::Fail => "fail",
+            },
+            delay.map(|d| d.as_millis()),
+        );
+        if let Some(delay) = delay {
             let until = self
                 .now()
                 .checked_add_signed(
@@ -532,6 +578,12 @@ impl Passthrough {
                 continue;
             };
             attempt = attempt.saturating_add(1);
+            let log = AttemptLog {
+                route: &route.config.name,
+                attempt,
+                new_session: was_new,
+                observed: sent.as_ref().ok().map(|r| r.status().as_u16()),
+            };
             let failure = match sent {
                 Err(_) => Failure::network("network", None),
                 Ok(mut response) => {
@@ -576,11 +628,17 @@ impl Passthrough {
                                 route.retries.failures.store(0, Ordering::Release);
                                 return Ok(());
                             }
-                            AnswerOutcome::Terminated => return Ok(()),
+                            AnswerOutcome::Terminated(code) => {
+                                log.warn(code, ErrorClass::Final, started, "fail", None);
+                                return self
+                                    .local_error(write, started, 502, code, &wait, None)
+                                    .await;
+                            }
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
+                            log.warn("upstream_status", ErrorClass::Final, started, "fail", None);
                             return self
                                 .local_error(write, false, 401, "upstream_status", &wait, None)
                                 .await;
@@ -591,10 +649,24 @@ impl Passthrough {
                         {
                             let renewed = login_request.retried();
                             if login.after_unauthorized(login_request).await.is_ok() {
+                                log.warn(
+                                    "upstream_status",
+                                    ErrorClass::Final,
+                                    started,
+                                    "renew",
+                                    None,
+                                );
                                 *injected = login_request.headers().clone();
                                 continue;
                             }
                             if !renewed {
+                                log.warn(
+                                    "credential_unavailable",
+                                    ErrorClass::Final,
+                                    started,
+                                    "fail",
+                                    None,
+                                );
                                 return self
                                     .local_error(
                                         write,
@@ -620,6 +692,13 @@ impl Passthrough {
                                 }
                             }
                             Err(EgressError::LimitExceeded) => {
+                                log.warn(
+                                    "response_too_large",
+                                    ErrorClass::Final,
+                                    started,
+                                    "fail",
+                                    None,
+                                );
                                 return self
                                     .local_error(
                                         write,
@@ -641,14 +720,7 @@ impl Passthrough {
                 policy.extend(named.clone());
             }
             let decision = self
-                .retry_decision(
-                    route,
-                    &failure,
-                    &policy,
-                    attempt,
-                    started,
-                    fallback.len() != 0,
-                )
+                .retry_decision(route, &failure, &log, &policy, started, fallback.len() != 0)
                 .await?;
             // Keep the single probe until its outcome has recorded the shared hold.
             drop(session);
@@ -772,17 +844,7 @@ impl Passthrough {
             || !matches!(kind, "text/event-stream" | "application/json")
             || (*started && kind != "text/event-stream")
         {
-            return self
-                .local_error(
-                    write,
-                    *started,
-                    502,
-                    "invalid_provider_response",
-                    wait,
-                    None,
-                )
-                .await
-                .map(|()| AnswerOutcome::Terminated);
+            return Ok(AnswerOutcome::Terminated("invalid_provider_response"));
         }
         let kind = kind.to_owned();
         let mut adapter = ResponsesAdapter::default();
@@ -801,10 +863,7 @@ impl Passthrough {
             let Some(bytes) = next else {
                 if kind == "application/json" {
                     if serde_json::from_slice::<serde_json::Value>(&json).is_err() {
-                        return self
-                            .local_error(write, *started, 502, "invalid_provider_json", wait, None)
-                            .await
-                            .map(|()| AnswerOutcome::Terminated);
+                        return Ok(AnswerOutcome::Terminated("invalid_provider_json"));
                     }
                     if !*started {
                         self.answer_head(route, response, write, &kind, wait)
@@ -822,10 +881,7 @@ impl Passthrough {
             };
             received = received.saturating_add(bytes.len());
             if received > route.config.max_response_bytes {
-                return self
-                    .local_error(write, *started, 502, "response_too_large", wait, None)
-                    .await
-                    .map(|()| AnswerOutcome::Terminated);
+                return Ok(AnswerOutcome::Terminated("response_too_large"));
             }
             if kind == "application/json" {
                 json.extend_from_slice(&bytes);
@@ -835,10 +891,7 @@ impl Passthrough {
                 Ok(e) => e,
                 Err(error) => {
                     let error = crate::stream::StreamError::from(error);
-                    return self
-                        .local_error(write, *started, 502, error.0, wait, None)
-                        .await
-                        .map(|()| AnswerOutcome::Terminated);
+                    return Ok(AnswerOutcome::Terminated(error.0));
                 }
             };
             for event in events {
@@ -867,10 +920,7 @@ impl Passthrough {
                 let clean = match join.accept(event) {
                     Ok(c) => c,
                     Err(e) => {
-                        return self
-                            .local_error(write, *started, 502, e.0, wait, None)
-                            .await
-                            .map(|()| AnswerOutcome::Terminated);
+                        return Ok(AnswerOutcome::Terminated(e.0));
                     }
                 };
                 if !clean.is_empty() {
