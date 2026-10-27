@@ -127,96 +127,6 @@ impl SqliteQueue {
             .map_err(storage_error)
     }
 
-    pub async fn mark_stale_active_dead(
-        &self,
-        queue_id: &QueueId,
-        stale_before: DateTime<Utc>,
-        reason: symbiotic_core::DiagnosticCode,
-    ) -> Result<usize, QueueError> {
-        self.mark_stale_active_dead_inner(Some(queue_id), stale_before, reason)
-            .await
-    }
-
-    pub async fn mark_all_stale_active_dead(
-        &self,
-        stale_before: DateTime<Utc>,
-        reason: symbiotic_core::DiagnosticCode,
-    ) -> Result<usize, QueueError> {
-        self.mark_stale_active_dead_inner(None, stale_before, reason)
-            .await
-    }
-
-    async fn mark_stale_active_dead_inner(
-        &self,
-        queue_id: Option<&QueueId>,
-        stale_before: DateTime<Utc>,
-        reason: symbiotic_core::DiagnosticCode,
-    ) -> Result<usize, QueueError> {
-        let now = self.now();
-        let queue_id = queue_id.cloned();
-        let (updated, items) = self
-            .with_connection(move |conn, _clock| {
-                let tx = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(storage_error)?;
-                let items = stale_active_items_in_tx(&tx, queue_id.as_ref(), stale_before, now)?;
-                let updated = match queue_id.as_ref() {
-                    Some(queue_id) => tx
-                        .execute(
-                            "update queue_items
-                         set status = 'dead',
-                             lease_owner = null,
-                             lease_until = null,
-                             last_error = ?3,
-                             updated_at = ?4
-                         where queue_id = ?1
-                           and status in ('pending', 'failed', 'running')
-                           and updated_at < ?2
-                           and (status != 'running' or lease_until is null or lease_until < ?4)",
-                            params![queue_id.0, ts(stale_before), reason.code(), ts(now)],
-                        )
-                        .map_err(storage_error)?,
-                    None => tx
-                        .execute(
-                            "update queue_items
-                         set status = 'dead',
-                             lease_owner = null,
-                             lease_until = null,
-                             last_error = ?2,
-                             updated_at = ?3
-                         where status in ('pending', 'failed', 'running')
-                           and updated_at < ?1
-                           and (status != 'running' or lease_until is null or lease_until < ?3)",
-                            params![ts(stale_before), reason.code(), ts(now)],
-                        )
-                        .map_err(storage_error)?,
-                };
-                tx.commit().map_err(storage_error)?;
-                Ok((updated, items))
-            })
-            .await?;
-        if let Some(sink) = &self.event_sink {
-            for mut item in items {
-                item.status = QueueStatus::Dead;
-                item.lease_owner = None;
-                item.lease_until = None;
-                item.last_error = Some(reason);
-                item.updated_at = now;
-                sink.record_queue_event(QueueEvent {
-                    item_id: item.item_id,
-                    queue_id: item.queue_id,
-                    kind: item.kind,
-                    status: item.status,
-                    attempt: item.attempt,
-                    timestamp: self.now(),
-                    error: Some(reason),
-                })
-                .await;
-            }
-        }
-        Ok(updated)
-    }
-
     /// Mark active items of every queue that have not changed since
     /// `stale_before` (and hold no live lease) dead with `reason`, without
     /// notifying the event sink. For startup and maintenance sweeps outside
@@ -347,7 +257,7 @@ impl SqliteQueue {
                 created_at: now,
                 updated_at: now,
             };
-            if let Err(err) = tx.execute(
+            tx.execute(
                 "insert into queue_items
                  (item_id, queue_id, kind, payload_json, status, attempt, max_attempts,
                   run_after, lease_owner, lease_until, idempotency_key, last_error, created_at, updated_at)
@@ -365,19 +275,7 @@ impl SqliteQueue {
                     ts(item.created_at),
                     ts(item.updated_at),
                 ],
-            ) {
-                if let Some(key) = &item.idempotency_key
-                    && is_unique_constraint(&err)
-                    && let Some(existing) = find_by_idempotency(&tx, &item.queue_id, key)?
-                {
-                    tx.commit().map_err(storage_error)?;
-                    return Ok(EnqueueOutcome {
-                        item: existing,
-                        disposition: EnqueueDisposition::ActiveDuplicate,
-                    });
-                }
-                return Err(storage_error(err));
-            }
+            ).map_err(storage_error)?;
             tx.commit().map_err(storage_error)?;
             Ok(EnqueueOutcome { item, disposition: EnqueueDisposition::Inserted })
         }).await?;
@@ -1015,7 +913,7 @@ fn find_by_idempotency(
                     created_at, updated_at, last_error_class
              from queue_items
              where queue_id = ?1 and idempotency_key = ?2
-             order by created_at desc
+             order by rowid desc
              limit 1",
         )
         .map_err(storage_error)?;
@@ -1102,53 +1000,6 @@ fn expired_running_items_in_tx(
         .map_err(storage_error)
 }
 
-fn stale_active_items_in_tx(
-    conn: &Connection,
-    queue_id: Option<&QueueId>,
-    stale_before: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Result<Vec<QueueItem>, QueueError> {
-    match queue_id {
-        Some(queue_id) => {
-            let mut stmt = conn
-                .prepare(
-                    "select item_id, queue_id, kind, payload_json, status, attempt, max_attempts,
-                            run_after, lease_owner, lease_until, idempotency_key, last_error,
-                            created_at, updated_at, last_error_class
-                     from queue_items
-                     where queue_id = ?1
-                       and status in ('pending', 'failed', 'running')
-                       and updated_at < ?2
-                       and (status != 'running' or lease_until is null or lease_until < ?3)
-                     order by updated_at asc",
-                )
-                .map_err(storage_error)?;
-            stmt.query_map(params![queue_id.0, ts(stale_before), ts(now)], row_to_item)
-                .map_err(storage_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(storage_error)
-        }
-        None => {
-            let mut stmt = conn
-                .prepare(
-                    "select item_id, queue_id, kind, payload_json, status, attempt, max_attempts,
-                            run_after, lease_owner, lease_until, idempotency_key, last_error,
-                            created_at, updated_at, last_error_class
-                     from queue_items
-                     where status in ('pending', 'failed', 'running')
-                       and updated_at < ?1
-                       and (status != 'running' or lease_until is null or lease_until < ?2)
-                     order by updated_at asc",
-                )
-                .map_err(storage_error)?;
-            stmt.query_map(params![ts(stale_before), ts(now)], row_to_item)
-                .map_err(storage_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(storage_error)
-        }
-    }
-}
-
 fn reclaim_expired_in_tx(
     conn: &Connection,
     queue_id: &QueueId,
@@ -1228,14 +1079,6 @@ fn json_to_sql(error: serde_json::Error) -> rusqlite::Error {
 
 fn queue_to_sql(error: QueueError) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
-}
-
-fn is_unique_constraint(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(code, _)
-            if code.code == rusqlite::ErrorCode::ConstraintViolation
-    )
 }
 
 #[cfg(test)]
@@ -1676,12 +1519,6 @@ mod tests {
         )
         .await;
         let reason = symbiotic_core::DiagnosticCode::LeaseExpired;
-        connection_wait_yields(
-            &queue,
-            queue.mark_stale_active_dead(&item.queue_id, Utc::now(), reason),
-        )
-        .await;
-        connection_wait_yields(&queue, queue.mark_all_stale_active_dead(Utc::now(), reason)).await;
         connection_wait_yields(&queue, queue.complete(&item.item_id, "worker")).await;
 
         for key in ["fail", "fail_with"] {
@@ -1782,95 +1619,6 @@ mod tests {
         let claimed_count = claimed.iter().map(Vec::len).sum::<usize>();
         assert_eq!(ids.len(), claimed_count);
         assert_eq!(claimed_count, 20);
-    }
-
-    #[tokio::test]
-    async fn mark_stale_active_dead_preserves_fresh_and_live_running_items() {
-        let queue = SqliteQueue::in_memory().unwrap();
-        let queue_id = QueueId::new("chat:deepseek:pro");
-        let stale_pending = queue.enqueue(request("stale-pending")).await.unwrap().item;
-        let fresh_pending = queue.enqueue(request("fresh-pending")).await.unwrap().item;
-        let stale_failed = queue.enqueue(request("stale-failed")).await.unwrap().item;
-        let stale_running = queue.enqueue(request("stale-running")).await.unwrap().item;
-        let live_running = queue.enqueue(request("live-running")).await.unwrap().item;
-
-        {
-            let conn = queue.conn.lock().unwrap();
-            let old = ts(Utc::now() - ChronoDuration::hours(2));
-            conn.execute(
-                "update queue_items set updated_at = ?2 where item_id = ?1",
-                params![stale_pending.item_id.0, old],
-            )
-            .unwrap();
-            conn.execute(
-                "update queue_items
-                 set status = 'failed', attempt = 1, updated_at = ?2
-                 where item_id = ?1",
-                params![stale_failed.item_id.0, old],
-            )
-            .unwrap();
-            conn.execute(
-                "update queue_items
-                 set status = 'running',
-                     attempt = 1,
-                     lease_owner = 'old-worker',
-                     lease_until = ?2,
-                     updated_at = ?3
-                 where item_id = ?1",
-                params![
-                    stale_running.item_id.0,
-                    ts(Utc::now() - ChronoDuration::hours(1)),
-                    old
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "update queue_items
-                 set status = 'running',
-                     attempt = 1,
-                     lease_owner = 'live-worker',
-                     lease_until = ?2,
-                     updated_at = ?3
-                 where item_id = ?1",
-                params![
-                    live_running.item_id.0,
-                    ts(Utc::now() + ChronoDuration::hours(1)),
-                    old
-                ],
-            )
-            .unwrap();
-        }
-
-        let updated = queue
-            .mark_stale_active_dead(
-                &queue_id,
-                Utc::now() - ChronoDuration::hours(1),
-                symbiotic_core::DiagnosticCode::StaleQueueItem,
-            )
-            .await
-            .unwrap();
-        assert_eq!(updated, 3);
-
-        assert_eq!(
-            queue.get(&stale_pending.item_id).unwrap().unwrap().status,
-            QueueStatus::Dead
-        );
-        assert_eq!(
-            queue.get(&stale_failed.item_id).unwrap().unwrap().status,
-            QueueStatus::Dead
-        );
-        assert_eq!(
-            queue.get(&stale_running.item_id).unwrap().unwrap().status,
-            QueueStatus::Dead
-        );
-        assert_eq!(
-            queue.get(&fresh_pending.item_id).unwrap().unwrap().status,
-            QueueStatus::Pending
-        );
-        assert_eq!(
-            queue.get(&live_running.item_id).unwrap().unwrap().status,
-            QueueStatus::Running
-        );
     }
 
     #[tokio::test]
