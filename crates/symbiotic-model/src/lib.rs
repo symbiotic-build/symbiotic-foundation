@@ -84,7 +84,7 @@ mod spend;
 pub use spend::*;
 
 mod secrets;
-pub use secrets::{CredentialBoundary, SecretValue, credential_encodings};
+pub use secrets::{CredentialBoundary, CredentialScrubber, SecretValue, credential_encodings};
 mod registry;
 pub use registry::*;
 mod anthropic;

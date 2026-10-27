@@ -1,5 +1,6 @@
 //! One retry engine for HTTP failures, connection failures and interrupted items.
 use super::*;
+use model::{CredentialScrubber, item_stream::ChatCompletionsAdapter};
 use std::sync::atomic::Ordering;
 
 struct AttemptLog<'a> {
@@ -37,7 +38,7 @@ struct Failure {
     code: String,
     class: ErrorClass,
     headers: HeaderMap,
-    event: Option<Box<ItemEvent>>,
+    event: Option<Vec<u8>>,
     new_session: bool,
 }
 impl Failure {
@@ -53,7 +54,7 @@ impl Failure {
     }
 }
 enum AnswerOutcome {
-    Complete,
+    Complete(Option<symbiotic_trace::UsageTrace>),
     Terminated(&'static str),
     Failure(Failure),
 }
@@ -311,7 +312,11 @@ impl Passthrough {
             route_name: route.config.name.clone(),
         };
         let mut rule = retry_policy::decision(policy, self.retry_hook.as_ref(), &context);
-        if rule.action == RetryAction::Switch && !fallback_available {
+        // Chat Completions has no replayable item identity. Even policy hooks cannot
+        // resend or switch once any downstream bytes (including headers) escaped.
+        if (started && route.config.stream == StreamDialect::OpenaiChatCompletions)
+            || (rule.action == RetryAction::Switch && !fallback_available)
+        {
             rule.action = RetryAction::Fail;
         }
         route
@@ -604,7 +609,7 @@ impl Passthrough {
             // execute() starts reqwest's timers; defer it until the grant actually sends.
             let transport = async { route.client.execute(transport_request).await };
             let mut was_new = false;
-            // Step 2: reserve a passthrough spend receipt immediately before sending.
+            let mut receipt = None;
             let queue_waited_ms = wait.total.as_millis() as u64;
             let next_attempt = wait.attempts.saturating_add(1);
             let sent = grant
@@ -622,6 +627,15 @@ impl Passthrough {
                         {
                             Ok(None)
                         } else {
+                            if route.config.stream == StreamDialect::OpenaiChatCompletions
+                                && route.config.method == PassthroughMethod::Post
+                            {
+                                receipt = Some(
+                                    route
+                                        .account
+                                        .reserve_passthrough(&route.config.identity())?,
+                                );
+                            }
                             was_new = new;
                             // Counted and logged inside the check, which runs just before the
                             // transport starts, so a cancelled send still counts.
@@ -691,7 +705,15 @@ impl Passthrough {
                             .answer(route, &mut response, write, &mut started, &mut join, wait)
                             .await?
                         {
-                            AnswerOutcome::Complete => {
+                            AnswerOutcome::Complete(usage) => {
+                                if let (Some(receipt), Some(usage)) = (&receipt, usage) {
+                                    route
+                                        .account
+                                        .finish_passthrough(receipt, &usage)
+                                        .map_err(|_| EgressError::StateUnavailable)?;
+                                }
+                                // A failed ledger write must leave HTTP visibly incomplete.
+                                finish(write).await?;
                                 route.retries.failures.store(0, Ordering::Release);
                                 wait.outcome = "complete".into();
                                 return Ok(());
@@ -811,10 +833,8 @@ impl Passthrough {
             }
             match decision.action {
                 RetryAction::Fail => {
-                    if started && let Some(event) = failure.event {
+                    if started && let Some(bytes) = failure.event {
                         wait.outcome = failure.code.clone();
-                        let bytes = ResponsesAdapter::encode(&event)
-                            .map_err(|_| EgressError::InvalidProviderJson)?;
                         chunk(write, &bytes).await?;
                         return finish(write).await;
                     }
@@ -920,7 +940,21 @@ impl Passthrough {
             return Ok(AnswerOutcome::Terminated("invalid_provider_response"));
         }
         let kind = kind.to_owned();
+        let chat = route.config.stream == StreamDialect::OpenaiChatCompletions;
+        if route.config.method == PassthroughMethod::Get && kind != "application/json" {
+            return Ok(AnswerOutcome::Terminated("invalid_provider_response"));
+        }
+        let mut scrubber = if chat || route.config.method == PassthroughMethod::Get {
+            Some(
+                CredentialScrubber::new(&route.secrets().await)
+                    .map_err(|_| EgressError::InvalidProviderJson)?,
+            )
+        } else {
+            None
+        };
         let mut adapter = ResponsesAdapter::default();
+        let mut chat_adapter = ChatCompletionsAdapter::default();
+        let mut usage = symbiotic_trace::UsageTrace::default();
         let mut received = 0usize;
         let mut json = Vec::new();
         loop {
@@ -935,8 +969,36 @@ impl Passthrough {
             };
             let Some(bytes) = next else {
                 if kind == "application/json" {
-                    if serde_json::from_slice::<serde_json::Value>(&json).is_err() {
+                    if chat && route.config.method == PassthroughMethod::Post {
+                        let event = match ChatCompletionsAdapter::json(&json) {
+                            Ok(event) => event,
+                            Err(_) => {
+                                return Ok(AnswerOutcome::Terminated("invalid_provider_json"));
+                            }
+                        };
+                        match event {
+                            ItemEvent::Usage {
+                                usage: reported, ..
+                            } => usage = reported,
+                            ItemEvent::Error { code, kind, .. } => {
+                                return Ok(AnswerOutcome::Failure(Failure {
+                                    status: 502,
+                                    code,
+                                    class: kind,
+                                    headers: response.headers().clone(),
+                                    event: None,
+                                    new_session: false,
+                                }));
+                            }
+                            _ => return Ok(AnswerOutcome::Terminated("invalid_provider_json")),
+                        }
+                    } else if serde_json::from_slice::<serde_json::Value>(&json).is_err() {
                         return Ok(AnswerOutcome::Terminated("invalid_provider_json"));
+                    }
+                    if let Some(scrubber) = &mut scrubber {
+                        let mut clean = scrubber.feed(&json);
+                        clean.extend(scrubber.finish());
+                        json = clean;
                     }
                     if !*started {
                         self.answer_head(route, response, write, &kind, wait)
@@ -944,8 +1006,7 @@ impl Passthrough {
                         *started = true;
                     }
                     chunk(write, &json).await?;
-                    finish(write).await?;
-                    return Ok(AnswerOutcome::Complete);
+                    return Ok(AnswerOutcome::Complete(chat.then_some(usage)));
                 }
                 return Ok(AnswerOutcome::Failure(Failure::network(
                     "upstream_disconnect",
@@ -960,7 +1021,12 @@ impl Passthrough {
                 json.extend_from_slice(&bytes);
                 continue;
             }
-            let events = match adapter.feed(&bytes, route.config.max_held_event_bytes) {
+            let decoded = if chat {
+                chat_adapter.feed(&bytes, route.config.max_held_event_bytes)
+            } else {
+                adapter.feed(&bytes, route.config.max_held_event_bytes)
+            };
+            let events = match decoded {
                 Ok(e) => e,
                 Err(error) => {
                     let error = crate::stream::StreamError::from(error);
@@ -969,17 +1035,29 @@ impl Passthrough {
             };
             for event in events {
                 if let ItemEvent::Error { code, kind, .. } = &event {
-                    join.add_usage(
-                        &ResponsesAdapter::event_usage(&event)
-                            .map_err(|_| EgressError::InvalidProviderJson)?,
-                    )
-                    .map_err(|_| EgressError::InvalidProviderJson)?;
+                    if !chat {
+                        join.add_usage(
+                            &ResponsesAdapter::event_usage(&event)
+                                .map_err(|_| EgressError::InvalidProviderJson)?,
+                        )
+                        .map_err(|_| EgressError::InvalidProviderJson)?;
+                    }
+                    let mut wire = if chat {
+                        event.record().wire().to_vec()
+                    } else {
+                        ResponsesAdapter::encode(&event)
+                            .map_err(|_| EgressError::InvalidProviderJson)?
+                    };
+                    if let Some(scrubber) = &mut scrubber {
+                        wire = scrubber.feed(&wire);
+                        wire.extend(scrubber.finish());
+                    }
                     return Ok(AnswerOutcome::Failure(Failure {
                         status: 502,
                         code: code.clone(),
                         class: *kind,
                         headers: response.headers().clone(),
-                        event: Some(Box::new(event)),
+                        event: Some(wire),
                         new_session: false,
                     }));
                 }
@@ -990,12 +1068,29 @@ impl Passthrough {
                         ..
                     }
                 );
-                let clean = match join.accept(event) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Ok(AnswerOutcome::Terminated(e.0));
+                let mut clean = if chat {
+                    match &event {
+                        ItemEvent::Usage {
+                            usage: reported,
+                            completed: false,
+                            ..
+                        } => usage = reported.clone(),
+                        ItemEvent::ItemDelta(_) => usage = Default::default(),
+                        _ => {}
+                    }
+                    event.record().wire().to_vec()
+                } else {
+                    match join.accept(event) {
+                        Ok(c) => c,
+                        Err(e) => return Ok(AnswerOutcome::Terminated(e.0)),
                     }
                 };
+                if let Some(scrubber) = &mut scrubber {
+                    clean = scrubber.feed(&clean);
+                    if completed {
+                        clean.extend(scrubber.finish());
+                    }
+                }
                 if !clean.is_empty() {
                     if !*started {
                         self.answer_head(route, response, write, &kind, wait)
@@ -1005,9 +1100,7 @@ impl Passthrough {
                     chunk(write, &clean).await?;
                 }
                 if completed {
-                    // Step 2: settle measured usage and emit an opted-in usage trailer.
-                    finish(write).await?;
-                    return Ok(AnswerOutcome::Complete);
+                    return Ok(AnswerOutcome::Complete(chat.then_some(usage)));
                 }
             }
         }

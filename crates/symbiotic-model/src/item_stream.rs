@@ -33,6 +33,12 @@ pub struct ItemRecord {
     original: Value,
     wire: Vec<u8>,
 }
+impl ItemRecord {
+    /// Original provider bytes, before any caller-facing edits.
+    pub fn wire(&self) -> &[u8] {
+        &self.wire
+    }
+}
 
 /// Neutral events consumed by the shared hold and join engine.
 #[derive(Clone, Debug)]
@@ -125,7 +131,26 @@ pub struct JoinFields<'a> {
 /// OpenAI Responses SSE adapter. No retry or admission policy lives here.
 #[derive(Default)]
 pub struct ResponsesAdapter {
+    records: SseRecords,
+}
+#[derive(Default)]
+struct SseRecords {
     pending: Vec<u8>,
+}
+impl SseRecords {
+    fn feed(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<Vec<u8>>, ItemStreamError> {
+        let mut out = Vec::new();
+        for &byte in bytes {
+            self.pending.push(byte);
+            if self.pending.len() > limit {
+                return Err(ItemStreamError::HeldEventBytesExceeded);
+            }
+            if self.pending.ends_with(b"\n\n") || self.pending.ends_with(b"\r\n\r\n") {
+                out.push(std::mem::take(&mut self.pending));
+            }
+        }
+        Ok(out)
+    }
 }
 impl ResponsesAdapter {
     /// Decode complete SSE records, refusing an unfinished record above the item limit.
@@ -134,19 +159,11 @@ impl ResponsesAdapter {
         bytes: &[u8],
         max_held_event_bytes: usize,
     ) -> Result<Vec<ItemEvent>, ItemStreamError> {
-        let mut out = Vec::new();
-        // Incrementally append so a single large network read cannot bypass the bound.
-        for &byte in bytes {
-            self.pending.push(byte);
-            if self.pending.len() > max_held_event_bytes {
-                return Err(ItemStreamError::HeldEventBytesExceeded);
-            }
-            if self.pending.ends_with(b"\n\n") || self.pending.ends_with(b"\r\n\r\n") {
-                let wire = std::mem::take(&mut self.pending);
-                out.push(self.decode(wire)?);
-            }
-        }
-        Ok(out)
+        self.records
+            .feed(bytes, max_held_event_bytes)?
+            .into_iter()
+            .map(|wire| self.decode(wire))
+            .collect()
     }
     fn decode(&mut self, wire: Vec<u8>) -> Result<ItemEvent, ItemStreamError> {
         let text = std::str::from_utf8(&wire).map_err(|_| ItemStreamError::InvalidEvent)?;
@@ -413,45 +430,250 @@ impl ResponsesAdapter {
         Self::usage(&event.record().value)
     }
     fn usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
-        let u = &value["response"]["usage"];
-        if !u.is_null() && !u.is_object() {
+        let mut usage = decode_usage(
+            &value["response"]["usage"],
+            "input_tokens",
+            "output_tokens",
+            "input_tokens_details",
+            "output_tokens_details",
+        )?;
+        usage.response_id = value["response"]["id"].as_str().map(str::to_owned);
+        usage.served_model = value["response"]["model"].as_str().map(str::to_owned);
+        Ok(usage)
+    }
+}
+
+fn decode_usage(
+    u: &Value,
+    input: &str,
+    output: &str,
+    input_details: &str,
+    output_details: &str,
+) -> Result<UsageTrace, ItemStreamError> {
+    if !u.is_null() && !u.is_object() {
+        return Err(ItemStreamError::InvalidEvent);
+    }
+    for details in [input_details, output_details] {
+        if u.get(details)
+            .is_some_and(|v| !v.is_null() && !v.is_object())
+        {
             return Err(ItemStreamError::InvalidEvent);
         }
-        for details in ["input_tokens_details", "output_tokens_details"] {
-            if u.get(details)
-                .is_some_and(|v| !v.is_null() && !v.is_object())
-            {
+    }
+    let number = |v: &Value| {
+        if v.is_null() {
+            Ok(None)
+        } else {
+            v.as_u64().map(Some).ok_or(ItemStreamError::InvalidEvent)
+        }
+    };
+    let input = number(&u[input])?;
+    let cached = number(&u[input_details]["cached_tokens"])?;
+    if cached.zip(input).is_some_and(|(c, i)| c > i) {
+        return Err(ItemStreamError::InvalidEvent);
+    }
+    Ok(UsageTrace {
+        input_tokens: input,
+        output_tokens: number(&u[output])?,
+        cache_hit_tokens: cached,
+        cache_miss_tokens: input.zip(cached).map(|(i, c)| i - c),
+        reasoning_tokens: number(&u[output_details]["reasoning_tokens"])?,
+        ..Default::default()
+    })
+}
+
+/// Chat Completions decoder. Deltas have no replayable item identity.
+/// Consumers relay original bytes and may retry only before releasing bytes.
+#[derive(Default)]
+pub struct ChatCompletionsAdapter {
+    records: SseRecords,
+}
+impl ChatCompletionsAdapter {
+    /// Decode complete SSE records, preserving comments, unknown fields and `[DONE]`.
+    pub fn feed(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<ItemEvent>, ItemStreamError> {
+        self.records
+            .feed(bytes, limit)?
+            .into_iter()
+            .map(|wire| {
+                let text = std::str::from_utf8(&wire).map_err(|_| ItemStreamError::InvalidEvent)?;
+                let data: Vec<_> = text
+                    .lines()
+                    .filter_map(|l| {
+                        l.strip_prefix("data:")
+                            .map(|d| d.strip_prefix(' ').unwrap_or(d))
+                    })
+                    .collect();
+                if data.is_empty() {
+                    return Ok(ItemEvent::Other(Self::record(Value::Null, wire)));
+                }
+                let data = data.join("\n");
+                if data == "[DONE]" {
+                    return Ok(ItemEvent::Usage {
+                        record: Self::record(Value::Null, wire),
+                        usage: UsageTrace::default(),
+                        completed: true,
+                    });
+                }
+                let value =
+                    serde_json::from_str(&data).map_err(|_| ItemStreamError::InvalidEvent)?;
+                Self::decode(value, wire, false)
+            })
+            .collect()
+    }
+    /// Decode one non-streaming Chat Completions JSON response.
+    pub fn json(bytes: &[u8]) -> Result<ItemEvent, ItemStreamError> {
+        let value = serde_json::from_slice(bytes).map_err(|_| ItemStreamError::InvalidEvent)?;
+        Self::decode(value, bytes.to_vec(), true)
+    }
+    fn record(value: Value, wire: Vec<u8>) -> ItemRecord {
+        ItemRecord {
+            response_id: value["id"].as_str().map(str::to_owned),
+            original: value.clone(),
+            value,
+            wire,
+            item_id: None,
+            output_index: None,
+            provider_sequence_number: None,
+        }
+    }
+    fn decode(value: Value, wire: Vec<u8>, completed: bool) -> Result<ItemEvent, ItemStreamError> {
+        if !value.is_object() {
+            return Err(ItemStreamError::InvalidEvent);
+        }
+        if let Some(error) = value.get("error") {
+            if !error.is_object() {
                 return Err(ItemStreamError::InvalidEvent);
             }
+            let code = error["code"]
+                .as_str()
+                .or_else(|| error["type"].as_str())
+                .unwrap_or("upstream_failure")
+                .to_owned();
+            let kind = ResponsesAdapter::classify(None, &code);
+            return Ok(ItemEvent::Error {
+                record: Self::record(value, wire),
+                code,
+                kind,
+            });
         }
-        let number = |v: &Value| {
-            if v.is_null() {
-                Ok(None)
-            } else {
-                v.as_u64().map(Some).ok_or(ItemStreamError::InvalidEvent)
-            }
-        };
-        let input = number(&u["input_tokens"])?;
-        let cached = number(&u["input_tokens_details"]["cached_tokens"])?;
-        if cached.zip(input).is_some_and(|(c, i)| c > i) {
+        let choices = value["choices"]
+            .as_array()
+            .ok_or(ItemStreamError::InvalidEvent)?;
+        if choices.iter().any(|c| {
+            !c.is_object()
+                || c["index"].as_u64().is_none()
+                || c.get("delta").is_some_and(|v| !v.is_object())
+                || c.get("message").is_some_and(|v| !v.is_object())
+                || c.get("finish_reason")
+                    .is_some_and(|v| !v.is_null() && !v.is_string())
+        }) {
             return Err(ItemStreamError::InvalidEvent);
         }
-        Ok(UsageTrace {
-            input_tokens: input,
-            output_tokens: number(&u["output_tokens"])?,
-            cache_hit_tokens: cached,
-            cache_miss_tokens: input.zip(cached).map(|(i, c)| i - c),
-            reasoning_tokens: number(&u["output_tokens_details"]["reasoning_tokens"])?,
-            response_id: value["response"]["id"].as_str().map(str::to_owned),
-            served_model: value["response"]["model"].as_str().map(str::to_owned),
-            ..Default::default()
-        })
+        let usage = decode_usage(
+            &value["usage"],
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+        )?;
+        let record = Self::record(value, wire);
+        if completed || !record.value["usage"].is_null() {
+            Ok(ItemEvent::Usage {
+                record,
+                usage,
+                completed,
+            })
+        } else {
+            Ok(ItemEvent::ItemDelta(record))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chat_completions_chunks_preserve_wire_and_decode_usage_at_every_split() {
+        let wire = b": keep\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"part\"}}]},\"finish_reason\":null}],\"unknown\":1.2300}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\ndata: [DONE]\n\n";
+        for split in 0..=wire.len() {
+            let mut adapter = ChatCompletionsAdapter::default();
+            let mut events = adapter.feed(&wire[..split], 4096).unwrap();
+            events.extend(adapter.feed(&wire[split..], 4096).unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .flat_map(|e| e.record().wire().iter().copied())
+                    .collect::<Vec<_>>(),
+                wire
+            );
+            assert!(matches!(events[0], ItemEvent::ItemDelta(_)));
+            let ItemEvent::Usage {
+                usage,
+                completed: false,
+                ..
+            } = &events[1]
+            else {
+                panic!("reported usage")
+            };
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_hit_tokens,
+                    usage.cache_miss_tokens,
+                    usage.reasoning_tokens
+                ),
+                (Some(7), Some(3), Some(2), Some(5), Some(1))
+            );
+            assert!(matches!(
+                events[2],
+                ItemEvent::Usage {
+                    completed: true,
+                    ..
+                }
+            ));
+        }
+    }
+    #[test]
+    fn chat_completions_json_preserves_missing_usage_and_classifies_errors() {
+        let event = ChatCompletionsAdapter::json(
+            br#"{"choices":[{"index":0,"message":{"content":"answer"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        let ItemEvent::Usage {
+            usage,
+            completed: true,
+            ..
+        } = event
+        else {
+            panic!("JSON response")
+        };
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            serde_json::to_value(UsageTrace::default()).unwrap()
+        );
+        let error = ChatCompletionsAdapter::json(br#"{"error":{"code":"slow_down"}}"#).unwrap();
+        assert!(matches!(
+            error,
+            ItemEvent::Error {
+                kind: ErrorClass::Throttle,
+                ..
+            }
+        ));
+        for value in [
+            serde_json::json!({"choices":{},"usage":{}}),
+            serde_json::json!({"choices":[{"index":-1}]}),
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":-1}}),
+            serde_json::json!({"choices":[],"usage":{"completion_tokens":"3"}}),
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":2}}}),
+        ] {
+            assert!(ChatCompletionsAdapter::json(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        assert!(matches!(
+            ChatCompletionsAdapter::default().feed(b"data: ", 5),
+            Err(ItemStreamError::HeldEventBytesExceeded)
+        ));
+    }
     #[test]
     fn responses_sequence_round_trips_with_unknown_fields_and_metadata() {
         let wire = b": comment\r\nevent: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"},\"extra\":1.2300}\r\n\r\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n";

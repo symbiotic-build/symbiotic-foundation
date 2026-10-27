@@ -13,7 +13,7 @@ This record designs two additions to the credential process for
 2. a **passthrough route**, which forwards an agent tool's own streaming HTTP request
    through the account's existing queue limits without decoding it.
 
-Nothing here is implemented yet. The operator approved this record on 2026-10-25
+Login and Responses passthrough are implemented. The operator approved this record on 2026-10-25
 (§Operator decisions). It changes a security boundary and the
 [boundary contract](../architecture/boundary.md), so only the operator could approve it.
 
@@ -48,7 +48,8 @@ The lead decided on 2026-10-26:
   the cooldown, charge pacing, start the send and release the gate. Recording a
   cooldown after a 429 takes the same gate (§Admission).
 - **One item bound:** `max_held_event_bytes` defaults to 67 108 864 with a
-  Serde default. It bounds the events retained for one unfinished output item.
+  Serde default. It bounds the events retained for one unfinished Responses output item.
+  For Chat Completions, it bounds each SSE record.
   Exceeding it ends the stream with a visible error. `rate_burst_seconds` defaults
   to zero. Both defaults preserve existing configurations.
 
@@ -59,9 +60,9 @@ original record.
 
 - Adapters classify failures. One configurable policy table chooses retry, switch
   or fail. One shared queue engine owns backoff before and during an answer.
-- Output-item events wait for `response.output_item.done`. Half-finished items
+- Responses output-item events wait for `response.output_item.done`. Half-finished items
   never reach the caller.
-- No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+- Responses POST performs no response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
   The corresponding Warden matching-filter removal is tracked by
   [warden#493](https://github.com/symbiotic-build/warden/issues/493).
 - A handled mid-answer failure discards the partial item and continues with every
@@ -144,8 +145,8 @@ account (two or three streams to start).
 - **Maximum cooldown wait:** `max_queue_wait_seconds`, an optional route setting, off
   by default. When set, a request that has waited that long for cooldowns gets 429
   with the remaining cooldown. Waiting for a free slot never counts against it.
-- **Stream dialect:** which provider event format a route streams. Only OpenAI
-  Responses has an item-stream adapter in this step.
+- **Stream dialect:** which provider event format a route streams: OpenAI
+  Responses or Chat Completions.
 
 ## Walkthrough
 
@@ -432,7 +433,8 @@ rules: owner-only directory, the bind lock beside the socket, and a peer UID equ
 the process UID. A host therefore runs as the same UID as the credential process.
 Request parsing is strict: one origin-form path without query, percent, fragment or
 backslash; no duplicate headers; no `Transfer-Encoding` or `Expect`; a
-`Content-Length` within `max_request_bytes`. The caller's `Authorization`,
+`Content-Length` within `max_request_bytes` on POST. GET may omit Content-Length
+for an empty body. The caller's `Authorization`,
 cookies, `Host` and forwarding headers are never copied.
 
 **Admission.** Each passthrough route registers its account with the runtime exactly
@@ -450,9 +452,10 @@ from its pacing check through the claim
 ([AI runtime §Current shared limits](../architecture/ai-runtime.md#current-shared-limits)).
 Typed sends pass this same gate. Every passthrough send, first or resent, takes the
 gate, rechecks login state, re-reads the durable cooldown and checks pacing admission.
-Only after those checks pass does it reserve one request in the spend ledger,
-charge pacing, start the send and release the gate. A waiting request creates no
-reservation; each actual send creates exactly one.
+Only after those checks pass does each actual Chat Completions POST send reserve
+exactly one request in the spend ledger.
+Responses POST and GET listings create none. A waiting request creates no reservation.
+The process then charges pacing, starts the send and releases the gate for every dialect.
 Recording a cooldown after a 429 takes that gate too. A send therefore either starts
 before the cooldown is recorded and is already in flight, or sees the cooldown and
 waits. The gate is released before any cooldown or pacing wait and before streaming
@@ -484,9 +487,9 @@ the answer. This extends the existing runtime mechanism; it adds no scheduler.
    - If pacing budget is unavailable, release the gate and wait with the slot held;
      then recheck login state and return to step 4.
 8. **Reserve and send:** with the gate still held and all checks passed, inject the
-   credential headers and reserve one request in the spend ledger. Immediately
-   charge pacing, send the body unchanged and release the gate.
-   - Every send is charged, including resends after a 429 or a login's first 401.
+   credential headers. Reserve one request in the spend ledger only for Chat Completions POST.
+   Immediately charge pacing, send the body unchanged and release the gate.
+   - Every send charges pacing, including resends after a 429 or a login's first 401.
 9. **Classify a failure:** apply the adapter mapping and route extensions, then
    the selected policy table. Retry returns to admission with the same slot;
    new-session holds release the slot so established sessions can proceed.
@@ -635,11 +638,13 @@ without a usable `Retry-After` uses the account's existing retry backoff
 (`retry_base_delay_ms`, doubling, 120 s clamp). Response bodies are never parsed for
 reset hints. The cooldown only moves forward, as today.
 
-No response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+Responses POST performs no response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
 
-All item events wait until the done event, then leave in arrival order.
+Responses item events wait until the done event, then leave in arrival order.
 `max_held_event_bytes` bounds the events retained for one unfinished item.
 Exceeding it emits a visible static error without releasing the partial item.
+Chat Completions forwards complete SSE records progressively after scrubbing;
+`max_held_event_bytes` bounds each record, not a complete choice.
 
 ### Internal item stream
 
@@ -652,9 +657,61 @@ provider fields remain opaque. Public Rust names use the naming conventions abov
 
 One Responses SSE adapter decodes provider events and re-encodes them. Unchanged
 events round-trip byte-for-byte. Modified events preserve every JSON field except
-explicit join edits. The credential process implements holding and joining once
-against the neutral enum. No Chat Completions,
-Anthropic Messages or Gemini adapter is built in this step.
+explicit join edits. The credential process implements Responses holding and joining once
+against the neutral enum. The Chat Completions adapter also decodes SSE and JSON
+into neutral events. It preserves original bytes for forwarding. Anthropic Messages
+and Gemini remain outside this implementation.
+
+### Chat Completions and model listings (#162)
+
+Issue [#162](https://github.com/symbiotic-build/symbiotic-foundation/issues/162)
+extends the approved passthrough with `stream: "openai_chat_completions"`.
+This task requires credential scrubbing and receipts for Chat Completions, replacing
+those deferrals for this dialect only. Responses keeps its existing behavior.
+
+A POST route accepts Chat Completions SSE or JSON. The adapter reads choices,
+provider errors, final usage and the `[DONE]` sentinel. It never reconstructs wire
+bytes from decoded JSON. A finish reason ends a choice; `[DONE]` ends the SSE response.
+Missing `[DONE]` is a visible disconnect, even after a final usage chunk.
+
+Every Chat Completions envelope passes through one incremental credential scrubber
+before forwarding. The scrubber uses the existing credential encoding set and replaces
+matches with `[REDACTED]`. An unfinished match waits for the next bytes. The same
+scrubber handles JSON model listings and non-streaming answers. Unmatched bytes,
+including unknown fields and SSE metadata, remain unchanged.
+
+The shared retry engine handles throttle, network and server failures before the
+first downstream byte. Once any bytes reach the caller, retries and route switching
+are refused, including overrides from named policies or hooks. Chat Completions has
+no replayable item identity. Fallback routes must use the same method and dialect. Provider error envelopes stay visible after scrubbing;
+a disconnect produces the existing static `upstream_disconnect` event. Responses
+alone continues and joins complete items.
+
+A Chat Completions POST reserves one attempt in the runtime's existing spend ledger
+immediately before each send. A successful terminal response settles only reported
+numeric usage. The final SSE `usage` object maps `prompt_tokens`, `completion_tokens`,
+`prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`
+to the existing usage fields. Non-streaming JSON uses the same mapping. Missing usage,
+provider errors, disconnects and cancellation retain `Unknown`. Provider text and answer
+bytes are never stored. Each send has an independent generated invocation, so an unknown
+attempt does not prevent the next send. Settlement precedes the final HTTP chunk;
+a ledger failure leaves the response visibly incomplete. No new table, index or queue
+is added.
+
+Configure a model listing with the existing `method: "get"`, exact `path` and
+`destination`, and the account's existing `stream` value. No new configuration key
+is needed. GET accepts a missing Content-Length as zero and relays JSON only. Listings
+reuse admission, retry, cooldown, header filtering and scrubbing. They create no spend
+receipt. POST continues to require Content-Length.
+
+Verification: `chat_completions_and_get_model_listing_routes_validate_without_io`,
+`chat_completions_static_key_stream_and_json_preserve_wire_and_record_reported_usage`,
+`chat_completions_pre_byte_throttle_and_server_failure_retry_through_shared_cooldown`,
+`chat_completions_scrubs_credentials_split_across_provider_chunks`,
+`chat_completions_failure_after_first_byte_is_visible_even_with_retry_override`,
+`chat_completions_disconnect_before_first_byte_retries_original_request` and
+`chat_completions_get_model_listing_relays_json_with_scrubbing` and
+`chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after_restart`.
 
 ### Continue and join
 
@@ -710,7 +767,8 @@ without parsing the stream. A stream without a usage event gets no trailer. The
 process keeps no per-caller totals and enforces no per-caller ceiling.
 
 **Deferred (operator decision, 2026-10-26).** The first implementation ships without
-both the spend receipts and the usage trailer above. Nothing consumes them yet: a login
+Responses spend receipts and the usage trailer above. Chat Completions receipts ship
+under #162 as described above. Nothing consumes Responses receipts yet: a login
 account has no per-request price, and no host enforces per-request usage yet.
 [#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165) tracks both.
 
@@ -926,11 +984,12 @@ All use loopback provider fixtures with synthetic tokens, in
   a login's 401 resend each wait for request pacing budget and charge it once
   immediately before sending. During each resend wait the original slot stays
   held; the fixture receives the same body and no send before pacing permits it.
-- **Reservation after admission:** with pacing exhausted and a controlled clock,
+- **Chat Completions POST reservation after admission:** with pacing exhausted and a controlled clock,
   a waiting request creates no spend reservation. Repeated admission checks while
   pacing is exhausted still create none. Once pacing permits a send, exactly one
   reservation exists for it. Repeat for a 429 resend and a login's 401 resend;
   each actual send has one reservation, with none added during its waits.
+  Responses POST and GET listings create no reservations.
 - **In-flight limit:** with `max_in_flight: 2`, five callers never have more than
   two concurrent requests at the fixture.
 - **Slot wait is not a 429:** with `max_in_flight: 1`, `max_queue_wait_seconds: 5` and
@@ -942,9 +1001,11 @@ All use loopback provider fixtures with synthetic tokens, in
 - **Cooldown recorded before dispatch:** pause a sender after its slot grant and
   before it takes the rate gate. Another caller's 429 records a cooldown under that
   gate. Resume the sender; the fixture sees no send from it until the cooldown ends.
-- **Complete-item release:** no event of a half-finished item reaches the caller.
+- **Responses complete-item release:** no event of a half-finished item reaches the caller.
   Item events release in arrival order only after the done event.
-- **Held-item bound:** an item exceeding `max_held_event_bytes` yields a visible error.
+- **Responses held-item bound:** an item exceeding `max_held_event_bytes` yields a visible error.
+- **Chat Completions record bound:** complete SSE records forward progressively after scrubbing.
+  A record exceeding `max_held_event_bytes` yields a visible error.
 - **Continue and join:** listed failed events and premature disconnects replay every
   complete item exactly, including encrypted reasoning. Partial items are discarded.
   Output uses one response ID, contiguous sequences, offset indexes and one final
