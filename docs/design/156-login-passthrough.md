@@ -264,7 +264,9 @@ Renewal errors use static diagnostic codes, never provider or transport error te
 **Renewal.** The process renews when the access token expires within 300 s, or once
 after the provider answers 401 to a forwarded request. Renewal runs under one async
 mutex per login store, so concurrent requests near expiry cause one token exchange.
-Requests that wait on that mutex use the renewed token.
+Requests that wait on that mutex use the renewed token. Grok logins also renew in
+the background at expiry minus 300 s while the process runs, as the Grok CLI does,
+so an idle Grok login keeps a refresh token in use.
 
 **Procedure: one renewal**
 
@@ -315,7 +317,8 @@ in Unix seconds:
 {"version":1,"state":"running","updated_at":1792000000,"routes":[{"name":"codex_responses","login":"ok","expires_at":1793000000,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null}]}
 ```
 
-`login` is `ok`, `expiring` (expires within two days), `renewal_failed` or
+`login` is `ok`, `expiring` (expires within 300 s for Grok, within two days for
+Codex and Kimi), `renewal_failed` or
 `login_required`; static-key routes report `static` with `expires_at: null`.
 On a clean stop (SIGTERM or SIGINT), the top-level `state` is `stopping` before the
 process closes its socket.

@@ -398,7 +398,9 @@ impl Passthrough {
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let mut login = Login::open(path, *family, config.max_secret_bytes)?;
                             login.notifications = changed.clone();
-                            entry.insert((*family, Arc::new(login)))
+                            let login = Arc::new(login);
+                            login.start_proactive_renewal()?;
+                            entry.insert((*family, login))
                         }
                     };
                     Credential::Login(entry.1.clone())
