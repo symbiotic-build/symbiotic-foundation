@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const GROK_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const KIMI_CLIENT: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const RENEWAL_WINDOW_SECS: u64 = 300;
 const UNAVAILABLE: EgressError = EgressError::CredentialUnavailable;
 type Result<T> = std::result::Result<T, EgressError>;
 
@@ -149,9 +150,9 @@ impl Store {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoginHealth {
-    /// Token remains valid for more than two days.
+    /// Token remains valid for more than 300 seconds (Grok) or two days (Codex/Kimi).
     Ok,
-    /// Token expires within two days.
+    /// Token expires within 300 seconds (Grok) or two days (Codex/Kimi).
     Expiring,
     /// A safe-to-retry exchange failed, or a retried request got another 401.
     RenewalFailed,
@@ -187,6 +188,7 @@ impl LoginRequest {
 
 /// Lifetime-exclusive owner of one login store. No other process may import it.
 pub struct Login {
+    family: LoginFamily,
     path: PathBuf,
     max_secret_bytes: usize,
     _lock: crate::ProcessLock,
@@ -201,6 +203,61 @@ pub struct Login {
     fail_install: std::sync::atomic::AtomicBool,
 }
 impl Login {
+    // Start once per store owner. Keep only a weak reference while waiting so
+    // dropping the service releases its login's lifetime lock.
+    pub(crate) fn start_proactive_renewal(self: &std::sync::Arc<Self>) -> Result<()> {
+        if self.family != LoginFamily::XaiGrok {
+            return Ok(());
+        }
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| EgressError::StateUnavailable)?;
+        let login = std::sync::Arc::downgrade(self);
+        let mut health = self.health_state.subscribe();
+        runtime.spawn(async move {
+            loop {
+                let (failure, expires_at, retry_renewal) = *health.borrow_and_update();
+                let delay = match failure {
+                    Some(LoginHealth::RenewalFailed) if retry_renewal => Duration::from_secs(60),
+                    Some(_) => Duration::ZERO,
+                    None => {
+                        let Ok(at) = now() else {
+                            tracing::warn!(
+                                "Grok proactive renewal stopped: system clock unavailable"
+                            );
+                            return;
+                        };
+                        Duration::from_secs(
+                            expires_at
+                                .saturating_sub(RENEWAL_WINDOW_SECS)
+                                .saturating_sub(at),
+                        )
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = health.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let Some(login) = login.upgrade() else {
+                    return;
+                };
+                let mut state = login.state.lock().await;
+                // Renewal publishes LoginRequired while an exchange is in flight.
+                // Inspect only its settled result under the mutex before stopping.
+                if login.renew(&mut state, false).await.is_err()
+                    && !(state.failure == Some(LoginHealth::RenewalFailed) && state.retry_renewal)
+                {
+                    return;
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Open a protected, bounded store and take its nonblocking lifetime lock.
     /// A set renewal fence opens in `login_required` and never exchanges a token.
     pub fn open(path: &Path, family: LoginFamily, max_secret_bytes: usize) -> Result<Self> {
@@ -222,6 +279,7 @@ impl Login {
         store.remember(&mut history);
         let health_state = tokio::sync::watch::channel((failure, store.expires_at, false)).0;
         Ok(Self {
+            family,
             renewing: std::sync::atomic::AtomicBool::new(false),
             history_state: tokio::sync::watch::channel(history).0,
             health_state,
@@ -275,9 +333,14 @@ impl Login {
         let renewing = self.renewing.load(std::sync::atomic::Ordering::Acquire);
         let fenced = self.fence.metadata().map_err(|_| UNAVAILABLE)?.len() != 0;
         let failure = if renewing { None } else { failure };
+        let expiry_window = if self.family == LoginFamily::XaiGrok {
+            RENEWAL_WINDOW_SECS
+        } else {
+            2 * 24 * 60 * 60
+        };
         let health = failure.unwrap_or(if fenced && !renewing {
             LoginHealth::LoginRequired
-        } else if expires_at <= now()?.saturating_add(2 * 24 * 60 * 60) {
+        } else if expires_at <= now()?.saturating_add(expiry_window) {
             LoginHealth::Expiring
         } else {
             LoginHealth::Ok
@@ -365,7 +428,10 @@ impl Login {
             return Err(UNAVAILABLE);
         }
         let at = now()?;
-        if !force && !state.retry_renewal && state.store.expires_at > at.saturating_add(300) {
+        if !force
+            && !state.retry_renewal
+            && state.store.expires_at > at.saturating_add(RENEWAL_WINDOW_SECS)
+        {
             if state.failure.is_some() {
                 return Err(UNAVAILABLE);
             }
@@ -1452,6 +1518,59 @@ mod tests {
             assert_eq!(login.health().await.unwrap().0, LoginHealth::RenewalFailed);
             assert!(login.request().await.is_err());
             assert_eq!(login.health().await.unwrap().0, LoginHealth::RenewalFailed);
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_proactively_renews_without_requests_and_releases_store_on_drop() {
+        let fixture = Fixture::start(200, "https://auth.x.ai/token").await;
+        let dir = tempfile::tempdir().unwrap();
+        let expiry = now().unwrap() + 301;
+        let login = Arc::new(login(dir.path(), LoginFamily::XaiGrok, expiry, &fixture));
+        let mut health = login.health_state.subscribe();
+        login.start_proactive_renewal().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (failure, expires_at, _) = *health.borrow_and_update();
+                if failure.is_none() && expires_at > expiry {
+                    break;
+                }
+                health.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("background renewal must complete without a request");
+        assert_eq!(fixture.count(), 1);
+        let stored: Store =
+            serde_json::from_slice(&read_private_file(&dir.path().join("login"), LIMIT).unwrap())
+                .unwrap();
+        assert!(
+            stored.access_token.text() == "new-access",
+            "rotated access credential must be persisted"
+        );
+        assert!(
+            stored.refresh_token.text() == "new-refresh",
+            "rotated refresh credential must be persisted"
+        );
+        assert!(stored.expires_at > expiry);
+        drop(login);
+        let reopened = Login::open(&dir.path().join("login"), LoginFamily::XaiGrok, LIMIT).unwrap();
+        assert_eq!(
+            reopened.health().await.unwrap(),
+            (LoginHealth::Ok, stored.expires_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_health_is_expiring_only_when_renewal_is_due() {
+        crate::protect_process().unwrap();
+        for (seconds, expected) in [(6 * 60 * 60, LoginHealth::Ok), (300, LoginHealth::Expiring)] {
+            let dir = tempfile::tempdir().unwrap();
+            let expiry = now().unwrap() + seconds;
+            let path = dir.path().join("login");
+            install(&path, &stored(LoginFamily::XaiGrok, expiry), false, LIMIT).unwrap();
+            let login = Login::open(&path, LoginFamily::XaiGrok, LIMIT).unwrap();
+            assert_eq!(login.health().await.unwrap(), (expected, expiry));
         }
     }
 

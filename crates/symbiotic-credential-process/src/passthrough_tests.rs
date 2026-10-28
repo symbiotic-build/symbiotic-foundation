@@ -203,7 +203,7 @@ impl Harness {
             .unwrap();
         pass.wire_base = Some(fixture.base.clone());
         pass.retry_hook = hook;
-        for route in &mut pass.routes {
+        for mut route in std::mem::take(&mut pass.routes) {
             route.client = reqwest::Client::builder()
                 .no_proxy()
                 .no_gzip()
@@ -221,12 +221,22 @@ impl Harness {
                 .connect_timeout(Duration::from_secs(route.config.idle_timeout_seconds))
                 .build()
                 .unwrap();
-            if let Credential::Login(login) = &mut route.credential {
-                Arc::get_mut(login).unwrap().test_transport(
-                    &fixture.base,
-                    fixture.idle_timeout.unwrap_or(Duration::from_secs(2)),
-                );
-            }
+            route.credential = match route.credential {
+                Credential::Login(login) => {
+                    // Unwrap also detaches the idle task's weak reference before
+                    // installing the fixture transport and restarting renewal.
+                    let mut login = Arc::try_unwrap(login).ok().unwrap();
+                    login.test_transport(
+                        &fixture.base,
+                        fixture.idle_timeout.unwrap_or(Duration::from_secs(2)),
+                    );
+                    let login = Arc::new(login);
+                    login.start_proactive_renewal().unwrap();
+                    Credential::Login(login)
+                }
+                credential => credential,
+            };
+            pass.routes.push(route);
         }
         let listener = bind(&process).unwrap();
         let (stop, stopped) = oneshot::channel();
@@ -1454,7 +1464,8 @@ async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
         };
     })
     .await;
-    let call = harness.call().await;
+    // The token is inside the renewal window, so background renewal starts
+    // discovery without a request.
     let discovery = fixture.next().await;
     assert!(
         discovery
@@ -1463,9 +1474,6 @@ async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
     );
     // Drive the timeout only after the server has received the request bytes.
     advance_clock(fixture.idle_timeout.unwrap()).await;
-    let (status, _, body) = decoded(&call.await.unwrap());
-    assert_eq!(status, 503);
-    assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
     harness
         .health_where(|h| h["routes"][0]["login"] == "renewal_failed")
         .await;

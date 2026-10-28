@@ -1140,13 +1140,17 @@ zeroizing storage and have no diagnostic representation. A lifetime-exclusive
 nonblocking lock prevents another owner or import while the process runs.
 
 Renewal occurs within 300 s of expiry under one async mutex per store.
-Concurrent callers share the completed renewal. Before an exchange, the process
-writes and syncs a nonempty renewal fence and syncs its directory. It installs
+Grok logins also renew in the background at expiry minus 300 s while the process
+runs, without requests. Codex and Kimi renew only on requests.
+Concurrent callers and background renewal share the completed renewal. Before an
+exchange, the process writes and syncs a nonempty renewal fence and syncs its directory. It installs
 rotated tokens by syncing a temporary store, renaming it and syncing the directory.
 Import follows this same durable-install-before-fence-clear ordering.
 Only then does it truncate and sync the fence. A cancelled or uncertain exchange
 leaves the fence set and requires fresh import. A transport failure established
 before send clears the fence and permits renewal on the next request.
+Grok background renewal retries safe-to-retry failures after 60 s and stops when
+the login requires import or the fence remains set.
 One upstream 401 forces renewal and one resend. A second 401 marks
 `renewal_failed` and returns 401. It sets the existing refusal fence so restart
 still requires a fresh import; a reopened store reports `login_required`.
@@ -1182,7 +1186,8 @@ notifications also trigger publication when typed providers set the deadline.
 Each replacement is synced and has mode 0640; the provisioned directory supplies its group. The file contains
 only `version`, `state`, `updated_at` and per-route `name`, `login`, `expires_at`
 and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
-`rate_limits_seen_at` and `new_session_hold_until`. Login states are `ok`, `expiring` within two days,
+`rate_limits_seen_at` and `new_session_hold_until`. Login states are `ok`,
+`expiring` within 300 s for Grok or two days for Codex and Kimi,
 `renewal_failed`, `login_required`, or `static`. SIGTERM and SIGINT publish
 `state: "stopping"` before closing the socket. Readers reject missing or malformed
 files, timestamps older than 30 s, stopping processes and unusable login states.
