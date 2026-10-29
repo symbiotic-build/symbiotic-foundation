@@ -642,6 +642,14 @@ without a usable `Retry-After` uses the account's existing retry backoff
 reset hints. The cooldown only moves forward, as today.
 
 Responses POST performs no response-body credential matching (operator decision 2026-10-26; the token is added outside the sandbox and never reaches the model).
+Provider failure events (`error`, `response.failed`, `response.incomplete`) are an
+exception: they are credential-scrubbed before reaching the caller.
+A non-terminal `error` waits for the terminal failure event or stream end within
+the existing limits.
+A fail decision forwards these events as a 200 SSE stream, even before output.
+The `upstream failure` warning includes `provider_message`, the provider's scrubbed
+error message from the failure event or HTTP error body.
+The field is omitted when no message is present.
 
 Responses item events wait until the done event, then leave in arrival order.
 `max_held_event_bytes` bounds the events retained for one unfinished item.

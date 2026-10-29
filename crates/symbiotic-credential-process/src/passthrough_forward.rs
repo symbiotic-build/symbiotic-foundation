@@ -787,18 +787,7 @@ impl Passthrough {
                             Ok(bytes) => {
                                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)
                                     .unwrap_or(serde_json::Value::Null);
-                                let secrets = route.secrets().await;
-                                let message = value
-                                    .pointer("/error/message")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(|message| {
-                                        String::from_utf8(scrub_failure(
-                                            message.as_bytes(),
-                                            &secrets,
-                                        )?)
-                                        .map_err(|_| EgressError::InvalidProviderJson)
-                                    })
-                                    .transpose()?;
+                                let message = failure_message(&value, &route.secrets().await)?;
                                 let (code, class) = ResponsesAdapter::http_failure(status, &bytes);
                                 Failure {
                                     status,
