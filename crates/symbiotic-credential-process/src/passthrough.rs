@@ -4,6 +4,14 @@
 //! wait for shared cooldown, renew, pace, recheck cooldown, send. Hold the slot through
 //! every retry and the complete filtered response. Dropping a connection drops this
 //! entire future, including its admission waiter and upstream request.
+//!
+//! Responses failures retain provider SSE bytes and order, apart from credential
+//! scrubbing. A non-terminal `error` waits for `response.failed`,
+//! `response.incomplete` or stream end within the existing byte and timeout limits.
+//! A fail decision forwards these events as a 200 SSE stream even before output.
+//! The terminal failure supplies the retry code and class when present.
+//! Failure warnings use the message `"upstream failure"`; optional `provider_message` contains
+//! the full scrubbed provider message from the stream or HTTP error body.
 use crate::{
     CredentialProcess, ProcessConfig,
     login::{Login, LoginHealth, LoginRequest},

@@ -384,6 +384,7 @@ impl ResponsesAdapter {
             | "quota_exhausted"
             | "context_length_exceeded"
             | "content_policy_violation"
+            | "cyber_policy"
             | "invalid_api_key" => ErrorClass::Final,
             "server_is_overloaded" | "rate_limit_exceeded" | "slow_down" => ErrorClass::Throttle,
             "network" | "upstream_disconnect" => ErrorClass::Network,
@@ -771,6 +772,16 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn cyber_policy_refusal_is_final_regardless_of_http_status() {
+        for status in [None, Some(429), Some(500), Some(503)] {
+            assert_eq!(
+                ResponsesAdapter::classify(status, "cyber_policy"),
+                ErrorClass::Final
+            );
+        }
+    }
+
     #[test]
     fn provider_failure_and_rate_header_classification_is_exact() {
         assert_eq!(

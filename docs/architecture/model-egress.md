@@ -1050,6 +1050,11 @@ without re-encoding. Unchanged Responses events round-trip exactly.
 For Responses, the credential process holds each item's events until its done event, then releases
 them in order.
 Responses POST performs no response-body credential matching (operator decision 2026-10-26).
+Provider failure events (`error`, `response.failed`, `response.incomplete`) are an
+exception: they are credential-scrubbed before reaching the caller.
+A non-terminal `error` waits for the terminal failure event or stream end within
+the existing limits.
+A fail decision forwards these events as a 200 SSE stream, even before output.
 Issue #162 requires Chat Completions and GET JSON listings to scrub held credentials
 using the model credential encoding set. One incremental scrubber replaces matches
 with `[REDACTED]`, including matches split across network chunks.
@@ -1232,6 +1237,9 @@ ERROR level, so a `warn` filter still keeps the request ID on warnings.
 Absent or invalid IDs use `local-` plus a generated UUID v4 in logs only.
 Health waiting entries still require a valid caller-supplied ID.
 Credentials, bodies and other header values are excluded from these events.
+The `upstream failure` warning is an exception: `provider_message` carries the
+provider's scrubbed error message from the failure event or HTTP error body.
+The field is omitted when no message is present.
 
 The optional top-level config field `log` accepts EnvFilter directives, for example
 `"log": "warn,symbiotic_credential_process::passthrough::forward=debug"`.

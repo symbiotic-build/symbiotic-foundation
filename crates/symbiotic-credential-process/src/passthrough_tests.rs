@@ -1982,6 +1982,261 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
     assert_eq!(decoded(&read(second).await).0, 200);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cyber_policy_refusal_reaches_caller_as_provider_failure_event_without_retry() {
+    cyber_policy_refusal(false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cyber_policy_refusal_reaches_caller_as_both_provider_failure_events_without_retry() {
+    cyber_policy_refusal(true, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cyber_policy_refusal_before_output_reaches_caller_as_200_sse() {
+    for preceding_error in [false, true] {
+        cyber_policy_refusal(preceding_error, false).await;
+    }
+}
+
+async fn cyber_policy_refusal(preceding_error: bool, output: bool) {
+    for message in [
+        "Synthetic refusal".to_owned(),
+        format!("Synthetic refusal {KEY} {}", "detail ".repeat(700)),
+    ] {
+        let (capture, _subscriber) = LogCapture::install("info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |_| {}).await;
+        let caller = harness.connect("/v1/responses", b"{}", "").await;
+        let created = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"synthetic-response\"}}\n\n";
+        let item = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"synthetic-item\",\"type\":\"message\",\"content\":[]}}\n\n";
+        let quoted_message = serde_json::to_string(&message).unwrap();
+        let error = format!(
+            "event: error\r\ndata: {{\"type\":\"error\", \"error\":{{\"code\":\"cyber_policy\",\"message\":{quoted_message}}}}}\r\n\r\n"
+        );
+        let failed = format!(
+            "event: response.failed\r\ndata: {{\"type\":\"response.failed\", \"response\":{{\"id\":\"synthetic-response\",\"error\":{{\"code\":\"cyber_policy\",\"message\":{quoted_message}}}}}}}\r\n\r\n"
+        );
+        let failures = format!("{}{failed}", if preceding_error { &error } else { "" });
+        let prefix = if output {
+            format!("{created}{item}")
+        } else {
+            String::new()
+        };
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: format!("{prefix}{failures}").into_bytes(),
+            })
+            .ok()
+            .unwrap();
+        let (status, head, body) = decoded(&read(caller).await);
+        assert_eq!(status, 200);
+        assert!(head.contains("content-type: text/event-stream\r\n"));
+        assert!(
+            fixture.incoming.try_recv().is_err(),
+            "exactly one upstream request"
+        );
+        let events = ResponsesAdapter::default().feed(&body, 65536).unwrap();
+        let mut expected_types = Vec::new();
+        if output {
+            expected_types.extend(["response.created", "response.output_item.done"]);
+        }
+        if preceding_error {
+            expected_types.push("error");
+        }
+        expected_types.push("response.failed");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.record().value["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_types
+        );
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            format!("{prefix}{failures}").replace(KEY, "[REDACTED]")
+        );
+        let lines = capture.lines();
+        let failures: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "upstream failure")
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            (
+                failures[0]["provider_message"].as_str(),
+                failures[0]["code"].as_str(),
+                failures[0]["class"].as_str(),
+                failures[0]["action"].as_str()
+            ),
+            (
+                Some(message.replace(KEY, "[REDACTED]").as_str()),
+                Some("cyber_policy"),
+                Some("Final"),
+                Some("fail")
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn passthrough_nonterminal_error_waits_for_terminal_code_or_stream_end() {
+    for terminal in [None, Some("response.failed"), Some("response.incomplete")] {
+        let (capture, _subscriber) = LogCapture::install("warn");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |_| {}).await;
+        let caller = harness.connect("/v1/responses", b"{}", "").await;
+        // A terminal refusal must override this retryable preliminary error.
+        let code = if terminal.is_some() {
+            "slow_down"
+        } else {
+            "cyber_policy"
+        };
+        let message = format!("Synthetic error {KEY}");
+        let error = json!({"type":"error","code":code,"message":message});
+        let mut wire = format!("event: error\ndata: {error}\n\n");
+        if let Some(terminal) = terminal {
+            wire.push_str(": synthetic heartbeat\n\n");
+            let value = json!({"type":terminal,"response":{"error":{"code":"cyber_policy","message":"Synthetic terminal refusal"}}});
+            wire.push_str(&format!("event: {terminal}\ndata: {value}\n\n"));
+        }
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: wire.as_bytes().to_vec(),
+            })
+            .ok()
+            .unwrap();
+        let (status, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (status, String::from_utf8(body).unwrap()),
+            (200, wire.replace(KEY, "[REDACTED]"))
+        );
+        assert!(
+            fixture.incoming.try_recv().is_err(),
+            "exactly one upstream request"
+        );
+        let lines = capture.lines();
+        let failure = lines
+            .iter()
+            .find(|line| line["message"] == "upstream failure")
+            .unwrap();
+        assert_eq!(
+            (
+                failure["code"].as_str(),
+                failure["class"].as_str(),
+                failure["provider_message"].as_str()
+            ),
+            (
+                Some("cyber_policy"),
+                Some("Final"),
+                Some(if terminal.is_some() {
+                    "Synthetic terminal refusal"
+                } else {
+                    "Synthetic error [REDACTED]"
+                })
+            )
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_http_failure_logs_full_scrubbed_message_without_retry() {
+    for status in [429, 503] {
+        let (capture, _subscriber) = LogCapture::install("warn");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |_| {}).await;
+        let caller = harness.connect("/v1/responses", b"{}", "").await;
+        let message = format!("Synthetic refusal {KEY} {}", "detail ".repeat(700));
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status,
+                headers: vec![],
+                body: serde_json::to_vec(
+                    &json!({"error":{"code":"cyber_policy","message":message}}),
+                )
+                .unwrap(),
+            })
+            .ok()
+            .unwrap();
+        let (actual_status, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (
+                actual_status,
+                serde_json::from_slice::<Value>(&body).unwrap()
+            ),
+            (status, json!({"error":{"code":"upstream_status"}}))
+        );
+        assert!(
+            fixture.incoming.try_recv().is_err(),
+            "exactly one upstream request"
+        );
+        let lines = capture.lines();
+        let failure = lines
+            .iter()
+            .find(|line| line["message"] == "upstream failure")
+            .unwrap();
+        assert_eq!(
+            failure["provider_message"],
+            message.replace(KEY, "[REDACTED]")
+        );
+        assert_eq!(
+            (failure["class"].as_str(), failure["action"].as_str()),
+            (Some("Final"), Some("fail"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn passthrough_pending_failure_events_respect_held_and_response_byte_limits() {
+    for held_limit in [false, true] {
+        let mut fixture = Fixture::start().await;
+        let error = "event: error\ndata: {\"type\":\"error\",\"code\":\"cyber_policy\"}\n\n";
+        let harness = Harness::start(&fixture, |c| {
+            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            if held_limit {
+                route.max_held_event_bytes = error.len();
+            } else {
+                route.max_response_bytes = error.len();
+            }
+        })
+        .await;
+        let caller = harness.connect("/v1/responses", b"{}", "").await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: error.repeat(2).into_bytes(),
+            })
+            .ok()
+            .unwrap();
+        let (status, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (status, serde_json::from_slice::<Value>(&body).unwrap()),
+            (
+                502,
+                json!({"error":{"code":if held_limit { "max_held_event_bytes" } else { "response_too_large" }}})
+            )
+        );
+        assert!(fixture.incoming.try_recv().is_err());
+    }
+}
+
 #[tokio::test]
 async fn mid_answer_failure_and_disconnect_continue_with_exact_items_and_one_joined_answer() {
     for disconnect in [false, true] {
@@ -2709,6 +2964,10 @@ async fn passthrough_warn_only_logging_keeps_request_id_on_upstream_failure() {
         .find(|line| line["message"] == "upstream failure")
         .expect("upstream failure is a warning");
     assert_eq!(failure["spans"][0]["request_id"], "synthetic-request");
+    assert!(
+        failure.get("provider_message").is_none(),
+        "absent provider message stays absent"
+    );
     assert!(lines.iter().all(|line| line["level"] != "INFO"));
 }
 
