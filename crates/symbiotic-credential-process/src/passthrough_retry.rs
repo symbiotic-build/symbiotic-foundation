@@ -92,6 +92,23 @@ pub(super) fn decision(
 mod tests {
     use super::*;
     #[test]
+    fn cyber_policy_refusal_uses_the_default_fail_decision() {
+        for status in [None, Some(429), Some(500), Some(503)] {
+            let context = RetryContext {
+                class: ResponsesAdapter::classify(status, "cyber_policy"),
+                code: "cyber_policy".into(),
+                attempt: 1,
+                bytes_reached_caller: false,
+                route_name: "responses".into(),
+            };
+            assert_eq!(
+                decision(&RetryPolicy::new(), None, &context).action,
+                RetryAction::Fail
+            );
+        }
+    }
+
+    #[test]
     fn retry_table_defaults_overrides_hook_and_attempt_limit() {
         let mut context = RetryContext {
             class: ErrorClass::Throttle,

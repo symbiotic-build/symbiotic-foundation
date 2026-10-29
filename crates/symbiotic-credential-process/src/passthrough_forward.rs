@@ -17,6 +17,7 @@ impl AttemptLog<'_> {
         bytes_reached_caller: bool,
         action: &str,
         delay_ms: Option<u128>,
+        provider_message: Option<&str>,
     ) {
         tracing::warn!(
             route = self.route,
@@ -28,6 +29,7 @@ impl AttemptLog<'_> {
             bytes_reached_caller,
             action,
             delay_ms,
+            provider_message,
             "upstream failure"
         );
     }
@@ -39,6 +41,7 @@ struct Failure {
     class: ErrorClass,
     headers: HeaderMap,
     event: Option<Vec<u8>>,
+    message: Option<String>,
     new_session: bool,
 }
 impl Failure {
@@ -49,6 +52,7 @@ impl Failure {
             class: ResponsesAdapter::classify(None, code),
             headers: headers.cloned().unwrap_or_default(),
             event: None,
+            message: None,
             new_session: false,
         }
     }
@@ -373,6 +377,7 @@ impl Passthrough {
                 RetryAction::Fail => "fail",
             },
             delay.map(|d| d.as_millis()),
+            failure.message.as_deref(),
         );
         if let Some(delay) = delay {
             let until = self
@@ -719,7 +724,7 @@ impl Passthrough {
                                 return Ok(());
                             }
                             AnswerOutcome::Terminated(code) => {
-                                log.warn(code, ErrorClass::Final, started, "fail", None);
+                                log.warn(code, ErrorClass::Final, started, "fail", None, None);
                                 return self
                                     .local_error(write, started, 502, code, wait, None)
                                     .await;
@@ -728,7 +733,14 @@ impl Passthrough {
                         }
                     } else {
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
-                            log.warn("upstream_status", ErrorClass::Final, started, "fail", None);
+                            log.warn(
+                                "upstream_status",
+                                ErrorClass::Final,
+                                started,
+                                "fail",
+                                None,
+                                None,
+                            );
                             return self
                                 .local_error(write, false, 401, "upstream_status", wait, None)
                                 .await;
@@ -745,6 +757,7 @@ impl Passthrough {
                                     started,
                                     "renew",
                                     None,
+                                    None,
                                 );
                                 *injected = login_request.headers().clone();
                                 continue;
@@ -755,6 +768,7 @@ impl Passthrough {
                                     ErrorClass::Final,
                                     started,
                                     "fail",
+                                    None,
                                     None,
                                 );
                                 return self
@@ -771,6 +785,20 @@ impl Passthrough {
                         }
                         match error_body(&mut response, route.config.max_response_bytes).await {
                             Ok(bytes) => {
+                                let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                                    .unwrap_or(serde_json::Value::Null);
+                                let secrets = route.secrets().await;
+                                let message = value
+                                    .pointer("/error/message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|message| {
+                                        String::from_utf8(scrub_failure(
+                                            message.as_bytes(),
+                                            &secrets,
+                                        )?)
+                                        .map_err(|_| EgressError::InvalidProviderJson)
+                                    })
+                                    .transpose()?;
                                 let (code, class) = ResponsesAdapter::http_failure(status, &bytes);
                                 Failure {
                                     status,
@@ -778,6 +806,7 @@ impl Passthrough {
                                     code,
                                     headers: response_headers,
                                     event: None,
+                                    message,
                                     new_session: status == 429 && was_new,
                                 }
                             }
@@ -787,6 +816,7 @@ impl Passthrough {
                                     ErrorClass::Final,
                                     started,
                                     "fail",
+                                    None,
                                     None,
                                 );
                                 return self
@@ -833,9 +863,20 @@ impl Passthrough {
             }
             match decision.action {
                 RetryAction::Fail => {
-                    if started && let Some(bytes) = failure.event {
+                    if let Some(bytes) = failure.event {
+                        let secrets = route.secrets().await;
+                        if !started {
+                            let mut headers =
+                                returned(&route.config, &failure.headers, &secrets, 200);
+                            headers.push((
+                                "x-symbiotic-queue-waited-ms".into(),
+                                wait.total.as_millis().to_string(),
+                            ));
+                            wait.status = Some(200);
+                            head(write, 200, "text/event-stream", &headers).await?;
+                        }
                         wait.outcome = failure.code.clone();
-                        chunk(write, &bytes).await?;
+                        chunk(write, &scrub_failure(&bytes, &secrets)?).await?;
                         return finish(write).await;
                     }
                     if !started {
@@ -957,14 +998,14 @@ impl Passthrough {
         let mut usage = symbiotic_trace::UsageTrace::default();
         let mut received = 0usize;
         let mut json = Vec::new();
+        let mut failure: Option<Failure> = None;
         loop {
             let next = match response.chunk().await {
                 Ok(c) => c,
                 Err(_) => {
-                    return Ok(AnswerOutcome::Failure(Failure::network(
-                        "upstream_disconnect",
-                        Some(response.headers()),
-                    )));
+                    return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
+                        Failure::network("upstream_disconnect", Some(response.headers()))
+                    })));
                 }
             };
             let Some(bytes) = next else {
@@ -987,6 +1028,11 @@ impl Passthrough {
                                     class: kind,
                                     headers: response.headers().clone(),
                                     event: None,
+                                    message: failure_message(
+                                        &serde_json::from_slice(&json)
+                                            .map_err(|_| EgressError::InvalidProviderJson)?,
+                                        &route.secrets().await,
+                                    )?,
                                     new_session: false,
                                 }));
                             }
@@ -1008,10 +1054,9 @@ impl Passthrough {
                     chunk(write, &json).await?;
                     return Ok(AnswerOutcome::Complete(chat.then_some(usage)));
                 }
-                return Ok(AnswerOutcome::Failure(Failure::network(
-                    "upstream_disconnect",
-                    Some(response.headers()),
-                )));
+                return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
+                    Failure::network("upstream_disconnect", Some(response.headers()))
+                })));
             };
             received = received.saturating_add(bytes.len());
             if received > route.config.max_response_bytes {
@@ -1042,24 +1087,47 @@ impl Passthrough {
                         )
                         .map_err(|_| EgressError::InvalidProviderJson)?;
                     }
-                    let mut wire = if chat {
-                        event.record().wire().to_vec()
-                    } else {
-                        ResponsesAdapter::encode(&event)
-                            .map_err(|_| EgressError::InvalidProviderJson)?
-                    };
+                    let terminal = chat
+                        || matches!(
+                            event.record().value["type"].as_str(),
+                            Some("response.failed" | "response.incomplete")
+                        );
+                    let previous = failure.take();
+                    let message = failure_message(&event.record().value, &route.secrets().await)?
+                        .or_else(|| previous.as_ref().and_then(|f| f.message.clone()));
+                    let mut wire = previous.and_then(|f| f.event).unwrap_or_default();
                     if let Some(scrubber) = &mut scrubber {
-                        wire = scrubber.feed(&wire);
                         wire.extend(scrubber.finish());
                     }
-                    return Ok(AnswerOutcome::Failure(Failure {
+                    wire.extend_from_slice(event.record().wire());
+                    if wire.len() > route.config.max_held_event_bytes {
+                        return Ok(AnswerOutcome::Terminated("max_held_event_bytes"));
+                    }
+                    let next_failure = Failure {
                         status: 502,
                         code: code.clone(),
                         class: *kind,
                         headers: response.headers().clone(),
                         event: Some(wire),
+                        message,
                         new_session: false,
-                    }));
+                    };
+                    if terminal {
+                        return Ok(AnswerOutcome::Failure(next_failure));
+                    }
+                    failure = Some(next_failure);
+                    continue;
+                }
+                if let Some(failure) = &mut failure {
+                    let wire = failure
+                        .event
+                        .as_mut()
+                        .ok_or(EgressError::StateUnavailable)?;
+                    wire.extend_from_slice(event.record().wire());
+                    if wire.len() > route.config.max_held_event_bytes {
+                        return Ok(AnswerOutcome::Terminated("max_held_event_bytes"));
+                    }
+                    continue;
                 }
                 let completed = matches!(
                     event,
@@ -1126,6 +1194,25 @@ impl Passthrough {
         wait.status = Some(response.status().as_u16());
         head(write, response.status().as_u16(), kind, &headers).await
     }
+}
+
+fn scrub_failure(bytes: &[u8], secrets: &[String]) -> Result<Vec<u8>> {
+    let mut scrubber =
+        CredentialScrubber::new(secrets).map_err(|_| EgressError::InvalidProviderJson)?;
+    let mut clean = scrubber.feed(bytes);
+    clean.extend(scrubber.finish());
+    Ok(clean)
+}
+
+fn failure_message(value: &serde_json::Value, secrets: &[String]) -> Result<Option<String>> {
+    ["/response/error/message", "/error/message", "/message"]
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(serde_json::Value::as_str))
+        .map(|message| {
+            String::from_utf8(scrub_failure(message.as_bytes(), secrets)?)
+                .map_err(|_| EgressError::InvalidProviderJson)
+        })
+        .transpose()
 }
 
 async fn error_body(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
