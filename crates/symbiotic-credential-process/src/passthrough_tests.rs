@@ -3205,6 +3205,130 @@ async fn chat_completions_pre_byte_throttle_and_server_failure_retry_through_sha
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn kimi_429_account_limits_reach_caller_after_one_attempt_as_final() {
+    for message in [
+        "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",
+        "You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.",
+        "You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
+        "Your credit balance is insufficient. To continue, purchase extra usage or upgrade your plan.",
+        "Your organization's Extra Usage balance has run out. Please contact your organization admin to add more Extra Usage.",
+        "You've reached the Extra Usage limit set for your account by your organization. Please contact your organization admin to increase your limit.",
+        "You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.",
+    ] {
+        let (capture, _subscriber) = LogCapture::install("warn");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, chat_config).await;
+        let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 429,
+                headers: vec![("retry-after".into(), "60".into())],
+                body: serde_json::to_vec(
+                    &json!({"error":{"type":"rate_limit_error","message":message}}),
+                )
+                .unwrap(),
+            })
+            .ok()
+            .unwrap();
+        let (status, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (status, serde_json::from_slice::<Value>(&body).unwrap()),
+            (429, json!({"error":{"code":"upstream_status"}})),
+            "{message}"
+        );
+        assert!(
+            fixture.incoming.try_recv().is_err(),
+            "exactly one upstream request: {message}"
+        );
+        let failures: Vec<_> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line["message"] == "upstream failure")
+            .map(|line| {
+                json!([
+                    line["status"],
+                    line["code"],
+                    line["class"],
+                    line["action"],
+                    line["attempt"],
+                    line["provider_message"]
+                ])
+            })
+            .collect();
+        assert_eq!(
+            failures,
+            vec![json!([429, "429", "Final", "fail", 1, message])]
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn kimi_429_transient_and_unknown_messages_still_retry_as_throttle() {
+    for message in [
+        "We're receiving too many requests at the moment. Please wait a moment and try again.",
+        "The engine is currently overloaded, please try again later",
+        "Synthetic unknown throttle",
+    ] {
+        let (capture, _subscriber) = LogCapture::install("warn");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, chat_config).await;
+        let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 429,
+                headers: vec![("retry-after".into(), "60".into())],
+                body: serde_json::to_vec(
+                    &json!({"error":{"type":"rate_limit_error","message":message}}),
+                )
+                .unwrap(),
+            })
+            .ok()
+            .unwrap();
+        harness
+            .health_where(|h| h["routes"][0]["retried_events"]["429"] == 1)
+            .await;
+        advance_clock(Duration::from_secs(61)).await;
+        let reply = chat_reply(false, true);
+        let expected = String::from_utf8(reply.body.clone())
+            .unwrap()
+            .replace(KEY, "[REDACTED]")
+            .into_bytes();
+        fixture.next().await.reply.send(reply).ok().unwrap();
+        let (status, _, body) = decoded(&read(caller).await);
+        assert_eq!((status, body), (200, expected), "{message}");
+        assert!(
+            fixture.incoming.try_recv().is_err(),
+            "exactly two upstream requests: {message}"
+        );
+        let failures: Vec<_> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line["message"] == "upstream failure")
+            .map(|line| {
+                json!([
+                    line["status"],
+                    line["code"],
+                    line["class"],
+                    line["action"],
+                    line["attempt"],
+                    line["provider_message"]
+                ])
+            })
+            .collect();
+        assert_eq!(
+            failures,
+            vec![json!([429, "429", "Throttle", "retry_same", 1, message])]
+        );
+    }
+}
+
 // Controlled provider bytes use a channel, never a sleep or reqwest chunk assumptions.
 async fn chat_stream_fixture() -> (Fixture, mpsc::Sender<Vec<u8>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

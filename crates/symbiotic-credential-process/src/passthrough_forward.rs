@@ -788,7 +788,27 @@ impl Passthrough {
                                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)
                                     .unwrap_or(serde_json::Value::Null);
                                 let message = failure_message(&value, &route.secrets().await)?;
-                                let (code, class) = ResponsesAdapter::http_failure(status, &bytes);
+                                let (code, mut class) =
+                                    ResponsesAdapter::http_failure(status, &bytes);
+                                // Kimi Code reports account limits only in the message;
+                                // transient 429s must keep the adapter's retry classification.
+                                if status == 429
+                                    && message.as_deref().is_some_and(|message| {
+                                        [
+                                            "You've reached your 5-hour usage limit",
+                                            "You've reached your weekly (7-day) usage limit",
+                                            "You've reached your monthly usage limit for this billing cycle",
+                                            "Your credit balance is insufficient",
+                                            "Your organization's Extra Usage balance has run out",
+                                            "You've reached the Extra Usage limit set for your account by your organization",
+                                            "You've reached your concurrent request limit",
+                                        ]
+                                        .iter()
+                                        .any(|prefix| message.starts_with(prefix))
+                                    })
+                                {
+                                    class = ErrorClass::Final;
+                                }
                                 Failure {
                                     status,
                                     class,
