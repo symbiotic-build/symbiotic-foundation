@@ -74,7 +74,7 @@
       ]
     },
     "Timestamp": {
-      "description": "ISO 8601 UTC timestamp as the source wrote it, for example\n`2026-10-31T20:56:19Z`. Contract types carry it unparsed.",
+      "description": "ISO 8601 UTC timestamp as the source wrote it, for example\n`2026-10-31T20:56:19Z`. Contract types carry it unparsed, so it has no\nordering: string order is not time order when precision differs.",
       "type": "string"
     }
   }

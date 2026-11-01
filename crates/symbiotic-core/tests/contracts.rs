@@ -1,7 +1,8 @@
 //! Contract fixtures parse and round-trip without loss.
 //!
-//! Each fixture comes from a record of 2026-10-31. Identifiers, sessions and
-//! times the records do not hold are placeholders.
+//! Each fixture has the shape of a record of 2026-10-31. Quoted words and
+//! free text are synthetic; identifiers, sessions and times the records do not
+//! hold are placeholders.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -52,16 +53,16 @@ fn hardware_key_blocker_parses_as_a_critical_option_decision() {
 fn operator_words_parse_as_a_correction_signal() {
     let signal: Signal = fixture("signal.json");
     assert_eq!(signal.kind, SignalKind::Correction);
-    assert_eq!(signal.quoted, "Do not stopp shit");
+    assert_eq!(signal.quoted, "Do not stop that run");
 }
 
 #[test]
-fn zip_first_parses_as_an_ordering_constraint() {
+fn first_step_instruction_parses_as_an_ordering_constraint() {
     let campaign: Campaign = fixture("campaign.json");
     assert_eq!(
         campaign.constraints[0].rule,
         ConstraintRule::Ordering {
-            first: vec!["zip".into()],
+            first: vec!["alpha".into()],
             then: vec![]
         }
     );
@@ -115,6 +116,17 @@ fn unknown_fields_are_refused() {
 
 #[test]
 fn tagged_variants_refuse_unknown_fields() {
-    let action = json!({ "kind": "ask", "questionKind": "authority", "extra": 1 });
-    assert!(serde_json::from_value::<PolicyAction>(action).is_err());
+    for action in [
+        json!({ "kind": "ask", "questionKind": "authority", "extra": 1 }),
+        json!({ "kind": "record", "extra": 1 }),
+        json!({ "kind": "stop", "extra": 1 }),
+        json!({ "kind": "notify", "extra": 1 }),
+        json!({ "kind": "divert", "extra": 1 }),
+        json!({ "kind": "shelve", "extra": 1 }),
+    ] {
+        assert!(
+            serde_json::from_value::<PolicyAction>(action.clone()).is_err(),
+            "{action} is refused"
+        );
+    }
 }

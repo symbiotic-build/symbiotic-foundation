@@ -150,7 +150,8 @@ pub enum Threshold {
     Age { minutes: u32 },
 }
 
-/// One policy action.
+/// One policy action. Fieldless actions are empty struct variants because
+/// serde ignores extra fields on unit variants of a tagged enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(
@@ -160,15 +161,15 @@ pub enum Threshold {
     deny_unknown_fields
 )]
 pub enum PolicyAction {
-    Record,
-    Stop,
-    Notify,
+    Record {},
+    Stop {},
+    Notify {},
     /// Raise a decision of this kind.
     Ask {
         question_kind: QuestionKind,
     },
     /// Move to the campaign's next ready step that the event does not block.
-    Divert,
+    Divert {},
     /// Set the remaining matching steps aside with the reason.
-    Shelve,
+    Shelve {},
 }

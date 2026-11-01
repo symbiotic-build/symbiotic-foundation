@@ -17,8 +17,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// ISO 8601 UTC timestamp as the source wrote it, for example
-/// `2026-10-31T20:56:19Z`. Contract types carry it unparsed.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// `2026-10-31T20:56:19Z`. Contract types carry it unparsed, so it has no
+/// ordering: string order is not time order when precision differs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Timestamp(pub String);
 

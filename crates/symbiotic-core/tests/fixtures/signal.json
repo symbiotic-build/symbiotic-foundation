@@ -2,7 +2,7 @@
   "id": "signal:audit-orchestrator:0",
   "observedAt": "2026-10-31T23:00:00Z",
   "kind": "correction",
-  "quoted": "Do not stopp shit",
+  "quoted": "Do not stop that run",
   "session": "audit-orchestrator",
   "turn": 0,
   "confidence": 0.95

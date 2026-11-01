@@ -102,5 +102,8 @@ UPDATE_SCHEMAS=1 cargo test --release -p symbiotic-core --features schema --test
 
 ## Fixtures
 
-`tests/fixtures/` holds one record per type, taken from records of 2026-10-31.
+`tests/fixtures/` holds one record per type, shaped after records of 2026-10-31.
 `tests/contracts.rs` parses each one and checks it round-trips without loss.
+The fixtures are synthetic: their quoted words and free text are invented, and
+they carry no transcript text. Replays against real records run in a private
+corpus outside this repository.
