@@ -8,16 +8,16 @@ use std::{
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
-use symbiotic_credential_process::{CredentialProcess, ProcessConfig};
+use symbiotic_gateway::{Gateway, GatewayConfig};
 
-fn config(dir: &std::path::Path) -> ProcessConfig {
-    serde_json::from_value(json!({"version":4,"state_dir":dir.join("state"),"socket_path":dir.join("typed.sock"),"admission_key":{"backend":"owner_only_file","path":dir.join("admission")},"max_secret_bytes":4096,"max_frame_bytes":8388608,"max_connections":8,"io_timeout_seconds":2,"routes":[],"passthrough":{"socket_path":dir.join("pass.sock"),"health_path":dir.join("health.json"),"max_connections":8,"routes":[{"name":"responses","tenant":"tenant","account":"account","account_sharing_key":null,"method":"post","path":"/v1/responses","destination":"https://provider.invalid/answer","secret":{"backend":"owner_only_file","path":dir.join("key")},"stream":"openai_responses","forward_headers":["content-type"],"return_headers":["x-codex-turn-state"],"max_request_bytes":4096,"max_response_bytes":4096,"max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}})).unwrap()
+fn config(dir: &std::path::Path) -> GatewayConfig {
+    serde_json::from_value(json!({"state_dir":dir.join("state"),"max_secret_bytes":4096,"max_header_bytes":8388608,"io_timeout_seconds":2,"passthrough":{"socket_path":dir.join("pass.sock"),"health_path":dir.join("health.json"),"max_connections":8,"routes":[{"name":"responses","tenant":"tenant","account":"account","account_sharing_key":null,"method":"post","path":"/v1/responses","destination":"https://provider.invalid/answer","secret":{"backend":"owner_only_file","path":dir.join("key")},"stream":"openai_responses","forward_headers":["content-type"],"return_headers":["x-codex-turn-state"],"max_request_bytes":4096,"max_response_bytes":4096,"max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}})).unwrap()
 }
 #[test]
 fn passthrough_contract_validation_refuses_ambiguous_routes_destinations_and_limits_without_io() {
     let dir = tempfile::tempdir().unwrap();
     let good = config(dir.path());
-    let route = &good.passthrough.as_ref().unwrap().routes[0];
+    let route = &good.passthrough.routes[0];
     assert_eq!(
         (
             route.rate_burst_seconds,
@@ -53,15 +53,15 @@ fn passthrough_contract_validation_refuses_ambiguous_routes_destinations_and_lim
     ] {
         let mut bad_config = value.clone();
         bad_config["passthrough"]["routes"][0][field] = bad;
-        let bad_config: ProcessConfig = serde_json::from_value(bad_config).unwrap();
+        let bad_config: GatewayConfig = serde_json::from_value(bad_config).unwrap();
         assert!(bad_config.validate_routes().is_err(), "accepted {field}");
-        assert!(CredentialProcess::open(bad_config).is_err());
+        assert!(Gateway::open(bad_config).is_err());
     }
     let mut invalid = good.clone();
-    invalid.passthrough.as_mut().unwrap().max_connections = usize::MAX;
+    invalid.passthrough.max_connections = usize::MAX;
     assert_eq!(
         invalid.validate_routes(),
-        Err(symbiotic_egress::EgressError::InvalidRequest)
+        Err(symbiotic_gateway::GatewayError::InvalidRequest)
     );
     for (field, names) in [
         (
@@ -103,17 +103,17 @@ fn passthrough_contract_validation_refuses_ambiguous_routes_destinations_and_lim
             let mut invalid = value.clone();
             invalid["passthrough"]["routes"][0][field] = json!([name]);
             assert_eq!(
-                serde_json::from_value::<ProcessConfig>(invalid)
+                serde_json::from_value::<GatewayConfig>(invalid)
                     .unwrap()
                     .validate_routes(),
-                Err(symbiotic_egress::EgressError::InvalidRequest),
+                Err(symbiotic_gateway::GatewayError::InvalidRequest),
                 "accepted {field}: {name}"
             );
         }
     }
     for field in ["name", "path", "max_in_flight", "requests_per_minute"] {
         let mut bad = good.clone();
-        let routes = &mut bad.passthrough.as_mut().unwrap().routes;
+        let routes = &mut bad.passthrough.routes;
         let mut second = routes[0].clone();
         second.name = "other".into();
         second.path = "/other".into();
@@ -152,21 +152,19 @@ async fn executable_publishes_health_and_sigterm_publishes_stopping_before_exit(
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = config(dir.path());
-    write(&dir.path().join("admission"), &[b'a'; 32]);
     write(&dir.path().join("key"), b"synthetic-executable-static-key");
     let config_path = dir.path().join("config.json");
     write(&config_path, &serde_json::to_vec(&config).unwrap());
-    let binary =
-        std::env::var_os("CARGO_BIN_EXE_symbiotic-credential-process").unwrap_or_else(|| {
-            std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("symbiotic-credential-process")
-                .into_os_string()
-        });
+    let binary = std::env::var_os("CARGO_BIN_EXE_symbiotic-gateway").unwrap_or_else(|| {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("symbiotic-gateway")
+            .into_os_string()
+    });
     let mut child = ChildGuard(
         Command::new(binary)
             .arg(&config_path)
@@ -229,54 +227,6 @@ async fn executable_publishes_health_and_sigterm_publishes_stopping_before_exit(
         fs::metadata(&health_path).unwrap().permissions().mode() & 0o777,
         0o640
     );
-}
-
-#[test]
-fn passthrough_contract_shared_policy_refuses_unsupported_typed_limits_and_mismatched_bursts() {
-    let dir = tempfile::tempdir().unwrap();
-    for shared in [false, true] {
-        let mut good = config(dir.path());
-        let mut typed = json!({
-            "tenant":"tenant", "account":"account", "account_sharing_key":null,
-            "max_attempts":3, "route":"chat", "secret_ref":"", "secret":{"backend":"none"},
-            "destination":"https://provider.invalid/v1", "model":"synthetic-model",
-            "provider":{"kind":"open_ai_chat","operator":"synthetic"},
-            "allow_loopback_http":false, "max_field_bytes":1024, "max_output_tokens":100,
-            "max_in_flight":2, "requests_per_minute":null, "input_units_per_minute":null,
-            "timeout_seconds":1
-        });
-        if shared {
-            typed["tenant"] = json!("another_tenant");
-            typed["account"] = json!("another_account");
-            typed["account_sharing_key"] = json!("synthetic_pool");
-            good.passthrough.as_mut().unwrap().routes[0].account_sharing_key =
-                Some(serde_json::from_value(json!("synthetic_pool")).unwrap());
-        }
-        good.routes = vec![serde_json::from_value(typed.clone()).unwrap()];
-        assert_eq!(good.validate_routes(), Ok(()));
-        for (field, value) in [
-            ("max_in_flight", json!(3)),
-            ("requests_per_minute", json!(1)),
-            ("input_units_per_minute", json!(1)),
-            ("provider_request_limit", json!(1)),
-        ] {
-            let mut candidate = good.clone();
-            let mut bad = typed.clone();
-            bad[field] = value;
-            candidate.routes = vec![serde_json::from_value(bad).unwrap()];
-            assert!(
-                candidate.validate_routes().is_err(),
-                "accepted shared {field}"
-            );
-        }
-        let mut candidate = good;
-        candidate.passthrough.as_mut().unwrap().routes[0].rate_burst_seconds = 60;
-        assert!(
-            candidate.validate_routes().is_err(),
-            "accepted mismatched burst"
-        );
-    }
-    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 fn account(
@@ -377,7 +327,7 @@ async fn passthrough_contract_request_pacing_charges_dispatch_and_not_cancelled_
 fn passthrough_contract_new_fields_default_and_local_headers_cannot_be_forwarded() {
     let dir = tempfile::tempdir().unwrap();
     let settings = config(dir.path());
-    let pass = settings.passthrough.as_ref().unwrap();
+    let pass = &settings.passthrough;
     let route = &pass.routes[0];
     assert_eq!(route.max_held_event_bytes, 67_108_864);
     assert_eq!(route.rate_burst_seconds, 0);
@@ -400,7 +350,7 @@ fn passthrough_contract_new_fields_default_and_local_headers_cannot_be_forwarded
     ] {
         for response in [false, true] {
             let mut bad = settings.clone();
-            let route = &mut bad.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut bad.passthrough.routes[0];
             if response {
                 route.return_headers.push(header.into());
             } else {
@@ -415,23 +365,22 @@ fn passthrough_contract_new_fields_default_and_local_headers_cannot_be_forwarded
 fn chat_completions_and_get_model_listing_routes_validate_without_io() {
     let dir = tempfile::tempdir().unwrap();
     let mut settings = config(dir.path());
-    let routes = &mut settings.passthrough.as_mut().unwrap().routes;
-    routes[0].stream = symbiotic_credential_process::stream::StreamDialect::OpenaiChatCompletions;
+    let routes = &mut settings.passthrough.routes;
+    routes[0].stream = symbiotic_gateway::stream::StreamDialect::OpenaiChatCompletions;
     routes[0].path = "/v1/chat/completions".into();
     let mut models = routes[0].clone();
     models.name = "models".into();
-    models.method = symbiotic_credential_process::PassthroughMethod::Get;
+    models.method = symbiotic_gateway::PassthroughMethod::Get;
     models.path = "/v1/models".into();
     models.destination = "https://provider.invalid/v1/models".into();
     routes.push(models);
     assert_eq!(settings.validate_routes(), Ok(()));
-    settings.passthrough.as_mut().unwrap().routes[0].fallback_routes = vec!["models".into()];
+    settings.passthrough.routes[0].fallback_routes = vec!["models".into()];
     assert!(settings.validate_routes().is_err());
-    settings.passthrough.as_mut().unwrap().routes[1].method =
-        symbiotic_credential_process::PassthroughMethod::Post;
+    settings.passthrough.routes[1].method = symbiotic_gateway::PassthroughMethod::Post;
     assert_eq!(settings.validate_routes(), Ok(()));
-    settings.passthrough.as_mut().unwrap().routes[1].stream =
-        symbiotic_credential_process::stream::StreamDialect::OpenaiResponses;
+    settings.passthrough.routes[1].stream =
+        symbiotic_gateway::stream::StreamDialect::OpenaiResponses;
     assert!(settings.validate_routes().is_err());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
@@ -441,7 +390,6 @@ async fn startup_refuses_version_17_queue_with_rebuild_diagnostic() {
     let dir = tempfile::tempdir().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let settings = config(dir.path());
-    write(&dir.path().join("admission"), &[b'a'; 32]);
     fs::create_dir(&settings.state_dir).unwrap();
     fs::set_permissions(&settings.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let path = settings
@@ -452,7 +400,7 @@ async fn startup_refuses_version_17_queue_with_rebuild_diagnostic() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let config_path = dir.path().join("config.json");
     write(&config_path, &serde_json::to_vec(&settings).unwrap());
-    let error = match CredentialProcess::open(settings) {
+    let error = match Gateway::open(settings) {
         Ok(_) => panic!("accepted version 17 queue"),
         Err(error) => error,
     };
@@ -466,21 +414,191 @@ async fn startup_refuses_version_17_queue_with_rebuild_diagnostic() {
             .unwrap(),
         17
     );
-    let binary =
-        std::env::var_os("CARGO_BIN_EXE_symbiotic-credential-process").unwrap_or_else(|| {
-            std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("symbiotic-credential-process")
-                .into_os_string()
-        });
+    let binary = std::env::var_os("CARGO_BIN_EXE_symbiotic-gateway").unwrap_or_else(|| {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("symbiotic-gateway")
+            .into_os_string()
+    });
     let output = Command::new(binary).arg(config_path).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "unsupported_queue_schema: unsupported queue schema; rebuild the queue database\n"
     );
+}
+
+fn gateway_binary() -> std::path::PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_symbiotic-gateway")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("symbiotic-gateway")
+        })
+}
+use symbiotic_gateway::GatewayError;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+const OBSERVATION_HANG_GUARD: Duration = Duration::from_secs(60);
+
+async fn wait_for_startup<T, F>(mut check_alive: impl FnMut(), mut probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Result<T, GatewayError>>,
+{
+    // The socket path can appear before the server accepts requests.
+    tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+        loop {
+            check_alive();
+            match probe().await {
+                Ok(reply) => break reply,
+                Err(GatewayError::Transport) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(error) => panic!("child startup failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("child did not accept requests within the startup hang guard")
+}
+
+async fn wait_for_child_startup<T, F>(child: &mut ChildGuard, probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Result<T, GatewayError>>,
+{
+    wait_for_startup(
+        || {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.0.stderr.take() {
+                    std::io::Read::read_to_end(&mut pipe, &mut stderr).unwrap();
+                }
+                panic!(
+                    "child exited before accepting requests: {status:?} stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        },
+        probe,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn logging_startup_prefers_environment_directives_and_refuses_invalid_ones() {
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    write(&dir.path().join("key"), b"synthetic-passthrough-secret");
+    let config = config(dir.path());
+    let passthrough_path = config.passthrough.socket_path.clone();
+    let start = |configured: Option<&str>, environment: Option<&str>| {
+        let mut config = config.clone();
+        config.log = configured.map(str::to_owned);
+        let path = dir.path().join("logging-config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut command = std::process::Command::new(gateway_binary());
+        command.env_remove(symbiotic_core::logging::LOG_ENV);
+        if let Some(value) = environment {
+            command.env(symbiotic_core::logging::LOG_ENV, value);
+        }
+        ChildGuard(
+            command
+                .arg(&path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let refused = |mut child: ChildGuard| async move {
+        let status = tokio::time::timeout(OBSERVATION_HANG_GUARD, async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("invalid directives must refuse startup");
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(!status.success());
+        assert!(stderr.contains("invalid logging directives"), "{stderr}");
+    };
+    refused(start(Some("invalid["), None)).await;
+    refused(start(Some("info"), Some("invalid["))).await;
+    refused(start(Some("invalid["), Some(""))).await;
+    for (configured, environment, info_expected) in [
+        (Some("invalid["), Some("warn"), false),
+        (Some("info"), Some("warn"), false),
+        (Some("warn"), None, false),
+        (None, None, true),
+    ] {
+        let mut child = start(configured, environment);
+        let mut caller = wait_for_child_startup(&mut child, || async {
+            tokio::net::UnixStream::connect(&passthrough_path)
+                .await
+                .map_err(|_| GatewayError::Transport)
+        })
+        .await;
+        caller.write_all(b"POST /unknown HTTP/1.1\r\nHost: ignored.invalid\r\nContent-Length: 0\r\nx-symbiotic-request-id: synthetic-logging\r\n\r\n").await.unwrap();
+        caller.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(OBSERVATION_HANG_GUARD, caller.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let lines: Vec<serde_json::Value> = stderr
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("production diagnostics are JSON"))
+            .collect();
+        let completed: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message"] == "request completed")
+            .collect();
+        if info_expected {
+            assert_eq!(completed.len(), 1, "{stderr}");
+            assert_eq!(
+                (
+                    &completed[0]["level"],
+                    &completed[0]["outcome"],
+                    &completed[0]["spans"][0]["request_id"]
+                ),
+                (
+                    &serde_json::json!("INFO"),
+                    &serde_json::json!("route_not_found"),
+                    &serde_json::json!("synthetic-logging")
+                ),
+            );
+        } else {
+            assert!(completed.is_empty(), "{stderr}");
+            assert!(lines.iter().all(|line| line["level"] != "INFO"), "{stderr}");
+        }
+    }
 }

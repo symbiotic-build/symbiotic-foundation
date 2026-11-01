@@ -1,6 +1,7 @@
 //! One retry engine for HTTP failures, connection failures and interrupted items.
 use super::*;
-use model::{CredentialScrubber, item_stream::ChatCompletionsAdapter};
+use crate::item_stream::ChatCompletionsAdapter;
+use model::CredentialScrubber;
 use std::sync::atomic::Ordering;
 
 struct AttemptLog<'a> {
@@ -164,14 +165,14 @@ impl Passthrough {
                     .sessions
                     .state
                     .lock()
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 (s.until, s.probing)
             };
             let now = self.now();
             if let Some(until) = until.filter(|t| *t > now) {
                 let remaining = (until - now)
                     .to_std()
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 let budget = route
                     .config
                     .max_queue_wait_seconds
@@ -196,8 +197,8 @@ impl Passthrough {
             let _entry = self.waiting(route, id, "new_session")?;
             wait.wait_started();
             let permit = tokio::select! {
-                p=route.retries.sessions.probe.clone().acquire_owned()=>Some(p.map_err(|_|EgressError::StateUnavailable)?),
-                r=changes.changed()=>{r.map_err(|_|EgressError::StateUnavailable)?;None},
+                p=route.retries.sessions.probe.clone().acquire_owned()=>Some(p.map_err(|_|GatewayError::StateUnavailable)?),
+                r=changes.changed()=>{r.map_err(|_|GatewayError::StateUnavailable)?;None},
             };
             wait.waited(route, "new_session");
             route.usable().await?;
@@ -207,7 +208,7 @@ impl Passthrough {
                     .sessions
                     .state
                     .lock()
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 if s.until.is_none_or(|t| t <= self.now()) {
                     return Ok(Ok(Some(permit)));
                 }
@@ -225,14 +226,14 @@ impl Passthrough {
                 .account
                 .cooldown_until()
                 .await
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             let now = self.now();
             let Some(until) = until.filter(|t| *t > now) else {
                 return Ok(None);
             };
             let remaining = (until - now)
                 .to_std()
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             let budget = route
                 .config
                 .max_queue_wait_seconds
@@ -300,7 +301,7 @@ impl Passthrough {
         fallback_available: bool,
     ) -> Result<RetryDecision> {
         if contains_secret(failure.code.as_bytes(), &route.secrets().await) {
-            return Err(EgressError::InvalidProviderJson);
+            return Err(GatewayError::InvalidProviderJson);
         }
         let class = route
             .config
@@ -329,17 +330,17 @@ impl Passthrough {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 Some(n.saturating_add(1))
             })
-            .map_err(|_| EgressError::StateUnavailable)?;
+            .map_err(|_| GatewayError::StateUnavailable)?;
         if rule.action != RetryAction::Fail {
             let mut health = route
                 .health
                 .lock()
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             let n = health
                 .retried_events
                 .entry(failure.code.clone())
                 .or_default();
-            *n = n.checked_add(1).ok_or(EgressError::StateUnavailable)?;
+            *n = n.checked_add(1).ok_or(GatewayError::StateUnavailable)?;
             self.changed.notify_one();
         }
         let delay = if rule.action == RetryAction::RetrySame {
@@ -360,7 +361,7 @@ impl Passthrough {
                         0,
                         0,
                     )
-                    .map_err(|_| EgressError::StateUnavailable)?,
+                    .map_err(|_| GatewayError::StateUnavailable)?,
                 ),
             })
         } else {
@@ -383,21 +384,22 @@ impl Passthrough {
             let until = self
                 .now()
                 .checked_add_signed(
-                    chrono::Duration::from_std(delay).map_err(|_| EgressError::StateUnavailable)?,
+                    chrono::Duration::from_std(delay)
+                        .map_err(|_| GatewayError::StateUnavailable)?,
                 )
-                .ok_or(EgressError::StateUnavailable)?;
+                .ok_or(GatewayError::StateUnavailable)?;
             if failure.new_session {
                 let _gate = route
                     .account
                     .send_gate()
                     .await
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 let mut hold = route
                     .retries
                     .sessions
                     .state
                     .lock()
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 hold.until = Some(hold.until.map_or(until, |t| t.max(until)));
                 hold.probing = true;
                 route.retries.sessions.changes.send_replace(());
@@ -407,7 +409,7 @@ impl Passthrough {
                     .account
                     .note_cooldown(until)
                     .await
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
             }
         }
         Ok(rule)
@@ -443,7 +445,7 @@ impl Passthrough {
         let mut buffered = reqwest::Request::new(
             reqwest::Method::POST,
             reqwest::Url::parse("https://provider.invalid")
-                .map_err(|_| EgressError::InvalidRequest)?,
+                .map_err(|_| GatewayError::InvalidRequest)?,
         );
         *buffered.body_mut() = Some(original.clone().into());
         let mut slot = None;
@@ -461,7 +463,7 @@ impl Passthrough {
                     .sessions
                     .state
                     .lock()
-                    .map_err(|_| EgressError::StateUnavailable)?;
+                    .map_err(|_| GatewayError::StateUnavailable)?;
                 if hold.probing {
                     slot = None;
                 }
@@ -473,7 +475,7 @@ impl Passthrough {
                         .local_error(write, started, 429, "rate_limited", wait, Some(until))
                         .await;
                 }
-                Err(EgressError::CredentialUnavailable) => {
+                Err(GatewayError::CredentialUnavailable) => {
                     return self
                         .local_error(write, started, 503, "credential_unavailable", wait, None)
                         .await;
@@ -488,13 +490,13 @@ impl Passthrough {
                         .account
                         .acquire()
                         .await
-                        .map_err(|_| EgressError::StateUnavailable)?,
+                        .map_err(|_| GatewayError::StateUnavailable)?,
                 );
                 wait.waited(route, "slot");
             }
             let cooldown = match self.cooldown(route, id, wait).await {
                 Ok(c) => c,
-                Err(EgressError::CredentialUnavailable) => {
+                Err(GatewayError::CredentialUnavailable) => {
                     return self
                         .local_error(write, started, 503, "credential_unavailable", wait, None)
                         .await;
@@ -533,7 +535,7 @@ impl Passthrough {
             }
             let mut headers = authentication
                 .as_ref()
-                .ok_or(EgressError::StateUnavailable)?
+                .ok_or(GatewayError::StateUnavailable)?
                 .0
                 .clone();
             let connection_headers: HashSet<_> = request
@@ -555,8 +557,8 @@ impl Passthrough {
                 {
                     headers.insert(
                         HeaderName::from_bytes(name.as_bytes())
-                            .map_err(|_| EgressError::InvalidRequest)?,
-                        HeaderValue::from_bytes(value).map_err(|_| EgressError::InvalidRequest)?,
+                            .map_err(|_| GatewayError::InvalidRequest)?,
+                        HeaderValue::from_bytes(value).map_err(|_| GatewayError::InvalidRequest)?,
                     );
                 }
             }
@@ -577,7 +579,7 @@ impl Passthrough {
                 .account
                 .request_admission()
                 .await
-                .map_err(|_| EgressError::StateUnavailable)?
+                .map_err(|_| GatewayError::StateUnavailable)?
             {
                 model::ModelRequestAdmission::Cooldown => continue,
                 model::ModelRequestAdmission::Wait(d) => {
@@ -607,10 +609,10 @@ impl Passthrough {
                     buffered
                         .try_clone()
                         .and_then(|mut request| request.body_mut().take())
-                        .ok_or(EgressError::StateUnavailable)?,
+                        .ok_or(GatewayError::StateUnavailable)?,
                 )
                 .build()
-                .map_err(|_| EgressError::InvalidRequest)?;
+                .map_err(|_| GatewayError::InvalidRequest)?;
             // execute() starts reqwest's timers; defer it until the grant actually sends.
             let transport = async { route.client.execute(transport_request).await };
             let accounted = route.config.stream == StreamDialect::OpenaiChatCompletions
@@ -673,7 +675,7 @@ impl Passthrough {
                         .local_error(write, started, 402, "spend_budget_exhausted", wait, None)
                         .await;
                 }
-                Err(_) => return Err(EgressError::StateUnavailable),
+                Err(_) => return Err(GatewayError::StateUnavailable),
             };
             let Some(sent) = sent else {
                 slot = None;
@@ -707,7 +709,7 @@ impl Passthrough {
                             route
                                 .seen
                                 .lock()
-                                .map_err(|_| EgressError::StateUnavailable)?
+                                .map_err(|_| GatewayError::StateUnavailable)?
                                 .insert(key.clone());
                         }
                         if was_new {
@@ -716,7 +718,7 @@ impl Passthrough {
                                 .sessions
                                 .state
                                 .lock()
-                                .map_err(|_| EgressError::StateUnavailable)?;
+                                .map_err(|_| GatewayError::StateUnavailable)?;
                             if session.is_some() && hold.until.is_none_or(|t| t <= self.now()) {
                                 hold.until = None;
                                 hold.probing = false;
@@ -734,7 +736,7 @@ impl Passthrough {
                                     route
                                         .account
                                         .finish_passthrough(receipt, &usage)
-                                        .map_err(|_| EgressError::StateUnavailable)?;
+                                        .map_err(|_| GatewayError::StateUnavailable)?;
                                 }
                                 // A failed ledger write must leave HTTP visibly incomplete.
                                 finish(write).await?;
@@ -849,7 +851,7 @@ impl Passthrough {
                                     new_session: status == 429 && was_new,
                                 }
                             }
-                            Err(EgressError::LimitExceeded) => {
+                            Err(GatewayError::LimitExceeded) => {
                                 log.warn(
                                     "response_too_large",
                                     ErrorClass::Final,
@@ -901,7 +903,7 @@ impl Passthrough {
             drop(session);
             let complete = join
                 .discard_partial()
-                .map_err(|_| EgressError::InvalidProviderJson)?;
+                .map_err(|_| GatewayError::InvalidProviderJson)?;
             if !complete.is_empty() {
                 if !started {
                     let mut headers =
@@ -981,7 +983,7 @@ impl Passthrough {
                         .routes
                         .iter()
                         .find(|r| &r.config.name == name)
-                        .ok_or(EgressError::InvalidRequest)?;
+                        .ok_or(GatewayError::InvalidRequest)?;
                     wait.route = Some(route.config.name.clone());
                     slot = None;
                     authentication = None;
@@ -994,7 +996,7 @@ impl Passthrough {
             if join.has_completed_items() {
                 *buffered.body_mut() = Some(
                     join.continuation(&original)
-                        .map_err(|_| EgressError::InvalidProviderJson)?
+                        .map_err(|_| GatewayError::InvalidProviderJson)?
                         .into(),
                 );
             }
@@ -1050,7 +1052,7 @@ impl Passthrough {
         let mut scrubber = if chat || route.config.method == PassthroughMethod::Get {
             Some(
                 CredentialScrubber::new(&route.secrets().await)
-                    .map_err(|_| EgressError::InvalidProviderJson)?,
+                    .map_err(|_| GatewayError::InvalidProviderJson)?,
             )
         } else {
             None
@@ -1092,7 +1094,7 @@ impl Passthrough {
                                     event: None,
                                     message: failure_message(
                                         &serde_json::from_slice(&json)
-                                            .map_err(|_| EgressError::InvalidProviderJson)?,
+                                            .map_err(|_| GatewayError::InvalidProviderJson)?,
                                         &route.secrets().await,
                                     )?,
                                     new_session: false,
@@ -1145,9 +1147,9 @@ impl Passthrough {
                     if !chat {
                         join.add_usage(
                             &ResponsesAdapter::event_usage(&event)
-                                .map_err(|_| EgressError::InvalidProviderJson)?,
+                                .map_err(|_| GatewayError::InvalidProviderJson)?,
                         )
-                        .map_err(|_| EgressError::InvalidProviderJson)?;
+                        .map_err(|_| GatewayError::InvalidProviderJson)?;
                     }
                     let terminal = chat
                         || matches!(
@@ -1184,7 +1186,7 @@ impl Passthrough {
                     let wire = failure
                         .event
                         .as_mut()
-                        .ok_or(EgressError::StateUnavailable)?;
+                        .ok_or(GatewayError::StateUnavailable)?;
                     wire.extend_from_slice(event.record().wire());
                     if wire.len() > route.config.max_held_event_bytes {
                         return Ok(AnswerOutcome::Terminated("max_held_event_bytes"));
@@ -1260,7 +1262,7 @@ impl Passthrough {
 
 fn scrub_failure(bytes: &[u8], secrets: &[String]) -> Result<Vec<u8>> {
     let mut scrubber =
-        CredentialScrubber::new(secrets).map_err(|_| EgressError::InvalidProviderJson)?;
+        CredentialScrubber::new(secrets).map_err(|_| GatewayError::InvalidProviderJson)?;
     let mut clean = scrubber.feed(bytes);
     clean.extend(scrubber.finish());
     Ok(clean)
@@ -1272,7 +1274,7 @@ fn failure_message(value: &serde_json::Value, secrets: &[String]) -> Result<Opti
         .find_map(|path| value.pointer(path).and_then(serde_json::Value::as_str))
         .map(|message| {
             String::from_utf8(scrub_failure(message.as_bytes(), secrets)?)
-                .map_err(|_| EgressError::InvalidProviderJson)
+                .map_err(|_| GatewayError::InvalidProviderJson)
         })
         .transpose()
 }
@@ -1281,7 +1283,7 @@ async fn error_body(response: &mut reqwest::Response, limit: usize) -> Result<Ve
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(http_error)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(EgressError::LimitExceeded);
+            return Err(GatewayError::LimitExceeded);
         }
         bytes.extend_from_slice(&chunk);
     }

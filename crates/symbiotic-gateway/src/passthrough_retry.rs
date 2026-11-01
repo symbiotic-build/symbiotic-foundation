@@ -1,6 +1,6 @@
 //! One configurable retry policy; adapters only classify failures.
 use super::*;
-pub use symbiotic_ai_runtime::model::item_stream::ErrorClass;
+pub use crate::item_stream::ErrorClass;
 
 /// Action after a classified failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

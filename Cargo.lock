@@ -1581,7 +1581,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
@@ -1604,6 +1603,30 @@ dependencies = [
  "thiserror",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "symbiotic-gateway"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "socket2",
+ "symbiotic-ai-runtime",
+ "symbiotic-core",
+ "symbiotic-queue",
+ "symbiotic-supervise",
+ "symbiotic-trace",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

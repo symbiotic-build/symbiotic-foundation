@@ -125,7 +125,7 @@ impl Fixture {
     }
 }
 struct Harness {
-    process: CredentialProcess,
+    process: Gateway,
     task: tokio::task::JoinHandle<Result<()>>,
     stop: Option<oneshot::Sender<()>>,
     _dir: tempfile::TempDir,
@@ -139,13 +139,11 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
-pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
+pub(super) fn config(dir: &std::path::Path) -> GatewayConfig {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
-    write_private(&dir.join("admission"), &[b'a'; 32]);
     serde_json::from_value(json!({
-        "version":4,"state_dir":dir.join("state"),"socket_path":dir.join("typed.sock"),
-        "admission_key":{"backend":"owner_only_file","path":dir.join("admission")},
-        "max_secret_bytes":65536,"max_frame_bytes":8388608,"max_connections":32,"io_timeout_seconds":2,"routes":[],
+        "state_dir":dir.join("state"),
+        "max_secret_bytes":65536,"max_header_bytes":8388608,"io_timeout_seconds":2,
         "passthrough":{"socket_path":dir.join("pass.sock"),"health_path":dir.join("health.json"),"max_connections":16,
         "routes":[{"name":"responses","tenant":"tenant","account":"account","account_sharing_key":null,
             "method":"post","path":"/v1/responses","destination":"https://provider.invalid/answer",
@@ -155,40 +153,38 @@ pub(super) fn config(dir: &std::path::Path) -> ProcessConfig {
             "max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}
     })).unwrap()
 }
-pub(super) fn open(config: ProcessConfig) -> Result<CredentialProcess> {
+pub(super) fn open(config: GatewayConfig) -> Result<Gateway> {
     open_with_clock(config, test_clock::clock())
 }
 fn open_with_clock(
-    config: ProcessConfig,
+    config: GatewayConfig,
     clock: symbiotic_queue::jobs::JobClock,
-) -> Result<CredentialProcess> {
+) -> Result<Gateway> {
     let key = config.state_dir.parent().unwrap().join("key");
     if config
         .passthrough
-        .as_ref()
-        .unwrap()
         .routes
         .iter()
         .any(|route| matches!(&route.secret, SecretSource::OwnerOnlyFile { path } if path == &key))
     {
         write_private(&key, KEY.as_bytes());
     }
-    CredentialProcess::open_with_clock(config, clock)
+    Gateway::open_with_clock(config, clock)
 }
 impl Harness {
-    async fn start(fixture: &Fixture, change: impl FnOnce(&mut ProcessConfig)) -> Self {
+    async fn start(fixture: &Fixture, change: impl FnOnce(&mut GatewayConfig)) -> Self {
         Self::with_hook(fixture, change, None).await
     }
     async fn with_hook(
         fixture: &Fixture,
-        change: impl FnOnce(&mut ProcessConfig),
+        change: impl FnOnce(&mut GatewayConfig),
         hook: Option<RetryHook>,
     ) -> Self {
         Self::with_clock(fixture, change, hook, None).await
     }
     async fn with_clock(
         fixture: &Fixture,
-        change: impl FnOnce(&mut ProcessConfig),
+        change: impl FnOnce(&mut GatewayConfig),
         hook: Option<RetryHook>,
         clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
     ) -> Self {
@@ -196,11 +192,7 @@ impl Harness {
         let mut config = config(dir.path());
         change(&mut config);
         let mut process = open_with_clock(config, clock.unwrap_or_else(test_clock::clock)).unwrap();
-        let pass = Arc::get_mut(&mut process.inner)
-            .unwrap()
-            .passthrough
-            .as_mut()
-            .unwrap();
+        let pass = &mut Arc::get_mut(&mut process.inner).unwrap().passthrough;
         pass.wire_base = Some(fixture.base.clone());
         pass.retry_hook = hook;
         for mut route in std::mem::take(&mut pass.routes) {
@@ -262,18 +254,10 @@ impl Harness {
         result
     }
     fn path(&self) -> &std::path::Path {
-        &self
-            .process
-            .config()
-            .passthrough
-            .as_ref()
-            .unwrap()
-            .socket_path
+        &self.process.config().passthrough.socket_path
     }
     fn account(&self) -> AccountAdmission {
-        self.process.inner.passthrough.as_ref().unwrap().routes[0]
-            .account
-            .clone()
+        self.process.inner.passthrough.routes[0].account.clone()
     }
     async fn connect(&self, path: &str, body: &[u8], extra: &str) -> UnixStream {
         let mut socket = UnixStream::connect(self.path()).await.unwrap();
@@ -294,8 +278,6 @@ impl Harness {
             .process
             .config()
             .passthrough
-            .as_ref()
-            .unwrap()
             .health_path
             .as_ref()
             .unwrap();
@@ -352,7 +334,7 @@ fn decoded(bytes: &[u8]) -> (u16, String, Vec<u8>) {
 async fn forwarding_preserves_body_and_only_allowed_headers_and_scrubs_return_headers() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |config| {
-        config.passthrough.as_mut().unwrap().routes[0]
+        config.passthrough.routes[0]
             .forward_headers
             .extend(["x-long", "x-empty", "x-nonascii"].map(str::to_owned));
     })
@@ -444,16 +426,14 @@ async fn unmatched_and_ambiguous_requests_never_reach_provider() {
 async fn redirects_and_provider_failures_return_fixed_bodies_and_safe_headers() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0]
-            .retry_policy
-            .insert(
-                ErrorClass::Server,
-                RetryRule {
-                    action: RetryAction::Fail,
-                    max_attempts: None,
-                    backoff: Default::default(),
-                },
-            );
+        c.passthrough.routes[0].retry_policy.insert(
+            ErrorClass::Server,
+            RetryRule {
+                action: RetryAction::Fail,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
     })
     .await;
     for status in [302, 401, 403, 500, 503] {
@@ -536,7 +516,7 @@ async fn concurrent_429s_both_wait_and_resend_under_the_shared_deadline() {
 async fn five_callers_share_two_slots_and_slot_wait_never_uses_cooldown_budget() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0)
+        c.passthrough.routes[0].max_queue_wait_seconds = Some(0)
     })
     .await;
     let mut calls = Vec::new();
@@ -563,10 +543,7 @@ async fn five_callers_share_two_slots_and_slot_wait_never_uses_cooldown_budget()
 #[tokio::test]
 async fn a_cooldown_recorded_during_slot_wait_is_checked_before_dispatch() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1
-    })
-    .await;
+    let harness = Harness::start(&fixture, |c| c.passthrough.routes[0].max_in_flight = 1).await;
     let first = harness.call().await;
     let upstream = fixture.next().await;
     let second = harness.call().await;
@@ -589,10 +566,7 @@ async fn a_cooldown_recorded_during_slot_wait_is_checked_before_dispatch() {
 #[tokio::test]
 async fn disconnect_during_slot_or_cooldown_wait_cancels_without_sending() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1
-    })
-    .await;
+    let harness = Harness::start(&fixture, |c| c.passthrough.routes[0].max_in_flight = 1).await;
     let slot = harness.account().acquire().await.unwrap();
     let pending = harness.connect("/v1/responses", b"{}", "").await;
     drop(pending);
@@ -618,7 +592,7 @@ async fn disconnect_during_slot_or_cooldown_wait_cancels_without_sending() {
 async fn maximum_cooldown_wait_returns_fixed_429_and_rounded_remaining_retry_after() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(1)
+        c.passthrough.routes[0].max_queue_wait_seconds = Some(1)
     })
     .await;
     let call = tokio::spawn(read(
@@ -655,14 +629,10 @@ async fn maximum_cooldown_wait_returns_fixed_429_and_rounded_remaining_retry_aft
 async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
     let directory = tempfile::tempdir().unwrap();
     let mut settings = config(directory.path());
-    settings.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
+    settings.passthrough.routes[0].max_queue_wait_seconds = Some(0);
     let frozen_at = Utc::now() + chrono::Duration::seconds(60);
     let mut process = open_with_clock(settings, Arc::new(move || frozen_at)).unwrap();
-    let pass = Arc::get_mut(&mut process.inner)
-        .unwrap()
-        .passthrough
-        .as_mut()
-        .unwrap();
+    let pass = &mut Arc::get_mut(&mut process.inner).unwrap().passthrough;
     let account = pass.routes[0].account.clone();
     for (nanoseconds, seconds) in [(1, 1), (1_000_000_000, 1), (1_000_000_001, 2)] {
         account
@@ -690,10 +660,8 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
 #[tokio::test]
 async fn invalid_content_encoding_and_type_and_response_overflow_end_without_final_chunk() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_response_bytes = 8
-    })
-    .await;
+    let harness =
+        Harness::start(&fixture, |c| c.passthrough.routes[0].max_response_bytes = 8).await;
     for headers in [
         vec![("content-type".into(), "text/plain".into())],
         vec![
@@ -718,17 +686,15 @@ async fn upstream_idle_timeout_with_fail_policy_releases_the_shared_slot() {
     let mut fixture = Fixture::start().await;
     fixture.idle_timeout = Some(Duration::from_secs(2));
     let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1;
-        c.passthrough.as_mut().unwrap().routes[0]
-            .retry_policy
-            .insert(
-                ErrorClass::Network,
-                RetryRule {
-                    action: RetryAction::Fail,
-                    max_attempts: None,
-                    backoff: Default::default(),
-                },
-            );
+        c.passthrough.routes[0].max_in_flight = 1;
+        c.passthrough.routes[0].retry_policy.insert(
+            ErrorClass::Network,
+            RetryRule {
+                action: RetryAction::Fail,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
     })
     .await;
     let call = harness.call().await;
@@ -753,7 +719,7 @@ async fn cooldown_is_durable_across_runtime_restart() {
     };
     let mut harness = Harness::with_clock(
         &fixture,
-        |config| config.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0),
+        |config| config.passthrough.routes[0].max_queue_wait_seconds = Some(0),
         None,
         Some(clock.clone()),
     )
@@ -766,11 +732,7 @@ async fn cooldown_is_durable_across_runtime_restart() {
     let retained = std::mem::replace(&mut harness._dir, tempfile::tempdir().unwrap());
     drop(harness);
     let mut process = open_with_clock(config, clock).unwrap();
-    let pass = Arc::get_mut(&mut process.inner)
-        .unwrap()
-        .passthrough
-        .as_mut()
-        .unwrap();
+    let pass = &mut Arc::get_mut(&mut process.inner).unwrap().passthrough;
     pass.wire_base = Some(fixture.base.clone());
     for route in &mut pass.routes {
         route.client = reqwest::Client::builder()
@@ -818,7 +780,7 @@ async fn cooldown_is_durable_across_runtime_restart() {
         response = &mut call => panic!("expired durable cooldown refused dispatch: {:?}", decoded(&response.unwrap())),
     };
     assert!(
-        restarted.process.inner.passthrough.as_ref().unwrap().now() >= until,
+        restarted.process.inner.passthrough.now() >= until,
         "restarted process dispatched inside its durable cooldown"
     );
     upstream.reply.send(Reply::json()).ok().unwrap();
@@ -829,7 +791,7 @@ async fn cooldown_is_durable_across_runtime_restart() {
 async fn health_heartbeat_replaces_complete_sanitized_json_and_stopping_precedes_close() {
     let fixture = Fixture::without_provider();
     let mut harness = Harness::start(&fixture, |_| {}).await;
-    let config = harness.process.config().passthrough.as_ref().unwrap();
+    let config = &harness.process.config().passthrough;
     let path = config.health_path.as_ref().unwrap();
     let initial = harness.health_where(|h| h["state"] == "running").await;
     assert_eq!(
@@ -849,11 +811,11 @@ async fn health_heartbeat_replaces_complete_sanitized_json_and_stopping_precedes
     assert_eq!((&mut harness.task).await.unwrap(), Ok(()));
 }
 
-fn login_config(config: &mut ProcessConfig) {
+fn login_config(config: &mut GatewayConfig) {
     let path = config.state_dir.parent().unwrap().join("login.json");
     let now = Utc::now().timestamp() as u64;
     write_private(&path,serde_json::to_string(&json!({"version":1,"family":"chatgpt_codex","issuer":"https://auth.openai.com","client_id":"app_EMoamEEZ73f0CkXaXp7hrann","access_token":"synthetic-old-access","refresh_token":"synthetic-old-refresh","id_token":"synthetic-old-id","account_id":"synthetic-account","principal_type":null,"principal_id":null,"expires_at":now+3600})).unwrap().as_bytes());
-    config.passthrough.as_mut().unwrap().routes[0].secret = SecretSource::LoginFile {
+    config.passthrough.routes[0].secret = SecretSource::LoginFile {
         path,
         family: LoginFamily::ChatgptCodex,
     };
@@ -939,15 +901,7 @@ async fn second_unauthorized_marks_login_failed_and_future_call_is_unavailable()
     assert_eq!(status, 503);
     assert_eq!(body, br#"{"error":{"code":"credential_unavailable"}}"#);
     assert!(fixture.incoming.try_recv().is_err());
-    let store = match &harness
-        .process
-        .config()
-        .passthrough
-        .as_ref()
-        .unwrap()
-        .routes[0]
-        .secret
-    {
+    let store = match &harness.process.config().passthrough.routes[0].secret {
         SecretSource::LoginFile { path, .. } => path.clone(),
         _ => unreachable!(),
     };
@@ -971,9 +925,7 @@ async fn fenced_login_never_sends_a_request() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         login_config(c);
-        let SecretSource::LoginFile { path, .. } =
-            &c.passthrough.as_ref().unwrap().routes[0].secret
-        else {
+        let SecretSource::LoginFile { path, .. } = &c.passthrough.routes[0].secret else {
             panic!()
         };
         let mut fence = path.as_os_str().to_owned();
@@ -989,101 +941,11 @@ async fn fenced_login_never_sends_a_request() {
 }
 
 #[tokio::test]
-async fn typed_provider_and_passthrough_share_one_durable_cooldown() {
-    use symbiotic_ai_runtime::{
-        ModelBinding, ResponseCacheMode,
-        model::{ChatMessage, ChatRequest, OpenAiCompatibleChatProvider},
-    };
-    let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |_| {}).await;
-    let route = &harness.process.inner.passthrough.as_ref().unwrap().routes[0];
-    let typed = harness
-        .process
-        .inner
-        .runtime
-        .chat(
-            ModelBinding::new(OpenAiCompatibleChatProvider::new(
-                "synthetic",
-                "model",
-                &fixture.base,
-                "",
-            ))
-            .with_identity(BindingIdentity::new(
-                &route.config.tenant,
-                "typed_chat",
-                "typed-v1",
-                &route.config.account,
-            ))
-            .with_policy(route.config.policy())
-            .with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off)
-            .with_response_cache(ResponseCacheMode::Off),
-        )
-        .unwrap();
-    let passthrough = harness.call().await;
-    fixture
-        .next()
-        .await
-        .reply
-        .send(Reply::rate(1))
-        .ok()
-        .unwrap();
-    harness
-        .health_where(|h| !h["routes"][0]["cooldown_until"].is_null())
-        .await;
-    let typed = tokio::spawn(async move {
-        typed
-            .chat(ChatRequest {
-                messages: vec![ChatMessage {
-                    role: "user".into(),
-                    content: "synthetic input".into(),
-                }],
-                max_output_tokens: Some(8),
-                temperature: None,
-                response_format: None,
-                role_binding: None,
-                source: None,
-                metadata: Value::Null,
-            })
-            .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), fixture.incoming.recv())
-            .await
-            .is_err()
-    );
-    advance_clock(Duration::from_secs(1)).await;
-    for _ in 0..2 {
-        let upstream = fixture.next().await;
-        if upstream.head.starts_with("POST /answer ") {
-            upstream.reply.send(Reply::json()).ok().unwrap();
-        } else {
-            assert!(upstream.head.starts_with("POST /chat/completions "));
-            let mut reply = Reply::json();
-            reply.body=br#"{"choices":[{"message":{"content":"typed answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#.to_vec();
-            upstream.reply.send(reply).ok().unwrap();
-        }
-    }
-    assert_eq!(decoded(&passthrough.await.unwrap()).0, 200);
-    assert_eq!(typed.await.unwrap().unwrap().text, "typed answer");
-    // Health republishes on the heartbeat and reads cooldown expiry on the process clock.
-    advance_clock(Duration::from_secs(10)).await;
-    harness
-        .health_where(|h| h["routes"][0]["cooldown_until"].is_null())
-        .await;
-}
-
-#[tokio::test]
 async fn peer_uid_check_refuses_a_foreign_uid_before_parsing() {
     let dir = tempfile::tempdir().unwrap();
     let process = open(config(dir.path())).unwrap();
     let listener = bind(&process).unwrap();
-    let socket_path = process
-        .config()
-        .passthrough
-        .as_ref()
-        .unwrap()
-        .socket_path
-        .clone();
+    let socket_path = process.config().passthrough.socket_path.clone();
     let task = tokio::spawn(serve_until(
         process,
         listener,
@@ -1103,10 +965,7 @@ async fn peer_uid_check_refuses_a_foreign_uid_before_parsing() {
 #[tokio::test]
 async fn disconnect_during_an_upstream_call_frees_the_slot_immediately() {
     let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1
-    })
-    .await;
+    let harness = Harness::start(&fixture, |c| c.passthrough.routes[0].max_in_flight = 1).await;
     let socket = harness.connect("/v1/responses", b"{}", "").await;
     let held = fixture.next().await;
     drop(socket);
@@ -1282,10 +1141,7 @@ async fn account_slot_stays_held_after_response_headers_until_the_stream_finishe
         incoming,
         task,
     };
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1
-    })
-    .await;
+    let harness = Harness::start(&fixture, |c| c.passthrough.routes[0].max_in_flight = 1).await;
     let first = harness.call().await;
     ready_receive.await.unwrap();
     let second = harness.call().await;
@@ -1295,80 +1151,11 @@ async fn account_slot_stays_held_after_response_headers_until_the_stream_finishe
 }
 
 #[tokio::test]
-async fn typed_provider_and_passthrough_spend_the_same_request_pacing_bucket() {
-    use symbiotic_ai_runtime::{
-        ModelBinding, ResponseCacheMode,
-        model::{ChatMessage, ChatRequest, OpenAiCompatibleChatProvider},
-    };
-    let mut fixture = Fixture::start().await;
-    let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().routes[0].requests_per_minute = Some(60)
-    })
-    .await;
-    let route = &harness.process.inner.passthrough.as_ref().unwrap().routes[0];
-    let typed = harness
-        .process
-        .inner
-        .runtime
-        .chat(
-            ModelBinding::new(OpenAiCompatibleChatProvider::new(
-                "synthetic",
-                "model",
-                &fixture.base,
-                "",
-            ))
-            .with_identity(BindingIdentity::new(
-                &route.config.tenant,
-                "typed_chat",
-                "typed-v1",
-                &route.config.account,
-            ))
-            .with_policy(route.config.policy())
-            .with_answer_recovery(symbiotic_ai_runtime::AnswerRecovery::Off)
-            .with_response_cache(ResponseCacheMode::Off),
-        )
-        .unwrap();
-    let typed = tokio::spawn(async move {
-        typed
-            .chat(ChatRequest {
-                messages: vec![ChatMessage {
-                    role: "user".into(),
-                    content: "synthetic input".into(),
-                }],
-                max_output_tokens: Some(8),
-                temperature: None,
-                response_format: None,
-                role_binding: None,
-                source: None,
-                metadata: Value::Null,
-            })
-            .await
-    });
-    let first = fixture.next().await;
-    let started = Instant::now();
-    let mut reply = Reply::json();
-    reply.body=br#"{"choices":[{"message":{"content":"typed answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#.to_vec();
-    first.reply.send(reply).ok().unwrap();
-    assert_eq!(typed.await.unwrap().unwrap().text, "typed answer");
-    let raw = harness.call().await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), fixture.incoming.recv())
-            .await
-            .is_err()
-    );
-    advance_clock(Duration::from_secs(1)).await;
-    let next = fixture.next().await;
-    assert!(started.elapsed() >= Duration::from_millis(900));
-    next.reply.send(Reply::json()).ok().unwrap();
-    assert_eq!(decoded(&raw.await.unwrap()).0, 200);
-}
-
-#[tokio::test]
 async fn route_event_hold_limit_returns_a_visible_error_for_oversized_items() {
     let mut fixture = Fixture::start().await;
     for (limit, earlier_item_released) in [(1, false), (256, false), (256, true)] {
         let harness = Harness::start(&fixture, |config| {
-            config.passthrough.as_mut().unwrap().routes[0].max_held_event_bytes = limit;
+            config.passthrough.routes[0].max_held_event_bytes = limit;
         })
         .await;
         let complete = b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"complete\",\"type\":\"message\",\"content\":[]}}\n\n";
@@ -1458,7 +1245,7 @@ async fn discovery_timeout_before_exchange_leaves_an_empty_retryable_fence() {
         store["client_id"] = json!("b1a00492-073a-47ea-816f-4c329264a828");
         store["expires_at"] = json!(Utc::now().timestamp() + 60);
         write_private(&path, &serde_json::to_vec(&store).unwrap());
-        config.passthrough.as_mut().unwrap().routes[0].secret = SecretSource::LoginFile {
+        config.passthrough.routes[0].secret = SecretSource::LoginFile {
             path,
             family: LoginFamily::XaiGrok,
         };
@@ -1494,7 +1281,7 @@ async fn rate_limit_and_unauthorized_resends_charge_pacing_while_keeping_the_slo
             if status == 401 {
                 login_config(config);
             }
-            let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut config.passthrough.routes[0];
             route.requests_per_minute = Some(60);
             route.max_in_flight = 1;
         })
@@ -1556,7 +1343,7 @@ async fn unusable_login_after_slot_cooldown_pacing_or_gate_wait_never_dispatches
             let mut fixture = Fixture::start().await;
             let harness = Harness::start(&fixture, |config| {
                 login_config(config);
-                let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+                let route = &mut config.passthrough.routes[0];
                 route.max_in_flight = if waiting == "slot" { 1 } else { 2 };
                 if waiting == "pacing" {
                     route.requests_per_minute = Some(60);
@@ -1712,7 +1499,7 @@ async fn passthrough_contract_parser_refuses_bare_newlines_before_or_within_the_
 async fn retry_policy_header_selects_named_table_and_unknown_name_is_local_400() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
-        c.passthrough.as_mut().unwrap().retry_policies.insert(
+        c.passthrough.retry_policies.insert(
             "stop".into(),
             HashMap::from([(
                 ErrorClass::Throttle,
@@ -1804,7 +1591,7 @@ async fn server_stops_on_third_attempt_and_switch_without_fallback_fails() {
     for switch in [false, true] {
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
-            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut c.passthrough.routes[0];
             route.retry_policy.insert(
                 ErrorClass::Server,
                 RetryRule {
@@ -1878,7 +1665,7 @@ async fn new_sessions_flow_freely_then_hold_and_probe_without_blocking_seen_sess
     let harness = Harness::with_clock(
         &fixture,
         |c| {
-            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut c.passthrough.routes[0];
             route.max_in_flight = 8;
             route.new_session = Some(NewSessionConfig {
                 session_headers: vec!["session-id".into(), "thread-id".into()],
@@ -2205,7 +1992,7 @@ async fn passthrough_pending_failure_events_respect_held_and_response_byte_limit
         let mut fixture = Fixture::start().await;
         let error = "event: error\ndata: {\"type\":\"error\",\"code\":\"cyber_policy\"}\n\n";
         let harness = Harness::start(&fixture, |c| {
-            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut c.passthrough.routes[0];
             if held_limit {
                 route.max_held_event_bytes = error.len();
             } else {
@@ -2242,7 +2029,7 @@ async fn mid_answer_failure_and_disconnect_continue_with_exact_items_and_one_joi
     for disconnect in [false, true] {
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
-            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut c.passthrough.routes[0];
             for class in [ErrorClass::Network, ErrorClass::Throttle] {
                 route.retry_policy.insert(
                     class,
@@ -2375,18 +2162,16 @@ async fn unreachable_provider_recovers_after_several_backoffs_with_one_late_answ
     let harness = Harness::with_hook(
         &absent,
         |c| {
-            c.passthrough.as_mut().unwrap().routes[0]
-                .retry_policy
-                .insert(
-                    ErrorClass::Network,
-                    RetryRule {
-                        action: RetryAction::RetrySame,
-                        max_attempts: Some(8),
-                        backoff: RetryBackoff {
-                            base_delay_ms: Some(10),
-                        },
+            c.passthrough.routes[0].retry_policy.insert(
+                ErrorClass::Network,
+                RetryRule {
+                    action: RetryAction::RetrySame,
+                    max_attempts: Some(8),
+                    backoff: RetryBackoff {
+                        base_delay_ms: Some(10),
                     },
-                );
+                },
+            );
         },
         Some(hook),
     )
@@ -2416,10 +2201,10 @@ async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waite
     let dir = tempfile::tempdir().unwrap();
     let mut settings = config(dir.path());
     login_config(&mut settings);
-    settings.passthrough.as_mut().unwrap().routes[0].max_in_flight = 1;
+    settings.passthrough.routes[0].max_in_flight = 1;
     let process = open(settings).unwrap();
     assert!(!dir.path().join("key").exists());
-    let pass = process.inner.passthrough.as_ref().unwrap();
+    let pass = &process.inner.passthrough;
     let permit = pass.routes[0].account.acquire().await.unwrap();
     let (mut caller, server) = UnixStream::pair().unwrap();
     caller.write_all(b"POST /v1/responses HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\nx-symbiotic-request-id: synthetic-job\r\n\r\n{}").await.unwrap();
@@ -2428,7 +2213,7 @@ async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waite
     tokio::time::timeout(Duration::from_secs(2), pass.changed.notified())
         .await
         .unwrap();
-    let settings = process.config().passthrough.as_ref().unwrap();
+    let settings = &process.config().passthrough;
     pass.publish_health(settings, "running").await.unwrap();
     let health: Value =
         serde_json::from_slice(&fs::read(settings.health_path.as_ref().unwrap()).unwrap()).unwrap();
@@ -2643,7 +2428,7 @@ async fn credential_in_response_header_name_is_dropped_from_reply_and_health() {
     let configured = format!("x-{KEY}-reply");
     let recognized = format!("x-{KEY}-limit-name");
     let harness = Harness::start(&fixture, |config| {
-        config.passthrough.as_mut().unwrap().routes[0]
+        config.passthrough.routes[0]
             .return_headers
             .push(configured.clone());
     })
@@ -2686,10 +2471,9 @@ async fn deadline_crossing_between_clock_reads_allows_socket_dispatch() {
             &fixture,
             |config| {
                 if session_hold {
-                    config.passthrough.as_mut().unwrap().routes[0].new_session =
-                        Some(NewSessionConfig {
-                            session_headers: vec!["session-id".into()],
-                        });
+                    config.passthrough.routes[0].new_session = Some(NewSessionConfig {
+                        session_headers: vec!["session-id".into()],
+                    });
                 }
             },
             None,
@@ -2697,7 +2481,7 @@ async fn deadline_crossing_between_clock_reads_allows_socket_dispatch() {
         )
         .await;
         if session_hold {
-            let pass = harness.process.inner.passthrough.as_ref().unwrap();
+            let pass = &harness.process.inner.passthrough;
             pass.routes[0].retries.sessions.state.lock().unwrap().until = Some(deadline);
         } else {
             harness.account().note_cooldown(deadline).await.unwrap();
@@ -2762,8 +2546,7 @@ impl LogCapture {
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_retry_logs_share_validated_request_id_and_complete_once() {
-    let (capture, _subscriber) =
-        LogCapture::install("off,symbiotic_credential_process::passthrough=debug");
+    let (capture, _subscriber) = LogCapture::install("off,symbiotic_gateway::passthrough=debug");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness
@@ -2829,8 +2612,7 @@ async fn passthrough_retry_logs_share_validated_request_id_and_complete_once() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_absent_request_id_logs_one_local_uuid() {
-    let (capture, _subscriber) =
-        LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+    let (capture, _subscriber) = LogCapture::install("off,symbiotic_gateway::passthrough=info");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |_| {}).await;
     let caller = harness.connect("/v1/responses", b"{}", "").await;
@@ -2878,14 +2660,13 @@ async fn passthrough_local_refusals_log_one_completion_with_returned_code_and_st
             "credential_unavailable",
         ),
     ] {
-        let (capture, _subscriber) =
-            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+        let (capture, _subscriber) = LogCapture::install("off,symbiotic_gateway::passthrough=info");
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
             if status == 503 {
                 login_config(c);
             }
-            c.passthrough.as_mut().unwrap().routes[0].max_queue_wait_seconds = Some(0);
+            c.passthrough.routes[0].max_queue_wait_seconds = Some(0);
         })
         .await;
         if status == 503 {
@@ -2994,11 +2775,10 @@ async fn passthrough_early_refusals_and_body_disconnect_log_one_completion() {
             Some("synthetic-request"),
         ),
     ] {
-        let (capture, _subscriber) =
-            LogCapture::install("off,symbiotic_credential_process::passthrough=info");
+        let (capture, _subscriber) = LogCapture::install("off,symbiotic_gateway::passthrough=info");
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |config| {
-            config.passthrough.as_mut().unwrap().routes[0].max_request_bytes = 2;
+            config.passthrough.routes[0].max_request_bytes = 2;
         })
         .await;
         let mut caller = UnixStream::connect(harness.path()).await.unwrap();
@@ -3063,8 +2843,8 @@ async fn passthrough_early_refusals_and_body_disconnect_log_one_completion() {
     }
 }
 
-fn chat_config(config: &mut ProcessConfig) {
-    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+fn chat_config(config: &mut GatewayConfig) {
+    let route = &mut config.passthrough.routes[0];
     route.stream = StreamDialect::OpenaiChatCompletions;
     route.path = "/v1/chat/completions".into();
 }
@@ -3433,18 +3213,16 @@ async fn chat_completions_disconnect_before_first_byte_retries_original_request(
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         chat_config(c);
-        c.passthrough.as_mut().unwrap().routes[0]
-            .retry_policy
-            .insert(
-                ErrorClass::Network,
-                RetryRule {
-                    action: RetryAction::RetrySame,
-                    max_attempts: Some(2),
-                    backoff: RetryBackoff {
-                        base_delay_ms: Some(1),
-                    },
+        c.passthrough.routes[0].retry_policy.insert(
+            ErrorClass::Network,
+            RetryRule {
+                action: RetryAction::RetrySame,
+                max_attempts: Some(2),
+                backoff: RetryBackoff {
+                    base_delay_ms: Some(1),
                 },
-            );
+            },
+        );
     })
     .await;
     let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
@@ -3462,7 +3240,7 @@ async fn chat_completions_get_model_listing_relays_json_with_scrubbing() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         chat_config(c);
-        let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+        let route = &mut c.passthrough.routes[0];
         route.method = PassthroughMethod::Get;
         route.path = "/v1/models".into();
         route.destination = "https://provider.invalid/v1/models".into();
@@ -3495,7 +3273,7 @@ async fn chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after
     let mut settings = config(directory.path());
     chat_config(&mut settings);
     let process = open(settings.clone()).unwrap();
-    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let route = &process.inner.passthrough.routes[0];
     let unknown = route
         .account
         .reserve_passthrough(&route.config.identity())
@@ -3553,9 +3331,9 @@ async fn chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after
     assert_eq!((measured.output, measured.recovery), (None, None));
 }
 
-fn money_config(config: &mut ProcessConfig) {
+fn money_config(config: &mut GatewayConfig) {
     chat_config(config);
-    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+    let route = &mut config.passthrough.routes[0];
     route.price = Some(
         serde_json::from_value(
             json!({"rates":{"input_cache_miss":"0.15","input_cache_hit":"0.003","output":"0.6"}}),
@@ -3563,9 +3341,9 @@ fn money_config(config: &mut ProcessConfig) {
         .unwrap(),
     );
 }
-fn balance_config(config: &mut ProcessConfig) {
+fn balance_config(config: &mut GatewayConfig) {
     money_config(config);
-    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+    let route = &mut config.passthrough.routes[0];
     route.destination = "https://api.deepseek.com/chat/completions".into();
     route.balance=Some(serde_json::from_value(json!({"provider":"deepseek","interval_seconds":10,"debounce_seconds":1,"low_balance":{"currency":"USD","amount":"5"}})).unwrap());
 }
@@ -3578,7 +3356,7 @@ async fn passthrough_money_fallback_secret_is_not_persisted_as_request_id() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         money_config(c);
-        let pass = c.passthrough.as_mut().unwrap();
+        let pass = &mut c.passthrough;
         let path = c.state_dir.parent().unwrap().join("fallback-key");
         write_private(&path, FALLBACK_KEY.as_bytes());
         let mut fallback = pass.routes[0].clone();
@@ -3641,7 +3419,7 @@ async fn passthrough_money_priced_and_unpriced_sends_store_cost_time_and_request
         let harness = Harness::start(&fixture, |c| {
             money_config(c);
             if !priced {
-                c.passthrough.as_mut().unwrap().routes[0].price = None;
+                c.passthrough.routes[0].price = None;
             }
         })
         .await;
@@ -3688,12 +3466,12 @@ async fn passthrough_money_priced_and_unpriced_sends_store_cost_time_and_request
 }
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_money_spent_and_unknown_holds_refuse_before_upstream_socket() {
-    let (capture, _guard) = LogCapture::install("symbiotic_credential_process=info");
+    let (capture, _guard) = LogCapture::install("symbiotic_gateway=info");
     for settled in [true, false] {
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
             money_config(c);
-            c.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(
+            c.passthrough.routes[0].spend_limit = Some(
                 serde_json::from_value(
                     json!({"usd":"0.000003","window_seconds":3600,"max_request_usd":"0.000003"}),
                 )
@@ -3742,12 +3520,12 @@ async fn passthrough_money_released_attempts_keep_budget_available_after_restart
     let directory = tempfile::tempdir().unwrap();
     let mut settings = config(directory.path());
     money_config(&mut settings);
-    settings.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(
+    settings.passthrough.routes[0].spend_limit = Some(
         serde_json::from_value(json!({"usd":"0.5","window_seconds":86400,"max_request_usd":"0.5"}))
             .unwrap(),
     );
     let process = open(settings.clone()).unwrap();
-    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let route = &process.inner.passthrough.routes[0];
     let mut references = Vec::new();
     for _ in 0..4 {
         let reference = route
@@ -3768,7 +3546,7 @@ async fn passthrough_money_released_attempts_keep_budget_available_after_restart
     }
     drop(process);
     let process = open(settings).unwrap();
-    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let route = &process.inner.passthrough.routes[0];
     let account = symbiotic_ai_runtime::account_scope(
         &route.config.identity(),
         route.config.account_sharing_key.as_ref(),
@@ -3821,7 +3599,7 @@ async fn passthrough_money_failed_send_stays_unknown_and_holds_budget() {
         let mut fixture = Fixture::start().await;
         let harness = Harness::start(&fixture, |c| {
             money_config(c);
-            let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+            let route = &mut c.passthrough.routes[0];
             route.spend_limit = Some(
                 serde_json::from_value(
                     json!({"usd":"0.5","window_seconds":86400,"max_request_usd":"0.5"}),
@@ -3871,14 +3649,14 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
     let limit: SpendLimit =
         serde_json::from_value(json!({"usd":"1","window_seconds":60,"max_request_usd":"0.1"}))
             .unwrap();
-    config.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(limit.clone());
+    config.passthrough.routes[0].spend_limit = Some(limit.clone());
     config.validate_routes().unwrap();
     for (stream, method) in [
         (StreamDialect::OpenaiChatCompletions, PassthroughMethod::Get),
         (StreamDialect::OpenaiResponses, PassthroughMethod::Get),
     ] {
         let mut with_listing = config.clone();
-        let routes = &mut with_listing.passthrough.as_mut().unwrap().routes;
+        let routes = &mut with_listing.passthrough.routes;
         let mut listing = routes[0].clone();
         listing.name = "models".into();
         listing.method = method;
@@ -3892,7 +3670,7 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
     }
 
     let mut with_responses = config.clone();
-    let routes = &mut with_responses.passthrough.as_mut().unwrap().routes;
+    let routes = &mut with_responses.passthrough.routes;
     let mut responses = routes[0].clone();
     responses.name = "responses".into();
     responses.path = "/v1/responses".into();
@@ -3902,34 +3680,10 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
     routes.push(responses);
     assert_eq!(
         with_responses.validate_routes(),
-        Err(EgressError::InvalidRequest)
+        Err(GatewayError::InvalidRequest)
     );
 
-    let mut with_typed = config.clone();
-    let mut typed: crate::RouteConfig = serde_json::from_value(json!({
-        "tenant":"tenant", "account":"account", "account_sharing_key":null,
-        "max_attempts":3, "route":"typed_chat", "secret_ref":"", "secret":{"backend":"none"},
-        "destination":"https://provider.invalid", "model":"synthetic",
-        "provider":{"kind":"open_ai_chat","operator":"synthetic"},
-        "allow_loopback_http":false, "max_field_bytes":128, "max_output_tokens":10,
-        "max_in_flight":2, "requests_per_minute":null, "input_units_per_minute":null,
-        "timeout_seconds":1
-    }))
-    .unwrap();
-    let limited = &config.passthrough.as_ref().unwrap().routes[0];
-    typed.tenant = limited.tenant.clone();
-    typed.account = limited.account.clone();
-    typed.max_in_flight = limited.max_in_flight;
-    typed.requests_per_minute = limited.requests_per_minute;
-    with_typed.routes.push(typed);
-    assert_eq!(
-        with_typed.validate_routes(),
-        Err(EgressError::InvalidRequest)
-    );
-    with_typed.passthrough.as_mut().unwrap().routes[0].spend_limit = None;
-    assert_eq!(with_typed.validate_routes(), Ok(()));
-
-    config.passthrough.as_mut().unwrap().routes[0].price = None;
+    config.passthrough.routes[0].price = None;
     assert!(config.validate_routes().is_err());
     money_config(&mut config);
     for (stream, method) in [
@@ -3937,7 +3691,7 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
         (StreamDialect::OpenaiChatCompletions, PassthroughMethod::Get),
     ] {
         let mut unsupported = config.clone();
-        let route = &mut unsupported.passthrough.as_mut().unwrap().routes[0];
+        let route = &mut unsupported.passthrough.routes[0];
         route.stream = stream;
         route.method = method;
         route.spend_limit = None;
@@ -3945,14 +3699,14 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
             unsupported.validate_routes().is_err(),
             "price requires Chat Completions POST"
         );
-        unsupported.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(limit.clone());
+        unsupported.passthrough.routes[0].spend_limit = Some(limit.clone());
         assert!(
             unsupported.validate_routes().is_err(),
             "limit requires Chat Completions POST"
         );
     }
     for sharing in [false, true] {
-        let pass = config.passthrough.as_mut().unwrap();
+        let pass = &mut config.passthrough;
         if sharing {
             pass.routes[0].account_sharing_key =
                 Some(symbiotic_ai_runtime::AccountSharingKey::new("shared"));
@@ -3967,9 +3721,9 @@ async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_
         other.spend_limit = None;
         pass.routes.push(other);
         assert!(config.validate_routes().is_err());
-        config.passthrough.as_mut().unwrap().routes[1].spend_limit = Some(limit.clone());
+        config.passthrough.routes[1].spend_limit = Some(limit.clone());
         assert!(config.validate_routes().is_ok());
-        config.passthrough.as_mut().unwrap().routes.pop();
+        config.passthrough.routes.pop();
     }
 }
 #[tokio::test(flavor = "current_thread")]
@@ -4114,11 +3868,11 @@ async fn passthrough_money_low_balance_polls_warn_once_and_recovery_rearms() {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn passthrough_money_insufficient_balance_is_final_one_attempt_and_single_flight_read() {
-    let (capture, _guard) = LogCapture::install("symbiotic_credential_process=info");
+    let (capture, _guard) = LogCapture::install("symbiotic_gateway=info");
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         balance_config(c);
-        c.passthrough.as_mut().unwrap().routes[0]
+        c.passthrough.routes[0]
             .balance
             .as_mut()
             .unwrap()
@@ -4196,7 +3950,7 @@ async fn passthrough_money_insufficient_balance_is_final_one_attempt_and_single_
 fn passthrough_money_price_setting_accepts_exact_decimal_strings() {
     let directory = tempfile::tempdir().unwrap();
     let settings = config(directory.path());
-    let mut route = serde_json::to_value(&settings.passthrough.unwrap().routes[0]).unwrap();
+    let mut route = serde_json::to_value(&settings.passthrough.routes[0]).unwrap();
     route["price"] =
         json!({"rates":{"input_cache_hit":"0.003","input_cache_miss":"0.15","output":"0.6"}});
     let result = serde_json::from_value::<PassthroughRoute>(route.clone());

@@ -40,7 +40,6 @@ fn config(dir: &std::path::Path, routes: Vec<RouteConfig>, frame: u32) -> Proces
         clock_rollback_warning_tolerance_seconds: 5,
         jobs: Default::default(),
         job_runner: Default::default(),
-        passthrough: None,
         routes,
     }
 }

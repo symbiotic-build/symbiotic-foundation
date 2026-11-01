@@ -5,6 +5,10 @@ issue: 156
 
 # 156 — Login accounts and agent passthrough
 
+The passthrough implementation now lives in `symbiotic-gateway` (issue #203).
+Its [README](../../crates/symbiotic-gateway/README.md) defines the separate
+configuration and command line. The shared-process design below records the original design.
+
 This record designs two additions to the credential process for
 [#156](https://github.com/symbiotic-build/symbiotic-foundation/issues/156):
 
@@ -659,7 +663,7 @@ Chat Completions forwards complete SSE records progressively after scrubbing;
 
 ### Internal item stream
 
-`symbiotic-model::item_stream` defines the provider-neutral enum `ItemEvent`:
+`symbiotic-gateway::item_stream` defines the provider-neutral enum `ItemEvent`:
 `ItemStarted`, `ItemDelta`, `ItemDone`, `Usage`, `Error`, and opaque `Other` events.
 `ItemDone` carries complete provider JSON for exact replay. `Usage` carries
 `symbiotic_trace::UsageTrace`. Error events carry provider code and class. Event
@@ -911,7 +915,7 @@ Removed while designing:
 ## Acceptance tests
 
 All use loopback provider fixtures with synthetic tokens, in
-`crates/symbiotic-credential-process/tests/passthrough.rs` and `login.rs`.
+`crates/symbiotic-gateway/tests/passthrough.rs` and `login.rs`.
 
 - **Renewal:** ten concurrent requests on a token expiring in 60 s cause one token
   exchange; all ten carry the new token.

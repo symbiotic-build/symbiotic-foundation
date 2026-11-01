@@ -1,11 +1,8 @@
 //! Complete-item holding and continuation joining.
+use crate::item_stream::{ItemEvent, ResponsesAdapter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use symbiotic_ai_runtime::model::{
-    self,
-    item_stream::{ItemEvent, ResponsesAdapter},
-};
 
 /// Provider event dialect. Chat Completions cannot continue and join after output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,11 +22,11 @@ impl std::fmt::Display for StreamError {
     }
 }
 impl std::error::Error for StreamError {}
-impl From<model::item_stream::ItemStreamError> for StreamError {
-    fn from(error: model::item_stream::ItemStreamError) -> Self {
+impl From<crate::item_stream::ItemStreamError> for StreamError {
+    fn from(error: crate::item_stream::ItemStreamError) -> Self {
         match error {
-            model::item_stream::ItemStreamError::InvalidEvent => Self("invalid_provider_stream"),
-            model::item_stream::ItemStreamError::HeldEventBytesExceeded => {
+            crate::item_stream::ItemStreamError::InvalidEvent => Self("invalid_provider_stream"),
+            crate::item_stream::ItemStreamError::HeldEventBytesExceeded => {
                 Self("max_held_event_bytes")
             }
         }
@@ -237,7 +234,7 @@ impl ItemJoin {
         }
         ResponsesAdapter::rewrite(
             event,
-            model::item_stream::JoinFields {
+            crate::item_stream::JoinFields {
                 response_id: self.response_id.as_deref(),
                 sequence_number,
                 output_index,
