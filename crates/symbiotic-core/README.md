@@ -6,7 +6,7 @@ queue or database.
 
 ## Contract types
 
-Five modules hold the types that several systems exchange. Each component imports
+Two modules hold the types that several systems exchange. Each component imports
 them from here and keeps no copy of its own. The types are serde types only: they
 carry no behaviour and do no I/O.
 
@@ -45,48 +45,20 @@ Producers: source adapters for Warden, the Foundation model proxy, GitHub,
 session hooks, hosts and the build queue. Consumer: Mission Control's event
 endpoint and policy runner.
 
-### `signal::Signal`
-
-The trigger classifier's reading of one operator message or agent reply:
-correction, preference, problem, operator blocker, confusion, clarification or
-none, with the words quoted exactly.
-
-Producer: the trigger classifier in the harness hooks. Consumers: Mission
-Control, which queues signals, and the compiler that turns them into incidents,
-guards and rule drafts.
-
-### `campaign::Campaign`
-
-A goal with the operator's instructions quoted as data. It holds the constraints
-derived from them (ordering, minimums, required report fields, spend limits,
-build rules), the `DECISION` records of deviations, and the policies that map
-events to actions: record, stop, notify, ask, divert, shelve.
-
-Producers: the orchestrator and the operator, through Mission Control. Consumers:
-Mission Control's policy runner and `plan check`.
-
-### `incident::Incident`
-
-One recorded failure with its class, start and detection times, escape reason,
-fix, guard and guard test. An incident closes only with a guard and its test.
-
-Producers: the incident ledger and the signal compiler. Consumers: Mission
-Control and the House Rules three-occurrence check.
-
 ## Naming conventions
 
 - Types are upper camel case nouns: `SystemEvent`, `DecisionEnvelope`.
 - Rust fields are lower snake case. Wire fields are lower camel case through
   `#[serde(rename_all = "camelCase")]`, because Mission Control is TypeScript:
   `observed_at` is `observedAt`.
-- Enumeration values on the wire are lower snake case: `operator_blocker`,
-  `plan_drift`.
+- Enumeration values on the wire are lower snake case: `more_context`,
+  `attached_repo`.
 - Tagged unions put their variant in a field named `kind`:
-  `{ "kind": "ask", "questionKind": "authority" }`.
+  `{ "kind": "more_context", "missing": ["evidence"] }`.
 - Event kinds are dotted, subject first, verb in the past tense:
   `provider.refused`, `job.failed`.
 - Identifiers are strings wrapped in one newtype per object: `EventId`,
-  `DecisionId`, `CampaignId`, `IncidentId`, `SignalId`.
+  `DecisionId`, `CampaignId`.
 - Timestamps are ISO 8601 UTC strings, carried unparsed in `Timestamp`.
 - Unknown fields fail to parse.
 

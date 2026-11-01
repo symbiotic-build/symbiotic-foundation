@@ -7,9 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Timestamp;
-use crate::campaign::CampaignId;
 use crate::event::EventId;
+use crate::{CampaignId, Timestamp};
 
 /// Stable decision identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

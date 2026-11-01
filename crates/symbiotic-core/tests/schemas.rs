@@ -4,11 +4,8 @@
 #![cfg(feature = "schema")]
 
 use schemars::{JsonSchema, schema_for};
-use symbiotic_core::campaign::Campaign;
 use symbiotic_core::decision::DecisionEnvelope;
 use symbiotic_core::event::SystemEvent;
-use symbiotic_core::incident::Incident;
-use symbiotic_core::signal::Signal;
 
 fn check<T: JsonSchema>(name: &str) {
     let path = format!("{}/schemas/{name}.json", env!("CARGO_MANIFEST_DIR"));
@@ -29,7 +26,4 @@ fn check<T: JsonSchema>(name: &str) {
 fn committed_schemas_match_the_types() {
     check::<DecisionEnvelope>("decision-envelope");
     check::<SystemEvent>("system-event");
-    check::<Signal>("signal");
-    check::<Campaign>("campaign");
-    check::<Incident>("incident");
 }

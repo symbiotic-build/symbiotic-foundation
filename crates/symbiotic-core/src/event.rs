@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Timestamp;
-use crate::campaign::CampaignId;
+use crate::{CampaignId, Timestamp};
 
 /// Source-assigned event identifier; a repeated id is the same event.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -7,13 +7,10 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use symbiotic_core::campaign::{Campaign, ConstraintRule, PolicyAction};
 use symbiotic_core::decision::{
     Answer, AnswerFormat, DecisionEnvelope, MissingContext, QuestionKind, QuestionSeverity,
 };
 use symbiotic_core::event::{DetailValue, EventSeverity, SystemEvent};
-use symbiotic_core::incident::{Incident, IncidentClass, IncidentStatus};
-use symbiotic_core::signal::{Signal, SignalKind};
 
 fn fixture<T: DeserializeOwned + Serialize>(name: &str) -> T {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -50,39 +47,6 @@ fn hardware_key_blocker_parses_as_a_critical_option_decision() {
 }
 
 #[test]
-fn operator_words_parse_as_a_correction_signal() {
-    let signal: Signal = fixture("signal.json");
-    assert_eq!(signal.kind, SignalKind::Correction);
-    assert_eq!(signal.quoted, "Do not stop that run");
-}
-
-#[test]
-fn first_step_instruction_parses_as_an_ordering_constraint() {
-    let campaign: Campaign = fixture("campaign.json");
-    assert_eq!(
-        campaign.constraints[0].rule,
-        ConstraintRule::Ordering {
-            first: vec!["alpha".into()],
-            then: vec![]
-        }
-    );
-    assert_eq!(
-        campaign.policies[0].actions[1],
-        PolicyAction::Ask {
-            question_kind: QuestionKind::Authority
-        }
-    );
-}
-
-#[test]
-fn ledger_incident_parses_with_its_class_and_status() {
-    let incident: Incident = fixture("incident.json");
-    assert_eq!(incident.class, IncidentClass::ReportDrift);
-    assert_eq!(incident.status, IncidentStatus::Open);
-    assert!(incident.guard.is_none());
-}
-
-#[test]
 fn more_context_answer_names_the_missing_parts() {
     let answer: Answer = serde_json::from_value(json!({
         "kind": "more_context",
@@ -108,25 +72,8 @@ fn event_detail_refuses_free_text() {
 
 #[test]
 fn unknown_fields_are_refused() {
-    let mut incident: Value =
-        serde_json::from_str(include_str!("fixtures/incident.json")).expect("fixture is JSON");
-    incident["detectionDelayMin"] = json!(447);
-    assert!(serde_json::from_value::<Incident>(incident).is_err());
-}
-
-#[test]
-fn tagged_variants_refuse_unknown_fields() {
-    for action in [
-        json!({ "kind": "ask", "questionKind": "authority", "extra": 1 }),
-        json!({ "kind": "record", "extra": 1 }),
-        json!({ "kind": "stop", "extra": 1 }),
-        json!({ "kind": "notify", "extra": 1 }),
-        json!({ "kind": "divert", "extra": 1 }),
-        json!({ "kind": "shelve", "extra": 1 }),
-    ] {
-        assert!(
-            serde_json::from_value::<PolicyAction>(action.clone()).is_err(),
-            "{action} is refused"
-        );
-    }
+    let mut event: Value =
+        serde_json::from_str(include_str!("fixtures/system-event.json")).expect("fixture is JSON");
+    event["unknownField"] = json!(1);
+    assert!(serde_json::from_value::<SystemEvent>(event).is_err());
 }

@@ -40,8 +40,8 @@ flowchart TB
 ### `symbiotic-core`
 
 Owns tiny stable vocabulary, the dependency-light `retry` module, and the
-serde-only contract modules `decision`, `event`, `signal`, `campaign` and
-`incident` ([crate README](../crates/symbiotic-core/README.md)):
+serde-only contract modules `decision` and `event`
+([crate README](../crates/symbiotic-core/README.md)):
 
 - `TraceId`
 - `QueueId`
