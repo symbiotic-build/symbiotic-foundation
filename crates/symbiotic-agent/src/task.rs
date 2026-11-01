@@ -84,9 +84,10 @@ fn matches_type(value: &Value, name: &str) -> bool {
         "object" => value.is_object(),
         "array" => value.is_array(),
         "string" => value.is_string(),
-        "integer" => {
-            value.is_i64() || value.is_u64() || value.as_f64().is_some_and(|n| n.fract() == 0.0)
-        }
+        "integer" => value
+            .as_number()
+            .and_then(normalized_decimal)
+            .is_some_and(|(_, digits, exponent)| digits.is_empty() || exponent >= 0),
         "number" => value.is_number(),
         "boolean" => value.is_boolean(),
         "null" => value.is_null(),
@@ -173,11 +174,9 @@ fn validate_at(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
 // JSON Schema compares numeric values, not serde_json's integer/float representations.
 fn json_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => {
-            a == b
-                || (a.is_f64() && integer_float_equal(b, a.as_f64()))
-                || (b.is_f64() && integer_float_equal(a, b.as_f64()))
-        }
+        (Value::Number(a), Value::Number(b)) => normalized_decimal(a)
+            .zip(normalized_decimal(b))
+            .is_some_and(|(a, b)| a == b),
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| json_equal(a, b))
         }
@@ -190,15 +189,29 @@ fn json_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn integer_float_equal(integer: &serde_json::Number, float: Option<f64>) -> bool {
-    let Some(float) = float.filter(|f| f.fract() == 0.0) else {
-        return false;
+// Number supplies valid JSON number text. Empty digits represent canonical unsigned zero.
+fn normalized_decimal(number: &serde_json::Number) -> Option<(bool, String, i64)> {
+    let text = number.to_string();
+    let negative = text.starts_with('-');
+    let unsigned = text.strip_prefix('-').unwrap_or(&text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
+        None => (unsigned, 0),
     };
-    if let Some(number) = integer.as_u64() {
-        float >= 0.0 && float < u64::MAX as f64 && float as u64 == number
-    } else if let Some(number) = integer.as_i64() {
-        float >= i64::MIN as f64 && float < i64::MAX as f64 && float as i64 == number
-    } else {
-        false
+    let fraction_len = mantissa
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let digits = mantissa.replace('.', "");
+    let significant = digits.trim_start_matches('0');
+    let trimmed = significant.trim_end_matches('0');
+    if trimmed.is_empty() {
+        return Some((false, String::new(), 0));
     }
+    let trailing_zeros = i64::try_from(significant.len() - trimmed.len()).ok()?;
+    let adjustment = trailing_zeros.checked_sub(i64::try_from(fraction_len).ok()?)?;
+    Some((
+        negative,
+        trimmed.to_owned(),
+        exponent.checked_add(adjustment)?,
+    ))
 }

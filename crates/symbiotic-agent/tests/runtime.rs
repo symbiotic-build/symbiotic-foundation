@@ -797,6 +797,56 @@ async fn report_constraints_return_json_paths_and_accept_valid_reports() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fractional_report_is_refused_before_an_equivalent_integer_enum_report_finishes() {
+    let fixture = Fixture::new(json!({}));
+    fixture.report_schema(json!({"type":"integer","enum":[1]}));
+    let server = Server::start(vec![
+        reply(vec![raw_call("finish", r#"{"report":1.0000000000000001}"#)]),
+        reply(vec![raw_call("finish", r#"{"report":1.0}"#)]),
+    ])
+    .await;
+    let output = fixture.run(&server).await;
+    exit(&output, 0);
+    assert_eq!(output.stdout, b"```json\n1.0\n```\n");
+    let logs = fixture.logs();
+    assert_eq!(logs[0]["calls"][0]["outcome"], "error");
+    assert_eq!(
+        logs[0]["calls"][0]["error"],
+        "invalid report /: expected type \"integer\""
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(tail(&requests[1]).contains("Error step 1 tool \"finish\""));
+    assert!(tail(&requests[1]).contains("error: invalid report /: expected type \"integer\""));
+    assert_eq!(logs[1]["stop"], "finished");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn underflowing_fraction_is_refused_before_an_exponent_integer_report_finishes() {
+    let fixture = Fixture::new(json!({}));
+    fixture.report_schema(json!({"type":"integer"}));
+    let server = Server::start(vec![
+        reply(vec![raw_call("finish", r#"{"report":1e-400}"#)]),
+        reply(vec![raw_call("finish", r#"{"report":10e-1}"#)]),
+    ])
+    .await;
+    let output = fixture.run(&server).await;
+    exit(&output, 0);
+    assert_eq!(output.stdout, b"```json\n10e-1\n```\n");
+    let logs = fixture.logs();
+    assert_eq!(logs[0]["calls"][0]["outcome"], "error");
+    assert_eq!(
+        logs[0]["calls"][0]["error"],
+        "invalid report /: expected type \"integer\""
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(tail(&requests[1]).contains("Error step 1 tool \"finish\""));
+    assert!(tail(&requests[1]).contains("error: invalid report /: expected type \"integer\""));
+    assert_eq!(logs[1]["stop"], "finished");
+}
+
 #[test]
 fn unsupported_or_malformed_report_schemas_refuse_start() {
     for schema in [
