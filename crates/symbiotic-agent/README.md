@@ -25,6 +25,10 @@ symbiotic-agent --version
 - `--out`: an existing, writable directory for the step log and the notes record.
 - `--version` prints `symbiotic-agent <version>` and exits 0.
 
+Environment: `SYMBIOTIC_AGENT_MODEL_TOKEN`, when set, is sent as
+`Authorization: Bearer <value>` on every model request. Unset sends no authorization
+header; an empty value refuses the start. The value is never logged or printed.
+
 ## Task file
 
 ```json

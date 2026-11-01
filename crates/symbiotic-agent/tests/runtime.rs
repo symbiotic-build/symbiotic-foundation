@@ -168,8 +168,17 @@ impl Fixture {
     }
 
     async fn run_args(&self, server: &Server, extra: Vec<String>) -> Output {
+        let mut command = self.command(&server.url);
+        command.args(extra);
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn command(&self, model_url: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_symbiotic-agent"));
         command
+            .env_remove("SYMBIOTIC_AGENT_MODEL_TOKEN")
             .arg("run")
             .arg("--task")
             .arg(&self.task)
@@ -180,11 +189,8 @@ impl Fixture {
             .arg("--out")
             .arg(&self.out)
             .arg("--model-url")
-            .arg(&server.url)
-            .args(extra);
-        tokio::task::spawn_blocking(move || command.output().unwrap())
-            .await
-            .unwrap()
+            .arg(model_url);
+        command
     }
 
     fn logs(&self) -> Vec<Value> {
@@ -218,6 +224,61 @@ fn exit(output: &Output, code: i32) {
     } else {
         assert!(output.stdout.is_empty());
         assert_eq!(String::from_utf8_lossy(&output.stderr).lines().count(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_model_token_authorizes_every_request_without_leaking_to_outputs() {
+    let token = "synthetic-model-token-7d3a";
+    for configured in [true, false] {
+        let fixture = Fixture::new(json!({}));
+        let server = Server::start(vec![reply(vec![]), reply(vec![finish()])]).await;
+        let mut command = fixture.command(&server.url);
+        if configured {
+            command.env("SYMBIOTIC_AGENT_MODEL_TOKEN", token);
+        }
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        exit(&output, 0);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let expected = configured.then(|| format!("Bearer {token}"));
+        for request in requests {
+            assert_eq!(request.headers.get("authorization"), expected.as_ref());
+        }
+        for bytes in [
+            fs::read(fixture.out.join("steps.jsonl")).unwrap(),
+            fs::read(fixture.out.join("notes.json")).unwrap(),
+            output.stdout,
+            output.stderr,
+        ] {
+            assert!(!String::from_utf8_lossy(&bytes).contains(token));
+        }
+    }
+}
+
+#[test]
+fn empty_or_invalid_model_token_refuses_start_without_printing_the_value() {
+    for (token, reason) in [
+        ("", "SYMBIOTIC_AGENT_MODEL_TOKEN must not be empty"),
+        (
+            "synthetic-invalid-token\nheader-injection",
+            "SYMBIOTIC_AGENT_MODEL_TOKEN is not a valid header value",
+        ),
+    ] {
+        let fixture = Fixture::new(json!({}));
+        let output = fixture
+            .command("http://127.0.0.1:9/v1/responses")
+            .env("SYMBIOTIC_AGENT_MODEL_TOKEN", token)
+            .output()
+            .unwrap();
+        exit(&output, 1);
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("symbiotic-agent: refused to start: {reason}\n")
+        );
+        assert_eq!(fs::read_dir(&fixture.out).unwrap().count(), 0);
     }
 }
 

@@ -1,4 +1,7 @@
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{
+    Client, StatusCode, Url,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use symbiotic_model::{
     item_stream::{ItemEvent, ResponsesAdapter},
     responses::{FunctionCall, ResponsesRequest},
@@ -23,7 +26,24 @@ impl Model {
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             return Err("model-url must be an HTTP or HTTPS URL".into());
         }
+        let mut headers = HeaderMap::new();
+        match std::env::var("SYMBIOTIC_AGENT_MODEL_TOKEN") {
+            Ok(token) => {
+                if token.is_empty() {
+                    return Err("SYMBIOTIC_AGENT_MODEL_TOKEN must not be empty".into());
+                }
+                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| "SYMBIOTIC_AGENT_MODEL_TOKEN is not a valid header value")?;
+                value.set_sensitive(true);
+                headers.insert(AUTHORIZATION, value);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("SYMBIOTIC_AGENT_MODEL_TOKEN must be valid Unicode".into());
+            }
+        }
         let client = Client::builder()
+            .default_headers(headers)
             .no_proxy()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
