@@ -115,14 +115,27 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
     let unmetered = accounts.difference(&metered).cloned().collect::<Vec<_>>();
     let mut quotas = BTreeMap::<String, Quota>::new();
     let mut violations = vec![];
-    let mut statement = conn.prepare("SELECT time,subject_id,kind,payload FROM events WHERE kind IN ('budget.reading','budget.warning','budget.exhausted','decision.answered','model.request') ORDER BY seq")?;
-    let mut events = statement.query([])?;
+    // Request events are joined to their normalized rows, so only the day's sent requests are
+    // replayed and no request payload (raw provider usage) is decoded.
+    let mut statement = conn.prepare(
+        "SELECT events.time, events.subject_id, events.kind,
+                CASE WHEN events.kind = 'model.request' THEN '{}' ELSE events.payload END,
+                requests.account
+         FROM events LEFT JOIN requests
+           ON events.kind = 'model.request' AND requests.request_id = events.subject_id
+         WHERE events.kind IN ('budget.reading', 'budget.warning', 'budget.exhausted', 'decision.answered')
+            OR (events.kind = 'model.request' AND requests.refused IS NULL
+                AND requests.time >= ?1 AND requests.time < ?2)
+         ORDER BY events.seq",
+    )?;
+    let mut events = statement.query(params![start, end])?;
     while let Some(event) = events.next()? {
         let time: String = event.get(0)?;
         let event_day = date(&time, "event.time")?.date_naive();
         let id: String = event.get(1)?;
         let kind: String = event.get(2)?;
         let payload: Value = serde_json::from_str(&event.get::<_, String>(3)?)?;
+        let request_account: Option<String> = event.get(4)?;
         let p = &payload;
         match kind.as_str() {
             "budget.reading" => {
@@ -157,14 +170,12 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
                     q.allowed = true;
                 }
             }
-            "model.request"
-                if p.get("refused").is_none()
-                    && date(string(p, "time")?, "request.time")?.date_naive() == day =>
-            {
-                let account = string(p, "account")?;
+            "model.request" => {
+                let account = request_account
+                    .ok_or_else(|| Error::new("store_error", "request event without its row"))?;
                 for (budget, q) in &quotas {
                     if q.account == account && q.state == "exhausted" && !q.allowed {
-                        violations.push(json!({"budget_id":budget,"request_id":p["request_id"],"problem":"request sent while exhausted without an answered allow_over_limit decision"}));
+                        violations.push(json!({"budget_id":budget,"request_id":id,"problem":"request sent while exhausted without an answered allow_over_limit decision"}));
                     }
                 }
             }
