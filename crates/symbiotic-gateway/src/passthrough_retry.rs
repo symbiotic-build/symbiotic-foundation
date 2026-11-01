@@ -111,21 +111,6 @@ mod tests {
             let actual = decision(&policy, None, &context);
             assert_eq!((actual.action, actual.max_attempts), (action, max));
         }
-        context.class = ErrorClass::Throttle;
-        context.attempt = 10;
-        assert_eq!(decision(&policy, None, &context).action, RetryAction::Fail);
-        policy.insert(
-            ErrorClass::Throttle,
-            RetryRule {
-                action: RetryAction::RetrySame,
-                max_attempts: None,
-                backoff: Default::default(),
-            },
-        );
-        assert_eq!(
-            decision(&policy, None, &context).action,
-            RetryAction::RetrySame
-        );
         context.class = ErrorClass::Server;
         context.attempt = 3;
         assert_eq!(decision(&policy, None, &context).action, RetryAction::Fail);

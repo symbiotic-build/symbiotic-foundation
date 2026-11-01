@@ -97,7 +97,7 @@ impl PassthroughMethod {
     }
 }
 
-/// A route-local message match used only when the provider supplies no error code or type.
+/// A route-local message match, used when the provider supplies no `error.code`; it comes before `error.type`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorMessageRule {
@@ -156,7 +156,7 @@ pub struct PassthroughRoute {
     /// Adapter code classification extensions.
     #[serde(default)]
     pub error_classes: HashMap<String, ErrorClass>,
-    /// Ordered message matches; at most 32, used after error code and type.
+    /// Ordered message matches; at most 32, used after `error.code` and before `error.type`.
     #[serde(default)]
     pub error_messages: Vec<ErrorMessageRule>,
     /// Sparse overrides of the default class table.

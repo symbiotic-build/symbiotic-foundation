@@ -96,49 +96,46 @@ impl Route {
     }
 }
 
-/// An account's adaptive cap. Existing holders survive decreases; only new acquisitions wait.
+/// An account's adaptive cap. A FIFO semaphore keeps arrival order; existing holders
+/// survive decreases, and permits they return pay off the part not yet removed.
 pub(super) struct AccountConcurrency {
     ceiling: usize,
+    permits: Arc<tokio::sync::Semaphore>,
     state: Mutex<ConcurrencyState>,
-    changes: tokio::sync::watch::Sender<()>,
 }
 struct ConcurrencyState {
     limit: usize,
-    active: usize,
+    // Permits still to remove after a decrease found them held.
+    debt: usize,
     successes: u8,
 }
-pub(super) struct ConcurrencyPermit(Arc<AccountConcurrency>);
+pub(super) struct ConcurrencyPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    owner: Arc<AccountConcurrency>,
+}
 impl AccountConcurrency {
     pub(super) fn new(ceiling: usize) -> Self {
         Self {
             ceiling,
+            permits: Arc::new(tokio::sync::Semaphore::new(ceiling)),
             state: Mutex::new(ConcurrencyState {
                 limit: ceiling,
-                active: 0,
+                debt: 0,
                 successes: 0,
             }),
-            changes: tokio::sync::watch::channel(()).0,
         }
     }
     pub(super) async fn acquire(self: &Arc<Self>) -> Result<ConcurrencyPermit> {
-        // Subscribe before checking capacity, so a release cannot be missed.
-        let mut changes = self.changes.subscribe();
-        loop {
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| GatewayError::StateUnavailable)?;
-                if state.active < state.limit {
-                    state.active += 1;
-                    return Ok(ConcurrencyPermit(self.clone()));
-                }
-            }
-            changes
-                .changed()
-                .await
-                .map_err(|_| GatewayError::StateUnavailable)?;
-        }
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GatewayError::StateUnavailable)?;
+        Ok(ConcurrencyPermit {
+            permit: Some(permit),
+            owner: self.clone(),
+        })
     }
     pub(super) fn outcome(&self, throttle: bool, route: &PassthroughRoute) -> Result<()> {
         let mut state = self
@@ -149,11 +146,21 @@ impl AccountConcurrency {
         if throttle {
             state.limit = (state.limit / 2).max(1);
             state.successes = 0;
+            let remove = previous - state.limit;
+            let removed = self.permits.forget_permits(remove);
+            state.debt += remove - removed;
         } else {
             state.successes += 1;
             if state.successes == 10 {
-                state.limit = (state.limit + 1).min(self.ceiling);
                 state.successes = 0;
+                if state.limit < self.ceiling {
+                    state.limit += 1;
+                    if state.debt > 0 {
+                        state.debt -= 1;
+                    } else {
+                        self.permits.add_permits(1);
+                    }
+                }
             }
         }
         if state.limit != previous {
@@ -163,18 +170,22 @@ impl AccountConcurrency {
                 effective_limit = state.limit,
                 "account concurrency changed"
             );
-            self.changes.send_replace(());
         }
         Ok(())
     }
 }
 impl Drop for ConcurrencyPermit {
     fn drop(&mut self) {
-        self.0
+        let mut state = self
+            .owner
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active -= 1;
-        self.0.changes.send_replace(());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(permit) = self.permit.take()
+            && state.debt > 0
+        {
+            state.debt -= 1;
+            permit.forget();
+        }
     }
 }

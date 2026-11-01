@@ -78,15 +78,28 @@ Default retries allow 10 total attempts for `throttle`, three for `server`, and
 unlimited attempts for `network`; `final` fails immediately. Attempts include the
 first send. A route's `retry_policy` overrides each class, including unlimited
 throttle retries through an explicit rule with absent or null `max_attempts`.
-Retry-After still takes precedence over account backoff. Exhausting attempts uses
-the existing failure response path.
+Retry-After still takes precedence over account backoff. The attempt count is per
+caller request, the first send included. When attempts run out, the caller gets the
+same response as any `fail` decision:
+
+- an HTTP failure returns the provider's status with the fixed local body
+  `{"error":{"code":"upstream_status"}}`, for example 429 after ten throttles;
+- a failure inside a stream returns HTTP 200 with the provider's own failure events,
+  scrubbed of credentials and in their original order.
+
+A cooldown is recorded only for a `retry_same` decision, so the final throttle sets
+none. It still halves the account's adaptive concurrency limit.
 
 Each account scope shares one memory-only adaptive concurrency limit across its
-routes. It starts at `max_in_flight`, which remains its ceiling. A request acquires
-an adaptive permit before the new-session probe and runtime account admission. It holds the permit through
-retries until the response ends. Permit waiting uses the existing `slot` wait log
+routes. It starts at `max_in_flight`, which remains its ceiling. Waiters get
+permits in arrival order. A request acquires its adaptive permit after any
+new-session hold or probe wait and before runtime account admission, and holds it
+through retries until the response ends. A new-session request gives its permit
+back before it waits for a hold or probe again, so a new-session refusal never
+blocks sessions already admitted. Permit waiting uses the existing `slot` wait log
 and health entry. A classified `throttle` halves the limit, rounding down with a
-floor of one, even when retry policy says fail. Existing holders keep their permits.
+floor of one, even when retry policy says fail. Existing holders keep their permits;
+the permits they return pay off the part of the decrease that could not take effect at once.
 After 10 successful responses with no intervening throttle, the limit increases by
 one up to its ceiling. The success counter resets on a throttle and after each
 increase. Each change logs the route, account and new effective limit at info level.

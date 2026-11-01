@@ -542,13 +542,11 @@ impl Passthrough {
                     slot = None;
                 }
             }
-            // Acquire before the session probe too: a probe holder must never wait
-            // for a permit held by a retry that needs that same probe.
-            if concurrency.is_none() {
-                let _entry = self.waiting(route, id, "slot")?;
-                wait.wait_started();
-                concurrency = Some(route.retries.concurrency.acquire().await?);
-                wait.waited(route, "slot");
+            // A new session waits for its hold or probe without an adaptive permit, so a
+            // new-session refusal never blocks sessions already admitted, and a probe holder
+            // never waits for a permit held by a request that waits for that probe.
+            if route.is_new(&key)? {
+                concurrency = None;
             }
             let mut session = match self.session_permit(route, &key, id, wait).await {
                 Ok(Ok(p)) => p,
@@ -564,6 +562,12 @@ impl Passthrough {
                 }
                 Err(error) => return Err(error),
             };
+            if concurrency.is_none() {
+                let _entry = self.waiting(route, id, "slot")?;
+                wait.wait_started();
+                concurrency = Some(route.retries.concurrency.acquire().await?);
+                wait.waited(route, "slot");
+            }
             if slot.is_none() {
                 let _entry = self.waiting(route, id, "slot")?;
                 wait.wait_started();
@@ -1380,7 +1384,7 @@ async fn error_body(response: &mut reqwest::Response, limit: usize) -> Result<Ve
 }
 
 impl Route {
-    /// Select provider code, then type, then the first configured message match.
+    /// Select the provider `error.code`, then the first configured message match, then `error.type`.
     /// Stream terminal errors nest under `response`; flat stream codes retain priority.
     fn error_code<'a>(&'a self, value: &'a serde_json::Value, stream: bool) -> Option<&'a str> {
         let error = if stream {

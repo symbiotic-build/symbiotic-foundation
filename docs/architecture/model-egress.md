@@ -1059,8 +1059,9 @@ route keeps a memory-only set of successful tuples, at most 100 000, oldest-firs
 and expired after 24 h. Missing every configured header disables session treatment.
 With no hold, new sessions flow freely under ordinary account limits. A retried
 new-session 429 sets a login-wide hold using Retry-After or shared backoff without
-setting account cooldown. New-session waiters release runtime slots but retain
-adaptive permits. Seen sessions continue within the adaptive account limit. After the hold, one probe is allowed until a new-session 2xx opens the
+setting account cooldown. New-session waiters hold neither a runtime slot nor an
+adaptive permit, so seen sessions continue within the adaptive account limit during
+the hold. After the hold, one probe is allowed until a new-session 2xx opens the
 gate. Another 429 extends the hold. Health exposes the hold's Unix deadline.
 
 The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque

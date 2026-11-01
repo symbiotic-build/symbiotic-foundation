@@ -3740,6 +3740,39 @@ async fn gateway_429_throttle_stops_after_ten_total_attempts() {
 }
 
 #[tokio::test]
+async fn gateway_429_explicit_unlimited_throttle_override_retries_past_ten() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        c.passthrough.routes[0].retry_policy.insert(
+            ErrorClass::Throttle,
+            RetryRule {
+                action: RetryAction::RetrySame,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
+    })
+    .await;
+    let caller = harness.connect("/v1/responses", b"{}", "").await;
+    for attempt in 1..=12 {
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply::rate(1))
+            .ok()
+            .unwrap();
+        harness
+            .health_where(|h| h["routes"][0]["retried_events"]["429"] == attempt)
+            .await;
+        advance_clock(Duration::from_secs(1)).await;
+    }
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    let (status, _, body) = decoded(&read(caller).await);
+    assert_eq!((status, body), (200, Reply::json().body));
+}
+
+#[tokio::test]
 async fn gateway_429_message_rules_validate_bounds() {
     let dir = tempfile::tempdir().unwrap();
     let mut settings = config(dir.path());
@@ -3932,7 +3965,50 @@ async fn gateway_429_recovery_requires_ten_successes_after_latest_throttle() {
 }
 
 #[tokio::test]
-async fn gateway_429_new_session_waiter_takes_adaptive_permit_before_probe() {
+async fn gateway_429_adaptive_waiters_take_permits_in_arrival_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let route = config(dir.path()).passthrough.routes.remove(0);
+    let limit = Arc::new(session::AccountConcurrency::new(4));
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(limit.acquire().await.unwrap());
+    }
+    // Two throttles take 4 to 2 to 1 while every permit is held.
+    limit.outcome(true, &route).unwrap();
+    limit.outcome(true, &route).unwrap();
+    let (sent, mut order) = mpsc::unbounded_channel();
+    let mut waiters = Vec::new();
+    for name in ["a", "b", "c"] {
+        let (limit, sent) = (limit.clone(), sent.clone());
+        let (release, released) = oneshot::channel::<()>();
+        waiters.push((
+            release,
+            tokio::spawn(async move {
+                let _permit = limit.acquire().await.unwrap();
+                sent.send(name).unwrap();
+                let _ = released.await;
+            }),
+        ));
+        // Let each waiter queue before the next one arrives.
+        tokio::task::yield_now().await;
+    }
+    // Returning the four permits pays off three; one remains for the first waiter.
+    held.clear();
+    assert_eq!(order.recv().await, Some("a"));
+    tokio::task::yield_now().await;
+    assert!(order.try_recv().is_err());
+    for (expected, (release, task)) in ["b", "c"].into_iter().zip(waiters.drain(..2)) {
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(order.recv().await, Some(expected));
+    }
+    let (release, task) = waiters.pop().unwrap();
+    release.send(()).unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn gateway_429_new_session_hold_keeps_established_sessions_moving() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |config| {
         config.passthrough.routes[0].new_session = Some(NewSessionConfig {
@@ -3940,6 +4016,13 @@ async fn gateway_429_new_session_waiter_takes_adaptive_permit_before_probe() {
         });
     })
     .await;
+    // Admit one session, so later requests in it are established.
+    let known = harness
+        .connect("/v1/responses", b"{}", "session-id: known\r\n")
+        .await;
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(known).await).2, Reply::json().body);
+    // A new session's throttle halves the limit of 2 to 1 and starts a new-session hold.
     let first = harness
         .connect(
             "/v1/responses",
@@ -3963,29 +4046,17 @@ async fn gateway_429_new_session_waiter_takes_adaptive_permit_before_probe() {
                 .any(|w| w["request_id"] == "synthetic-first" && w["reason"] == "new_session")
         })
         .await;
-    let second = harness
-        .connect(
-            "/v1/responses",
-            b"{}",
-            "session-id: second\r\nx-symbiotic-request-id: synthetic-second\r\n",
-        )
+    // The held request owns no adaptive permit, so the established session still sends.
+    let established = harness
+        .connect("/v1/responses", b"{}", "session-id: known\r\n")
         .await;
-    harness
-        .health_where(|h| {
-            h["routes"][0]["waiting"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|w| w["request_id"] == "synthetic-second" && w["reason"] == "slot")
-        })
-        .await;
+    let sent = fixture.next().await;
+    assert!(sent.head.contains("session-id: known\r\n"));
+    sent.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(established).await).2, Reply::json().body);
     advance_clock(Duration::from_secs(1)).await;
     let retry = fixture.next().await;
     assert!(retry.head.contains("session-id: first\r\n"));
     retry.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&read(first).await).2, Reply::json().body);
-    let next = fixture.next().await;
-    assert!(next.head.contains("session-id: second\r\n"));
-    next.reply.send(Reply::json()).ok().unwrap();
-    assert_eq!(decoded(&read(second).await).2, Reply::json().body);
 }
