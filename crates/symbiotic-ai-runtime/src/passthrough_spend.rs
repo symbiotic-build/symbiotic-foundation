@@ -80,6 +80,12 @@ impl TokenRates {
             _ => return None,
         };
         let output = usage.output_tokens?;
+        if output > 0
+            && usage.reasoning_tokens.is_none()
+            && self.reasoning.is_some_and(|rate| rate != self.output)
+        {
+            return None;
+        }
         let reasoning = usage.reasoning_tokens.unwrap_or(0);
         let sum = [
             (miss, self.input_cache_miss),
@@ -191,7 +197,7 @@ impl SpendLimit {
 pub struct SpendCost {
     /// Sum of measured, priced receipts in billionths of USD, saturating at u64::MAX.
     pub settled_nano_usd: u64,
-    /// Receipts without complete usage (Released receipts are excluded).
+    /// Unknown receipts plus settled priced receipts with unknown cost; excludes Released.
     pub unknown_usage_count: u64,
     /// Receipts without configured price, independently of whether usage arrived.
     pub unpriced_count: u64,

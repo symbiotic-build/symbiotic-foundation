@@ -442,6 +442,11 @@ impl Runtime {
         invocation: Option<&str>,
         request_id_prefix: Option<&str>,
     ) -> Result<SpendCost, ModelError> {
+        let ceil_millis = |bound: chrono::DateTime<chrono::Utc>| {
+            bound.timestamp_millis().saturating_add(i64::from(
+                !bound.timestamp_subsec_nanos().is_multiple_of(1_000_000),
+            ))
+        };
         self.inner
             .job_ledger
             .as_ref()
@@ -450,8 +455,8 @@ impl Runtime {
             ))?
             .cost(
                 account,
-                start.timestamp_millis(),
-                end.timestamp_millis(),
+                ceil_millis(start),
+                ceil_millis(end),
                 invocation,
                 request_id_prefix,
             )
@@ -1099,7 +1104,7 @@ impl AccountAdmission {
         Ok(reference)
     }
 
-    /// Release a complete non-2xx provider failure with no output and known zero usage.
+    /// Release a 4xx provider refusal with no output and known zero usage.
     pub fn release_passthrough(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
         self.runtime.inner.spend.finish(
             reference,
@@ -1114,8 +1119,8 @@ impl AccountAdmission {
         )
     }
 
-    /// Settle reported numeric usage without storing provider text or response bytes.
-    /// Missing usage leaves the reservation unknown, including after a process restart.
+    /// Settle complete numeric input/output usage without storing provider text or bytes.
+    /// Partial usage leaves the reservation unknown and reconcilable on every route.
     pub fn finish_passthrough(
         &self,
         reference: &SpendReceiptRef,
@@ -1129,7 +1134,10 @@ impl AccountAdmission {
             reasoning_tokens: usage.reasoning_tokens,
             ..Default::default()
         };
-        if !model::has_measured_usage(&usage) {
+        if usage.output_tokens.is_none()
+            || (usage.input_tokens.is_none()
+                && (usage.cache_hit_tokens.is_none() || usage.cache_miss_tokens.is_none()))
+        {
             return Ok(());
         }
         self.runtime
@@ -1283,7 +1291,7 @@ fn open_persistent_queue(
         }
     }
     let queue = SqliteQueue::open(&path)
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?
+        .map_err(|err| ModelError::Queue(err.code()))?
         .with_clock(config.clock.clone());
     let sweep = Sweep::new(
         queue.clone(),

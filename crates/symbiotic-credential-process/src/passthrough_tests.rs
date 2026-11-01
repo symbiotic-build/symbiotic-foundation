@@ -3198,9 +3198,11 @@ async fn chat_completions_pre_byte_throttle_and_server_failure_retry_through_sha
         fixture.next().await.reply.send(reply).ok().unwrap();
         assert_eq!(decoded(&read(caller).await).2, expected);
         let receipts = chat_receipts(&harness);
+        // A 4xx refusal is known zero spend; a 5xx outcome stays unknown.
+        let failed = if status == 429 { "released" } else { "unknown" };
         assert_eq!(
             receipts.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-            ["released", "settled"]
+            [failed, "settled"]
         );
     }
 }
@@ -3572,6 +3574,181 @@ fn balance_config(config: &mut ProcessConfig) {
 fn balance_reply(amount: &str, available: bool) -> Reply {
     Reply {status:200,headers:vec![("content-type".into(),"application/json".into())],body:serde_json::to_vec(&json!({"is_available":available,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"},{"currency":"USD","total_balance":amount,"granted_balance":"0","topped_up_balance":amount}]})).unwrap()}
 }
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_money_settlement_above_frozen_hold_warns_once_without_identifiers() {
+    let (capture, _guard) = LogCapture::install("warn");
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = config(directory.path());
+    money_config(&mut settings);
+    settings.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(
+        serde_json::from_value(json!({"usd":"1","window_seconds":60,"max_request_usd":"0.000001"}))
+            .unwrap(),
+    );
+    let process = open(settings.clone()).unwrap();
+    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let reference = route
+        .account
+        .reserve_passthrough_priced(
+            &route.config.identity(),
+            route.config.price.as_ref(),
+            route.config.spend_limit.as_ref(),
+            Some("synthetic-request"),
+        )
+        .unwrap();
+    drop(process);
+    // Settlement after restart compares with the original hold, even after a config change.
+    settings.passthrough.as_mut().unwrap().routes[0]
+        .spend_limit
+        .as_mut()
+        .unwrap()
+        .max_request_usd = symbiotic_ai_runtime::DecimalAmount::parse("1").unwrap();
+    let process = open(settings).unwrap();
+    let usage = symbiotic_trace::UsageTrace {
+        input_tokens: Some(7),
+        cache_hit_tokens: Some(2),
+        output_tokens: Some(3),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        process
+            .inner
+            .runtime
+            .reconcile_spend(&reference, model::SpendState::Settled, Some(usage.clone()))
+            .unwrap();
+    }
+    let warnings: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|v| v["message"] == "passthrough cost exceeded max_request_usd")
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["cost_nano_usd"], 2556);
+    assert_eq!(warnings[0]["max_request_nano_usd"], 1000);
+    // Metadata aside, the warning contains only numeric fields and its fixed message.
+    let fields = warnings[0].as_object().unwrap();
+    for (key, value) in fields {
+        if !["timestamp", "level", "target", "message"].contains(&key.as_str()) {
+            assert!(value.is_number(), "unexpected warning field {key}: {value}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn passthrough_money_fallback_secret_is_not_persisted_as_request_id() {
+    const FALLBACK_KEY: &str = "synthetic-fallback-secret";
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        money_config(c);
+        let pass = c.passthrough.as_mut().unwrap();
+        let path = c.state_dir.parent().unwrap().join("fallback-key");
+        write_private(&path, FALLBACK_KEY.as_bytes());
+        let mut fallback = pass.routes[0].clone();
+        fallback.name = "fallback".into();
+        fallback.path = "/fallback".into();
+        fallback.account = "fallback".into();
+        fallback.secret = SecretSource::OwnerOnlyFile { path };
+        pass.routes[0].fallback_routes = vec![fallback.name.clone()];
+        pass.routes[0].retry_policy.insert(
+            ErrorClass::Server,
+            RetryRule {
+                action: RetryAction::Switch,
+                max_attempts: Some(2),
+                backoff: Default::default(),
+            },
+        );
+        pass.routes.push(fallback);
+    })
+    .await;
+    let caller = harness
+        .connect(
+            "/v1/chat/completions",
+            b"{}",
+            &format!("x-symbiotic-request-id: job-{FALLBACK_KEY}\r\n"),
+        )
+        .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::status(503))
+        .ok()
+        .unwrap();
+    let fallback = fixture.next().await;
+    assert!(fallback.head.contains(FALLBACK_KEY));
+    fallback.reply.send(chat_reply(false, true)).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let conn = rusqlite::Connection::open(
+        harness
+            .process
+            .config()
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    let ids: Vec<Option<String>> = conn
+        .prepare("SELECT caller_request_id FROM spend_receipts ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids, vec![Some(format!("job-{FALLBACK_KEY}")), None]);
+}
+
+#[tokio::test]
+async fn passthrough_money_static_401_releases_hold_without_waiting_for_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (send, incoming) = mpsc::channel::<Upstream>(1);
+    let (done, wait) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _send = send;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        let mut body = [0; 2];
+        stream.read_exact(&mut body).await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let _ = wait.await;
+    });
+    let fixture = Fixture {
+        idle_timeout: Some(Duration::from_secs(30)),
+        base,
+        incoming,
+        task,
+    };
+    let harness = Harness::start(&fixture, money_config).await;
+    let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+    let response = tokio::time::timeout(Duration::from_secs(2), read(caller))
+        .await
+        .expect("401 must finish before its provider body");
+    assert_eq!(decoded(&response).0, 401);
+    let receipts = chat_receipts(&harness);
+    assert_eq!(receipts.len(), 1);
+    let conn = rusqlite::Connection::open(
+        harness
+            .process
+            .config()
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    let actual: (String, Option<u64>) = conn
+        .query_row("SELECT state,cost_nano_usd FROM spend_receipts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(actual, ("released".into(), Some(0)));
+    let _ = done.send(());
+}
+
 #[tokio::test]
 async fn passthrough_money_priced_and_unpriced_sends_store_cost_time_and_request_id() {
     for priced in [true, false] {
@@ -3759,7 +3936,7 @@ async fn passthrough_money_released_attempts_keep_budget_available_after_restart
 }
 
 #[tokio::test]
-async fn passthrough_money_complete_http_failures_release_holds_and_known_zero_cost() {
+async fn passthrough_money_complete_4xx_releases_holds_but_5xx_keeps_unknown() {
     let mut fixture = Fixture::start().await;
     let harness = Harness::start(&fixture, |c| {
         money_config(c);
@@ -3769,6 +3946,14 @@ async fn passthrough_money_complete_http_failures_release_holds_and_known_zero_c
                 json!({"usd":"0.5","window_seconds":86400,"max_request_usd":"0.5"}),
             )
             .unwrap(),
+        );
+        route.retry_policy.insert(
+            ErrorClass::Server,
+            RetryRule {
+                action: RetryAction::Fail,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
         );
         route.retry_policy.insert(
             ErrorClass::Throttle,
@@ -3860,18 +4045,37 @@ async fn passthrough_money_complete_http_failures_release_holds_and_known_zero_c
         symbiotic_ai_runtime::SpendCost::default()
     );
     let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
-    let reply = chat_reply(false, true);
-    let expected = String::from_utf8(reply.body.clone())
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::status(503))
+        .ok()
+        .unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 503);
+    let reference: String = connection
+        .query_row(
+            "SELECT reference FROM spend_receipts ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let receipt = runtime
+        .spend_receipt(&model::SpendReceiptRef::new(reference).unwrap())
         .unwrap()
-        .replace(KEY, "[REDACTED]")
-        .into_bytes();
-    fixture.next().await.reply.send(reply).ok().unwrap();
-    let response = decoded(&read(caller).await);
-    assert_eq!((response.0, response.2), (200, expected));
+        .unwrap();
+    assert_eq!(
+        (
+            receipt.state,
+            receipt.cost_nano_usd,
+            serde_json::to_value(receipt.usage).unwrap()
+        ),
+        (model::SpendState::Unknown, None, Value::Null)
+    );
 }
 
-#[test]
-fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_account_limits() {
+#[tokio::test]
+async fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_account_limits() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path());
     money_config(&mut config);
@@ -3879,10 +4083,48 @@ fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_accoun
         serde_json::from_value(json!({"usd":"1","window_seconds":60,"max_request_usd":"0.1"}))
             .unwrap();
     config.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(limit.clone());
-    validate(&config).unwrap();
+    config.validate_routes().unwrap();
+    for (stream, method) in [
+        (StreamDialect::OpenaiChatCompletions, PassthroughMethod::Get),
+        (StreamDialect::OpenaiResponses, PassthroughMethod::Get),
+        (StreamDialect::OpenaiResponses, PassthroughMethod::Post),
+    ] {
+        let mut with_listing = config.clone();
+        let routes = &mut with_listing.passthrough.as_mut().unwrap().routes;
+        let mut listing = routes[0].clone();
+        listing.name = "models".into();
+        listing.method = method;
+        listing.path = "/v1/models".into();
+        listing.stream = stream;
+        listing.price = None;
+        listing.spend_limit = None;
+        routes.push(listing);
+        assert_eq!(with_listing.validate_routes(), Ok(()));
+        drop(open(with_listing).unwrap());
+    }
+
     config.passthrough.as_mut().unwrap().routes[0].price = None;
-    assert!(validate(&config).is_err());
+    assert!(config.validate_routes().is_err());
     money_config(&mut config);
+    for (stream, method) in [
+        (StreamDialect::OpenaiResponses, PassthroughMethod::Post),
+        (StreamDialect::OpenaiChatCompletions, PassthroughMethod::Get),
+    ] {
+        let mut unsupported = config.clone();
+        let route = &mut unsupported.passthrough.as_mut().unwrap().routes[0];
+        route.stream = stream;
+        route.method = method;
+        route.spend_limit = None;
+        assert!(
+            unsupported.validate_routes().is_err(),
+            "price requires Chat Completions POST"
+        );
+        unsupported.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(limit.clone());
+        assert!(
+            unsupported.validate_routes().is_err(),
+            "limit requires Chat Completions POST"
+        );
+    }
     for sharing in [false, true] {
         let pass = config.passthrough.as_mut().unwrap();
         if sharing {
@@ -3898,9 +4140,9 @@ fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_accoun
         }
         other.spend_limit = None;
         pass.routes.push(other);
-        assert!(validate(&config).is_err());
+        assert!(config.validate_routes().is_err());
         config.passthrough.as_mut().unwrap().routes[1].spend_limit = Some(limit.clone());
-        assert!(validate(&config).is_ok());
+        assert!(config.validate_routes().is_ok());
         config.passthrough.as_mut().unwrap().routes.pop();
     }
 }
@@ -4124,17 +4366,6 @@ async fn passthrough_money_insufficient_balance_is_final_one_attempt_and_single_
     }
 }
 
-#[tokio::test]
-async fn passthrough_money_unpriced_health_reports_unknown_price_without_sending() {
-    let directory = tempfile::tempdir().unwrap();
-    let process = open(config(directory.path())).unwrap();
-    let pass = process.inner.passthrough.as_ref().unwrap();
-    let settings = process.config().passthrough.as_ref().unwrap();
-    pass.publish_health(settings, "running").await.unwrap();
-    let health: Value =
-        serde_json::from_slice(&fs::read(settings.health_path.as_ref().unwrap()).unwrap()).unwrap();
-    assert_eq!(health["routes"][0]["cost"], "price not configured");
-}
 #[test]
 fn passthrough_money_price_setting_accepts_exact_decimal_strings() {
     let directory = tempfile::tempdir().unwrap();

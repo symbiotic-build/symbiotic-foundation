@@ -96,6 +96,9 @@ pub enum EgressError {
     /// Durable state failed; no new handoff is permitted.
     #[error("egress state unavailable")]
     StateUnavailable,
+    /// The queue format is unsupported and requires an explicit database rebuild.
+    #[error("unsupported_queue_schema: unsupported queue schema; rebuild the queue database")]
+    UnsupportedQueueSchema,
     /// Frame or provider output exceeds configured limits.
     #[error("egress message exceeds configured limit")]
     LimitExceeded,

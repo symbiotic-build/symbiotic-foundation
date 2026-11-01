@@ -244,10 +244,10 @@ settlement transactions. `AccountAdmission::reserve_passthrough_priced` records
 the token rates selected at send time. Settlement uses those frozen rates even
 if the stream crosses a peak boundary or the process configuration changes.
 `SpendReceipt::cost_nano_usd` is absent until both price and complete input/output
-usage are known, except that `Released` receipts have zero cost. A failed
-passthrough attempt with a complete non-2xx HTTP response and no provider output
-is `Released` with known zero usage. Transport failures before a response and
-2xx streams cut before usage remain `Unknown` because they may have been charged.
+usage are known, except that `Released` receipts have zero cost.
+Complete 4xx refusals release at zero cost (401 without reading its body); 5xx,
+incomplete bodies, transport failures, cancellation and missing successful usage
+retain `Unknown` because provider work may have been charged.
 An unpriced receipt remains unpriced after reconciliation.
 Provider bodies and credentials never enter these fields.
 
@@ -259,7 +259,11 @@ The result saturates at `i64::MAX` nano-USD. Output includes reasoning tokens;
 separately priced reasoning replaces that part of the output charge.
 Missing cache splits charge all input at the miss price. One reported split
 component derives the other from total input. Incomplete input/output usage
-leaves cost unknown.
+leaves the receipt `Unknown` on priced and unpriced routes. With a configured
+spend limit, the receipt keeps its maximum-cost hold. It remains reconcilable
+until complete usage arrives.
+When output is positive, a distinct reasoning rate also requires a reasoning
+count; otherwise complete usage settles with unknown cost.
 
 `spend_limit` supplies a rolling account budget. Reservation takes SQLite's
 IMMEDIATE write lock before it reads any costs. It admits a send only when
@@ -270,7 +274,11 @@ Released receipts do not count. A settled receipt whose cost remains unknown
 also holds the maximum. Unknown sends survive restart and retain that hold
 until settlement, release, or window expiry. `max_request_usd` must be a
 conservative bound chosen for the route's requests; it does not rewrite or
-limit caller output-token settings. Actual settled cost can exceed this hold.
+limit caller output-token settings. The budget is guaranteed only when
+`max_request_usd` bounds every request's real cost. A settled cost above
+`max_request_usd` overshoots the reserved budget by the difference. Settlement
+emits one `passthrough cost exceeded max_request_usd` warning with numeric
+`cost_nano_usd` and `max_request_nano_usd` fields so the operator can raise the hold.
 Admission refusal returns `BudgetExhausted(SpendBudgetExhausted)` before transport.
 
 `Runtime::spend_cost(account, start, end, invocation, request_id_prefix)` reads
@@ -279,13 +287,16 @@ Use `account_scope(identity, sharing)` for the account argument. Optional invoca
 matches exactly; optional request ID matches a literal prefix, including `%`
 and `_` without wildcard interpretation. The result contains
 `settled_nano_usd`, `unknown_usage_count`, and `unpriced_count`. The two counts
-are independent: an unpriced unknown receipt contributes to both. Priced partial
-usage whose cost cannot be computed contributes to unknown usage. Released
+are independent: partial usage leaves priced and unpriced receipts `Unknown`.
+An unpriced receipt with partial usage contributes to both counts. Settled
+priced receipts with unknown cost also contribute to `unknown_usage_count`. Released
 receipts are excluded. Totals saturate at `u64::MAX`.
 
 Schema 18 adds four nullable receipt columns: `sent_at_ms`, `caller_request_id`,
-`price`, and `cost_nano_usd`. One native `(account, sent_at_ms)` index bounds rolling
-budget reads and reports to the requested account/window. The bare SQLite cost
+`price`, and `cost_nano_usd`. The frozen `price` JSON includes the per-request
+`max_request_nano_usd` hold when configured, so settlement warnings survive restart.
+One native `(account, sent_at_ms)` index bounds rolling budget reads and reports
+to the requested account/window. The bare SQLite cost
 is one index range scan and receipt updates in the existing transaction. There
 is no new ledger, summary table, or accounting cache. Older schemas, including
 version 17, are refused without migration. Deploying version 18 requires

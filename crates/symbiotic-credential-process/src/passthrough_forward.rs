@@ -613,6 +613,8 @@ impl Passthrough {
                 .map_err(|_| EgressError::InvalidRequest)?;
             // execute() starts reqwest's timers; defer it until the grant actually sends.
             let transport = async { route.client.execute(transport_request).await };
+            let secrets = route.secrets().await;
+            let receipt_id = id.filter(|id| safe_value(id.as_bytes(), &secrets, 64));
             let mut was_new = false;
             let mut receipt = None;
             let queue_waited_ms = wait.total.as_millis() as u64;
@@ -639,7 +641,7 @@ impl Passthrough {
                                     &route.config.identity(),
                                     route.config.price.as_ref(),
                                     route.config.spend_limit.as_ref(),
-                                    id,
+                                    receipt_id,
                                 )?);
                             }
                             was_new = new;
@@ -744,8 +746,7 @@ impl Passthrough {
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
-                        let body = error_body(&mut response, route.config.max_response_bytes).await;
-                        if body.is_ok()
+                        if status == 401
                             && let Some(receipt) = &receipt
                         {
                             route
@@ -803,6 +804,17 @@ impl Passthrough {
                                     )
                                     .await;
                             }
+                        }
+                        let body = error_body(&mut response, route.config.max_response_bytes).await;
+                        if body.is_ok()
+                            && (400..500).contains(&status)
+                            && status != 401
+                            && let Some(receipt) = &receipt
+                        {
+                            route
+                                .account
+                                .release_passthrough(receipt)
+                                .map_err(|_| EgressError::StateUnavailable)?;
                         }
                         match body {
                             Ok(bytes) => {

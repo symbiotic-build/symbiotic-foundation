@@ -1083,10 +1083,10 @@ After that byte, a failure stays visible and no policy or hook may retry or swit
 The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
 A final usage chunk supplies prompt, completion, cached and reasoning token counts.
 Non-streaming JSON uses its `usage` object. Successful terminal responses settle
-reported numeric usage in the canonical ledger. A failed attempt with a complete
-non-2xx HTTP response and no provider output is `Released` with known zero usage
-and zero cost. Transport failures before a response, incomplete error bodies,
-cancellation, and 2xx responses without complete usage keep `Unknown`.
+complete numeric input/output usage in the canonical ledger.
+Complete 4xx refusals release at zero cost (401 without reading its body); 5xx,
+incomplete bodies, transport failures, cancellation and missing successful usage
+retain `Unknown` because provider work may have been charged.
 Provider identity text and answer bytes are excluded.
 The ledger adds one existing receipt row per dispatched Chat Completions POST attempt and uses its
 native reserve/finish transactions. It uses the existing ledger; money settings add the receipt columns and account/time index described below. Independent generated
@@ -1107,15 +1107,17 @@ types use UpperCamelCase. Closed diagnostic codes use lower snake case, subject
 first. All money settings are exact decimal strings; binary floats are refused.
 Configuration version stays 4. These optional settings do not infer a model's price.
 
-- `price.rates` supplies USD per million `input_cache_miss`, `input_cache_hit`,
-  and `output` tokens. Optional `reasoning` defaults to `output`.
+- `price` requires Chat Completions POST accounting. `price.rates` supplies USD per
+  million `input_cache_miss`, `input_cache_hit`, and `output` tokens. Optional
+  `reasoning` defaults to `output`.
 - `price.peak` supplies nonoverlapping UTC windows with ISO `weekdays` (Monday=1,
   Sunday=7), `start` and `end` in HH:MM, and their own `rates`. Start is inclusive;
   end is exclusive and can be 24:00. Split overnight windows into two days.
 - `spend_limit` supplies `usd`, positive `window_seconds`, and positive
-  `max_request_usd`. Every route sharing the account must have the same limit,
-  including omission. A limit requires a configured price and Chat Completions
-  POST accounting. Sharing with a typed route therefore requires no money limit.
+  `max_request_usd`. Chat Completions POST routes sharing the account must have
+  the same limit, including omission. A limit requires a configured price.
+  Other routes omit `spend_limit` and `price` and are exempt from limit agreement
+  because they do not account money.
   Invalid policies refuse startup with the existing `InvalidRequest` configuration error.
 - `balance` supplies `provider: "deepseek"`, positive `interval_seconds`,
   positive `debounce_seconds` (default 1), and
@@ -1130,6 +1132,13 @@ records unknown cost and publishes `cost: "price not configured"`; configured
 prices publish `cost: "priced"`. An exhausted local budget returns HTTP 402 with
 `spend_budget_exhausted`, zero upstream attempts, and that outcome in the
 `request completed` event. The local response carries no upstream headers.
+The spend limit is guaranteed only when `max_request_usd` bounds every
+request's real cost. A settled cost above `max_request_usd` overshoots the
+reserved budget by the difference. Settlement warns with numeric cost and hold
+fields so the operator can raise the hold. Partial input/output usage leaves
+receipts `Unknown` on priced and unpriced routes. They retain any configured
+maximum-cost hold and allow reconciliation. Complete usage with a distinct reasoning rate but no
+reasoning count settles with unknown cost.
 
 DeepSeek balance monitoring uses the route's own secret and HTTPS client for
 `GET https://api.deepseek.com/user/balance`. Configuration requires that the model

@@ -320,9 +320,194 @@ mod passthrough_money {
             rates().cost_nano_usd(&UsageTrace {
                 input_tokens: Some(u64::MAX),
                 output_tokens: Some(u64::MAX),
+                reasoning_tokens: Some(0),
                 ..Default::default()
             }),
             Some(i64::MAX as u64)
+        );
+    }
+    #[test]
+    fn passthrough_money_distinct_reasoning_rate_requires_a_count_for_nonzero_output() {
+        let mut usage = usage();
+        usage.reasoning_tokens = None;
+        assert_eq!(rates().cost_nano_usd(&usage), None);
+        let mut equal_rates = rates();
+        equal_rates.reasoning = Some(equal_rates.output);
+        assert_eq!(equal_rates.cost_nano_usd(&usage), Some(212_400));
+        equal_rates.reasoning = None;
+        assert_eq!(equal_rates.cost_nano_usd(&usage), Some(212_400));
+        usage.output_tokens = Some(0);
+        assert_eq!(rates().cost_nano_usd(&usage), Some(32_400));
+    }
+
+    fn runtime() -> (
+        tempfile::TempDir,
+        crate::Runtime,
+        crate::AccountAdmission,
+        crate::BindingIdentity,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::open(crate::RuntimeConfig {
+            state_dir: Some(dir.path().join("state")),
+            clock: std::sync::Arc::new(|| DateTime::from_timestamp_millis(1).unwrap()),
+            ..Default::default()
+        })
+        .unwrap();
+        let identity = crate::BindingIdentity::new("tenant", "provider", "1", "account");
+        let admission = runtime
+            .account_admission(&identity, None, Default::default())
+            .unwrap();
+        (dir, runtime, admission, identity)
+    }
+
+    #[tokio::test]
+    async fn passthrough_money_fractional_bounds_preserve_half_open_send_times() {
+        let (_dir, runtime, admission, identity) = runtime();
+        let reference = admission
+            .reserve_passthrough_priced(&identity, Some(&price()), None, None)
+            .unwrap();
+        admission.finish_passthrough(&reference, &usage()).unwrap();
+        let account = crate::account_scope(&identity, None).unwrap();
+        for (start_us, end_us, expected) in [
+            (0, 1500, 272_400),
+            (1500, 2000, 0),
+            (1000, 1500, 272_400),
+            (0, 1000, 0),
+        ] {
+            let cost = runtime
+                .spend_cost(
+                    &account,
+                    DateTime::from_timestamp_micros(start_us).unwrap(),
+                    DateTime::from_timestamp_micros(end_us).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                cost,
+                SpendCost {
+                    settled_nano_usd: expected,
+                    ..Default::default()
+                },
+                "[{start_us}, {end_us}) microseconds"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_money_partial_usage_stays_unknown_and_reconcilable_on_every_route() {
+        let limit: SpendLimit = serde_json::from_value(
+            serde_json::json!({"usd":"1","window_seconds":60,"max_request_usd":"1"}),
+        )
+        .unwrap();
+        for priced in [false, true] {
+            let (_dir, runtime, admission, identity) = runtime();
+            for partial in [
+                UsageTrace {
+                    input_tokens: Some(7),
+                    ..Default::default()
+                },
+                UsageTrace {
+                    output_tokens: Some(3),
+                    ..Default::default()
+                },
+                UsageTrace {
+                    cache_hit_tokens: Some(2),
+                    output_tokens: Some(3),
+                    ..Default::default()
+                },
+            ] {
+                let reference = admission
+                    .reserve_passthrough_priced(
+                        &identity,
+                        priced.then_some(&price()),
+                        priced.then_some(&limit),
+                        None,
+                    )
+                    .unwrap();
+                admission.finish_passthrough(&reference, &partial).unwrap();
+                let receipt = runtime.spend_receipt(&reference).unwrap().unwrap();
+                assert_eq!(
+                    (receipt.state, receipt.cost_nano_usd),
+                    (SpendState::Unknown, None)
+                );
+                let account = crate::account_scope(&identity, None).unwrap();
+                assert_eq!(
+                    runtime
+                        .spend_cost(
+                            &account,
+                            DateTime::from_timestamp_millis(0).unwrap(),
+                            DateTime::from_timestamp_millis(2).unwrap(),
+                            Some(reference.as_str()),
+                            None
+                        )
+                        .unwrap(),
+                    SpendCost {
+                        settled_nano_usd: 0,
+                        unknown_usage_count: 1,
+                        unpriced_count: u64::from(!priced)
+                    }
+                );
+                if priced {
+                    assert_eq!(
+                        admission
+                            .reserve_passthrough_priced(
+                                &identity,
+                                Some(&price()),
+                                Some(&limit),
+                                None
+                            )
+                            .unwrap_err()
+                            .code(),
+                        symbiotic_core::DiagnosticCode::SpendBudgetExhausted
+                    );
+                }
+                runtime
+                    .reconcile_spend(&reference, SpendState::Released, None)
+                    .unwrap();
+            }
+            let reference = admission
+                .reserve_passthrough_priced(&identity, priced.then_some(&price()), None, None)
+                .unwrap();
+            let mut complete = usage();
+            complete.input_tokens = None;
+            complete.cache_miss_tokens = Some(200);
+            admission.finish_passthrough(&reference, &complete).unwrap();
+            assert_eq!(
+                runtime.spend_receipt(&reference).unwrap().unwrap().state,
+                SpendState::Settled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_money_missing_reasoning_count_is_settled_with_unknown_cost() {
+        let (_dir, runtime, admission, identity) = runtime();
+        let reference = admission
+            .reserve_passthrough_priced(&identity, Some(&price()), None, None)
+            .unwrap();
+        let mut usage = usage();
+        usage.reasoning_tokens = None;
+        admission.finish_passthrough(&reference, &usage).unwrap();
+        assert_eq!(
+            runtime.spend_receipt(&reference).unwrap().unwrap().state,
+            SpendState::Settled
+        );
+        assert_eq!(
+            runtime
+                .spend_cost(
+                    &crate::account_scope(&identity, None).unwrap(),
+                    DateTime::from_timestamp_millis(0).unwrap(),
+                    DateTime::from_timestamp_millis(2).unwrap(),
+                    None,
+                    None
+                )
+                .unwrap(),
+            SpendCost {
+                settled_nano_usd: 0,
+                unknown_usage_count: 1,
+                unpriced_count: 0
+            }
         );
     }
     #[test]
@@ -345,6 +530,9 @@ mod passthrough_money {
         let mut overlapping = price.clone();
         overlapping.peak.push(overlapping.peak[0].clone());
         assert!(!overlapping.valid());
+    }
+    #[test]
+    fn passthrough_money_decimal_parsing_rejects_malformed_and_overflowing_amounts() {
         for bad in [
             "-1",
             "1e-3",

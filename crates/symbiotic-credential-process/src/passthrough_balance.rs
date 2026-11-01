@@ -81,7 +81,6 @@ pub(super) struct BalanceHealth {
 #[derive(Default)]
 pub(super) struct BalanceActivity {
     pub value: Option<BalanceHealth>,
-    low_warned: bool,
 }
 #[derive(Deserialize)]
 struct BalanceResponse {
@@ -128,10 +127,15 @@ impl Passthrough {
             .map_err(|_| EgressError::StateUnavailable)?;
         match result {
             Ok(value) => {
-                if value.low && !health.balance.low_warned {
+                if value.low
+                    && !health
+                        .balance
+                        .value
+                        .as_ref()
+                        .is_some_and(|previous| previous.low)
+                {
                     tracing::warn!(route = route.config.name, currency = ?value.currency, total_nano_units = value.total_nano_units, is_available = value.is_available, "provider balance low");
                 }
-                health.balance.low_warned = value.low;
                 health.balance.value = Some(value);
             }
             Err(code) => {

@@ -105,6 +105,14 @@ pub(crate) fn constrain_job_recovery_in(
     Ok((prohibited, deadline))
 }
 
+// Freeze the hold beside the rates so reconciliation uses the receipt's send-time policy.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PassthroughPriceSnapshot {
+    #[serde(flatten)]
+    rates: TokenRates,
+    max_request_nano_usd: Option<u64>,
+}
+
 /// Ledger handle for the versioned queue database. Opens only current queue state.
 pub struct SqliteSpendLedger(
     pub(super) Mutex<Connection>,
@@ -168,7 +176,10 @@ impl SqliteSpendLedger {
         // cannot freeze yesterday's window or the preceding peak rate.
         let sent_at = self.now();
         let sent_at_ms = sent_at.timestamp_millis();
-        let price = price.map(|p| p.rates_at(sent_at));
+        let price = price.map(|p| PassthroughPriceSnapshot {
+            rates: p.rates_at(sent_at).clone(),
+            max_request_nano_usd: limit.map(|l| l.max_request_usd.nano_units()),
+        });
         if let Some(limit) = limit {
             let start = sent_at_ms.saturating_sub((limit.window_seconds * 1000) as i64);
             let mut stmt = tx.prepare("SELECT cost_nano_usd FROM spend_receipts WHERE account=?1 AND sent_at_ms>?2 AND state!='released'").map_err(storage)?;
@@ -192,7 +203,7 @@ impl SqliteSpendLedger {
         }
         let accepted = Self::reserve_in(&tx, r)?;
         if accepted {
-            tx.execute("UPDATE spend_receipts SET sent_at_ms=?2, caller_request_id=?3, price=?4 WHERE reference=?1", params![r.reference.as_str(), sent_at_ms, request_id, price.map(serde_json::to_string).transpose().map_err(storage)?]).map_err(storage)?;
+            tx.execute("UPDATE spend_receipts SET sent_at_ms=?2, caller_request_id=?3, price=?4 WHERE reference=?1", params![r.reference.as_str(), sent_at_ms, request_id, price.as_ref().map(serde_json::to_string).transpose().map_err(storage)?]).map_err(storage)?;
         }
         tx.commit().map_err(storage)?;
         Ok(accepted)
@@ -213,7 +224,7 @@ impl SqliteSpendLedger {
             ));
         }
         let conn = self.0.lock().map_err(storage)?;
-        let mut stmt = conn.prepare("SELECT cost_nano_usd, state='unknown' OR (price IS NOT NULL AND cost_nano_usd IS NULL), price IS NULL FROM spend_receipts WHERE account=?1 AND sent_at_ms>=?2 AND sent_at_ms<?3 AND state!='released' AND (?4 IS NULL OR invocation=?4) AND (?5 IS NULL OR substr(caller_request_id,1,length(?5))=?5)").map_err(storage)?;
+        let mut stmt = conn.prepare("SELECT cost_nano_usd, state='unknown' OR (state='settled' AND price IS NOT NULL AND cost_nano_usd IS NULL), price IS NULL FROM spend_receipts WHERE account=?1 AND sent_at_ms>=?2 AND sent_at_ms<?3 AND state!='released' AND (?4 IS NULL OR invocation=?4) AND (?5 IS NULL OR substr(caller_request_id,1,length(?5))=?5)").map_err(storage)?;
         let rows = stmt
             .query_map(
                 params![account, start_ms, end_ms, invocation, prefix],
@@ -494,7 +505,7 @@ impl SqliteSpendLedger {
                 |r| r.get(0),
             )
             .map_err(storage)?;
-        let price: Option<TokenRates> = price
+        let price: Option<PassthroughPriceSnapshot> = price
             .map(|p| serde_json::from_str(&p))
             .transpose()
             .map_err(storage)?;
@@ -504,7 +515,7 @@ impl SqliteSpendLedger {
             price
                 .as_ref()
                 .zip(usage.as_ref())
-                .and_then(|(p, u)| p.cost_nano_usd(u))
+                .and_then(|(p, u)| p.rates.cost_nano_usd(u))
         } else {
             None
         };
@@ -543,6 +554,15 @@ impl SqliteSpendLedger {
             params![reference.as_str(), state_name(state), usage, output, cost],
         )
         .map_err(storage)?;
+        if let Some((cost, hold)) = cost.zip(price.and_then(|p| p.max_request_nano_usd))
+            && cost > hold
+        {
+            tracing::warn!(
+                cost_nano_usd = cost,
+                max_request_nano_usd = hold,
+                "passthrough cost exceeded max_request_usd"
+            );
+        }
         Ok(())
     }
 }

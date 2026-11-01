@@ -73,7 +73,7 @@ impl SqliteQueue {
     }
 
     /// Initialize the current queue/job format on a caller-owned ledger connection.
-    /// Version 17 migrates in place; unknown formats are refused.
+    /// Older versions, including 17, are refused; rebuild the queue database.
     pub fn initialize_connection(conn: &mut Connection) -> Result<(), QueueError> {
         configure(conn)
     }
