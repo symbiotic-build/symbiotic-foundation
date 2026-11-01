@@ -1106,17 +1106,17 @@ Chat Completions uses the same retry engine before the first downstream byte.
 After that byte, a failure stays visible and no policy or hook may retry or switch. Fallback routes must use the same method and dialect.
 The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
 A final usage chunk supplies prompt, completion, cached and reasoning token counts.
-Non-streaming JSON uses its `usage` object. Each matched caller request produces
-one core request record with normalized usage and the unchanged provider usage
-object. Incomplete responses have null usage. Retries share one record.
-The gateway stores completed records in its SQLite outbox after the response ends.
-The [gateway record contract](../../crates/symbiotic-gateway/README.md#request-records-and-the-quota-gate)
+Non-streaming JSON uses its `usage` object. Each upstream attempt produces its own
+core request record, with normalized usage and the unchanged provider usage object;
+a failed or cut attempt keeps any usage it reported. The gateway stores each record
+in its SQLite outbox when that attempt ends. The
+[gateway record contract](../../crates/symbiotic-gateway/README.md#request-records-and-the-quota-gate)
 defines delivery and quota refusal.
 
 For model listings, configure the existing `method: "get"`, exact `path` (for example
 `/v1/models`), destination URL and account credential. Keep the account's `stream`
 value. GET accepts JSON only and uses the same scrubber and account admission.
-Listings also produce one request record with null usage.
+Each listing attempt also produces a request record, with null usage.
 
 ### Request records, quota limits, and provider balance
 
