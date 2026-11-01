@@ -5,6 +5,7 @@ members = [
     "crates/symbiotic-credential-process",
     "crates/symbiotic-ai-runtime",
     "crates/symbiotic-core",
+    "crates/symbiotic-core-service",
     "crates/symbiotic-queue",
     "crates/symbiotic-queue-sqlite",
     "crates/symbiotic-model",

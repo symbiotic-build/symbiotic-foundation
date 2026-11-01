@@ -17,6 +17,7 @@ Reusable Rust contracts for durable AI work:
   contract types other systems exchange (decision and event; see
   [its README](crates/symbiotic-core/README.md)). It needs no
   HTTP client, async runtime, queue, or database.
+- [`symbiotic-core-service`](crates/symbiotic-core-service/README.md) — local service for jobs, request records, budgets, decisions and reconciliation.
 - `symbiotic-queue` — durable execution queue traits and state vocabulary,
   plus the in-process `MemoryQueue` backend and a backend conformance suite; no
   storage dependency.

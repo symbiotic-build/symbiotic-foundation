@@ -1,0 +1,25 @@
+[package]
+name = "symbiotic-core-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "symbiotic-core"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync"] }
+symbiotic-core = { path = "../symbiotic-core" }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
