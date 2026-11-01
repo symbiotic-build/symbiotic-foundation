@@ -299,10 +299,27 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read");
-        let arguments: Value = serde_json::from_str(&calls[0].arguments).unwrap();
-        assert_eq!(arguments["path"], "README.md");
-        assert!(usage.unwrap().input_tokens.is_some_and(|n| n > 0));
+        assert_eq!(
+            calls,
+            [FunctionCall {
+                call_id: "call_4ed0389cbf8c40bd8eb745b1613cf4d9".into(),
+                name: "read".into(),
+                arguments: r#"{"end":5,"path":"README.md","start":1}"#.into(),
+            }]
+        );
+        let usage = usage.unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cache_hit_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens
+            ),
+            (Some(78), Some(0), Some(26), Some(0))
+        );
+        assert_eq!(
+            usage.response_id.as_deref(),
+            Some("resp_07bb52e6215b0ab8016ae76dd1cf28819189310dde8b3e811f")
+        );
     }
 }
