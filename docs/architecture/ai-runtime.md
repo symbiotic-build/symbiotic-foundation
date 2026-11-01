@@ -187,7 +187,10 @@ even after lease reclaim marks the queue item dead. A later identical call can
 reconsider a pre-dispatch storage failure once the ledger is available again.
 `Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
 counts against the absolute account request allowance until reconciliation; unknown
-replay returns `SpendReconciliationRequired`. Typed-route money remains reporting. Passthrough can configure the rolling reservation budget described below.
+replay returns `SpendReconciliationRequired`. Typed-route money remains reporting.
+The gateway records passthrough attempts, usage and provider-unit meters in its
+SQLite outbox for the core. The core owns budgets and credit decisions; the
+gateway persists quota observations and gates exhausted Codex accounts.
 
 Ledger accounting receipts survive queue retention. Only explicit invocations save
 recovery answers, until completion time plus `RuntimeConfig::retention`, host acceptance

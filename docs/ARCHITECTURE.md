@@ -162,7 +162,9 @@ and disables response caching. Details: [model egress](architecture/model-egress
 
 Owns the same-user Unix-socket HTTP passthrough, renewable login stores and login
 import. It opens `symbiotic-ai-runtime` without a model registry for account
-admission and existing spend accounting. It publishes the configured health file.
+admission. It records each passthrough attempt in a SQLite outbox for the core
+and persists quota observations for its Codex gate. The core owns budgets and
+credit decisions. The gateway publishes the configured health file.
 The typed credential process keeps the signed egress protocol.
 Until that typed path retires, both binaries hold their own copies of process protection,
 the state lock, the socket bind and the owner-only file reader; issue #207 tracks removing them.

@@ -993,8 +993,10 @@ remains authoritative; no second cooldown database or scheduler is created. Rout
 that share an account must use matching slot caps, request rates and
 `rate_burst_seconds`. The burst setting defaults to zero. Raw requests consume the
 shared request bucket; their undecoded bodies have no input-unit estimate.
-Chat Completions POST reserves each dispatched attempt in the existing spend ledger.
-GET listings and Responses do not create reservations.
+The gateway records each upstream attempt with its account, status, reported usage
+and provider-unit meter. Its SQLite outbox delivers these records to the core,
+which owns budgets and credit decisions. The gateway persists quota observations
+and refuses exhausted Codex accounts until reset or core permission.
 `ModelRequestGrant::start_checked` holds a consumer's admission guard through the
 first transport poll. A deferred send consumes no pacing. This orders login-wide
 new-session holds even when routes use distinct runtime account scopes. Failure

@@ -161,6 +161,12 @@ pub struct PassthroughRoute {
 }
 
 impl PassthroughRoute {
+    pub(crate) fn record_account(&self) -> String {
+        match &self.account_sharing_key {
+            Some(key) => format!("shared:{}", key.0),
+            None => format!("{}/{}", self.tenant, self.account),
+        }
+    }
     fn identity(&self) -> BindingIdentity {
         BindingIdentity::new(&self.tenant, &self.name, "passthrough-v1", &self.account)
     }
@@ -758,7 +764,7 @@ async fn connection_request(
         return refuse(process, socket, 404, "route_not_found", wait).await;
     };
     wait.route = Some(route.config.name.clone());
-    wait.account = route.config.account.clone();
+    wait.account = route.config.record_account();
     wait.record_route = route.config.name.clone();
     wait.records = Some(pass.records.clone());
     if request.length > route.config.max_request_bytes {
@@ -819,7 +825,7 @@ fn safe_value(value: &[u8], secrets: &[String], max: usize) -> bool {
     printable(value, max) && !contains_secret(value, secrets)
 }
 
-fn rate_header(name: &str, _route: &PassthroughRoute) -> bool {
+pub(crate) fn rate_header(name: &str) -> bool {
     name == "retry-after" || name.starts_with("x-ratelimit-") || ResponsesAdapter::rate_header(name)
 }
 
@@ -834,7 +840,7 @@ fn returned(
         .filter_map(|(name, value)| {
             let name = name.as_str();
             let rate = ResponsesAdapter::rate_header(name)
-                || (matches!(status, 429 | 503) && rate_header(name, route));
+                || (matches!(status, 429 | 503) && rate_header(name));
             if forbidden_header(name)
                 || contains_secret(name.as_bytes(), secrets)
                 || !(rate || route.return_headers.iter().any(|h| h == name))

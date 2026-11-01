@@ -12,6 +12,8 @@ type Result<T> = std::result::Result<T, GatewayError>;
 type Row = Option<(i64, String)>;
 enum Command {
     Insert(String, String),
+    SaveGate(String, String),
+    LoadGates(mpsc::Sender<Result<Vec<(String, String)>>>),
     First(oneshot::Sender<Result<Row>>),
     Delete(i64, oneshot::Sender<Result<()>>),
     Flush(oneshot::Sender<()>),
@@ -42,7 +44,7 @@ impl Outbox {
         match version {
             0 => {
                 let tx = conn.transaction().map_err(storage)?;
-                tx.execute_batch("CREATE TABLE outbox (seq INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, record TEXT NOT NULL);").map_err(storage)?;
+                tx.execute_batch("CREATE TABLE outbox (seq INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, record TEXT NOT NULL); CREATE TABLE gate (account TEXT PRIMARY KEY, observations TEXT NOT NULL);").map_err(storage)?;
                 tx.pragma_update(None, "user_version", 1).map_err(storage)?;
                 tx.commit().map_err(storage)?;
             }
@@ -73,6 +75,22 @@ impl Outbox {
                             } else {
                                 notify.notify_one();
                             }
+                        }
+                        Command::SaveGate(account, observations) => {
+                            if conn.execute(
+                                "INSERT INTO gate(account, observations) VALUES (?1, ?2) ON CONFLICT(account) DO UPDATE SET observations=excluded.observations",
+                                params![account, observations],
+                            ).is_err() {
+                                tracing::error!(code = "gate_write_failed", account, "quota gate write failed");
+                            }
+                        }
+                        Command::LoadGates(reply) => {
+                            let result = (|| {
+                                let mut statement = conn.prepare("SELECT account, observations FROM gate").map_err(storage)?;
+                                let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(storage)?;
+                                rows.collect::<std::result::Result<Vec<_>, _>>().map_err(storage)
+                            })();
+                            let _ = reply.send(result);
                         }
                         Command::First(reply) => {
                             let result = conn
@@ -118,6 +136,26 @@ impl Outbox {
                 "request record write failed"
             );
         }
+    }
+    pub fn save_gate(&self, account: &str, observations: String) {
+        if self
+            .commands
+            .send(Command::SaveGate(account.to_owned(), observations))
+            .is_err()
+        {
+            tracing::error!(
+                code = "gate_write_failed",
+                account,
+                "quota gate write failed"
+            );
+        }
+    }
+    pub fn load_gates(&self) -> Result<Vec<(String, String)>> {
+        let (send, receive) = mpsc::channel();
+        self.commands
+            .send(Command::LoadGates(send))
+            .map_err(storage)?;
+        receive.recv().map_err(storage)?
     }
     pub async fn first(&self) -> Result<Row> {
         let (send, receive) = oneshot::channel();

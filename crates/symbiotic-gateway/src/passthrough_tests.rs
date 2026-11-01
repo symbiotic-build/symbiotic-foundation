@@ -2969,9 +2969,17 @@ async fn chat_completions_pre_byte_throttle_and_server_failure_retry_through_sha
         fixture.next().await.reply.send(reply).ok().unwrap();
         assert_eq!(decoded(&read(caller).await).2, expected);
         let records = request_records(&harness).await;
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["status"], status);
+        assert_eq!(records[0]["usage"], Value::Null);
+        assert_eq!(records[0]["meter"]["provider"]["retry-after"], "60");
         assert_eq!(
-            records[0]["usage"]["normalized"],
+            records[1]["request_id"],
+            format!("{}.2", records[0]["request_id"].as_str().unwrap())
+        );
+        assert_eq!(records[1]["status"], 200);
+        assert_eq!(
+            records[1]["usage"]["normalized"],
             json!({"input_tokens":7,"cached_input_tokens":2,"output_tokens":3,"reasoning_tokens":1})
         );
     }

@@ -980,7 +980,8 @@ impl Runtime {
 
 /// Access to the runtime's existing account slot, pacing and durable cooldown.
 /// Admission creates no queue item, retry scheduler, cache or spend receipt.
-/// Explicit passthrough accounting uses the runtime's existing canonical ledger.
+/// The gateway records passthrough attempts and provider-unit meters for the core.
+/// The core owns passthrough budgets and credit decisions.
 #[derive(Clone)]
 pub struct AccountAdmission {
     runtime: Runtime,

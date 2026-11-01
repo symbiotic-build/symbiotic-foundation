@@ -52,28 +52,42 @@ SIGTERM or SIGINT. Import refuses an existing store unless `--replace` is given.
 
 ## Request records and the quota gate
 
-Every caller request that matches a route produces one record after its response
-ends, including failures and local refusals. Retries share that record. Unmatched
-requests produce none. The caller's `x-symbiotic-request-id` identifies the record;
-requests without it receive a local UUID. `job_id` removes the final hyphen and
-suffix, or keeps the whole identifier when it has no hyphen.
+Every upstream attempt produces one record when that attempt ends, including
+failures and continuations. Attempt 1 uses the caller's `x-symbiotic-request-id`;
+attempt n ≥ 2 uses `<request_id>.<n>`. Requests without a caller id receive a local
+UUID. Every attempt's `job_id` removes the caller id's final hyphen and suffix,
+or keeps the whole caller id when it has no hyphen. A matched request that ends
+before dispatch produces one local record. A quota refusal before a later attempt
+uses that attempt's numbered id. Unmatched requests produce none. A job's cost in
+the core is the sum of its attempts' records, so a retried or continued answer is
+counted once per upstream call.
 
-Records contain the matched account and route, served model (falling back to the
-requested model), returned HTTP status and completion time in UTC. Successful
-Responses and Chat Completions responses retain the provider's complete `usage`
-object beside normalized input, cached input, output and reasoning token counts.
-Missing counts stay absent. Missing usage and incomplete responses have null usage.
-Quota headers remain intact in `meter.provider`; numeric readings use the
-provider's unit. DeepSeek's latest successful balance poll adds its currency,
-remaining balance and poll time. Optional `balance.allowance` is a decimal string
-in that currency and supplies the reading's limit.
+Records contain the attempt's account and route, served model (falling back to
+the requested model), upstream HTTP status and end time in UTC. A network failure
+or disconnect records 502. Local records use the local response status.
+An account is `shared:<key>` when its route has `account_sharing_key`; otherwise
+it is `<tenant>/<account>`. Records, gates, `budget.get` arguments and the core's
+`budgets[].account` all use this string. Independent tenants keep separate gates;
+routes with the same sharing key share a gate.
 
-The gateway queues completed records to one SQLite writer after the response ends.
-`state_dir/outbox.sqlite` uses WAL, `synchronous=FULL` and numbered migrations
-through `user_version`. Its sole table orders records by `seq` and makes
-`request_id` unique. This costs one native SQLite insert per completed request, an indexed head read,
-and one delete per acknowledged delivery. The worker keeps disk writes off the
-request handler. A failed write logs `outbox_write_failed` with the request id.
+Readable usage from each attempt retains the provider's complete `usage` object
+beside normalized input, cached input, output and reasoning token counts, even
+when the response fails or disconnects. Missing counts stay absent. Usage is null
+only when the attempt reports no readable usage. Recognized headers, including
+`retry-after`, `x-ratelimit-*` and Codex quota headers, remain in `meter.provider`.
+Numeric readings use the provider's unit. DeepSeek's latest successful balance
+poll adds its currency, remaining balance and poll time. Optional
+`balance.allowance` is a decimal string in that currency and supplies the reading's limit.
+
+The gateway queues records to one SQLite writer as each attempt ends. Recording
+never blocks or fails the call. `state_dir/outbox.sqlite` uses WAL,
+`synchronous=FULL` and `user_version` 1. Migration 1 creates `outbox`, which orders
+records by `seq` and makes `request_id` unique, and `gate`, which stores each
+account's latest local and core observations, including `over_limit_allowed`.
+The native outbox cost is one insert per attempt, an indexed head read and one
+delete per acknowledged delivery. Gate observations add one account upsert per
+observation update. The writer keeps disk work off the request handler.
+Failed writes log `outbox_write_failed` or `gate_write_failed`.
 
 One drain task sends records in order over `core_socket_path` using the core's
 `request.record` JSON-line protocol. It reuses its connection while draining. Each delivery uses `io_timeout_seconds`.
@@ -92,7 +106,7 @@ marked `exhausted`, closes the gate unless the core's latest budget permits
 not refuse. A passed reset time opens the gate, and an `over_limit_allowed`
 answer lapses with the reset of the window it answered, so a later window at
 100 % refuses again even while the core is unreachable. Closed gates return local
-HTTP 402 with `quota_exhausted`; a request refused before any attempt also records
+HTTP 402 with `quota_exhausted`; every quota refusal also records
 `refused: "quota_exhausted"` and null usage. Every gate transition logs the
 account, reading name and reason.
 
@@ -100,5 +114,6 @@ The gateway asks the core for `budget.get` at startup and at most once every 10 
 while closed gates receive requests. Each lookup times out after 2 s. A failed
 lookup preserves the gate. An offline core does not prevent startup or forwarding
 through open gates. Records accumulate in the outbox until delivery resumes.
-Quota state stays in memory; the core owns budgets and credit decisions. The
-health file adds no record or quota fields and omits the retired `cost` field.
+Opening restores gate observations before admission. An exhausted account stays
+closed across restart during a core outage until reset or core permission.
+The core owns budgets and credit decisions. The health file adds no record or quota fields and omits the retired `cost` field.
