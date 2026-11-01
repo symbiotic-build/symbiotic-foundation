@@ -1,0 +1,23 @@
+[package]
+name = "symbiotic-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded-step agent runtime: one job as small model steps rebuilt from records"
+
+[dependencies]
+regex = "1"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Request types and the Responses stream parser; no queue runtime in the sandbox.
+symbiotic-model = { path = "../symbiotic-model", default-features = false }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }

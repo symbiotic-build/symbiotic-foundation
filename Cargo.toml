@@ -10,6 +10,7 @@ members = [
     "crates/symbiotic-model",
     "crates/symbiotic-trace",
     "crates/symbiotic-portability",
+    "crates/symbiotic-agent",
 ]
 resolver = "2"
 
