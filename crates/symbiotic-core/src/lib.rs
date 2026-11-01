@@ -6,10 +6,21 @@
 #[cfg(feature = "logging")]
 pub mod logging;
 
+pub mod campaign;
+pub mod decision;
+pub mod event;
+pub mod incident;
 pub mod retry;
+pub mod signal;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// ISO 8601 UTC timestamp as the source wrote it, for example
+/// `2026-10-31T20:56:19Z`. Contract types carry it unparsed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Timestamp(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceId(pub String);
