@@ -115,27 +115,28 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
     let unmetered = accounts.difference(&metered).cloned().collect::<Vec<_>>();
     let mut quotas = BTreeMap::<String, Quota>::new();
     let mut violations = vec![];
-    // Request events are joined to their normalized rows, so only the day's sent requests are
-    // replayed and no request payload (raw provider usage) is decoded.
+    // Quota history comes from the events; the day's sent requests come from the
+    // `requests(time)` index with a keyed event lookup, so no other day's request is read and
+    // no request payload (raw provider usage) is decoded. Both branches replay in `seq` order.
     let mut statement = conn.prepare(
-        "SELECT events.time, events.subject_id, events.kind,
-                CASE WHEN events.kind = 'model.request' THEN '{}' ELSE events.payload END,
-                requests.account
-         FROM events LEFT JOIN requests
-           ON events.kind = 'model.request' AND requests.request_id = events.subject_id
-         WHERE events.kind IN ('budget.reading', 'budget.warning', 'budget.exhausted', 'decision.answered')
-            OR (events.kind = 'model.request' AND requests.refused IS NULL
-                AND requests.time >= ?1 AND requests.time < ?2)
-         ORDER BY events.seq",
+        "SELECT seq, time, subject_id, kind, payload, NULL FROM events
+         WHERE kind IN ('budget.reading', 'budget.warning', 'budget.exhausted', 'decision.answered')
+         UNION ALL
+         SELECT events.seq, events.time, events.subject_id, events.kind, '{}', requests.account
+         FROM requests CROSS JOIN events
+           ON events.subject_kind = 'request' AND events.subject_id = requests.request_id
+          AND events.kind = 'model.request'
+         WHERE requests.time >= ?1 AND requests.time < ?2 AND requests.refused IS NULL
+         ORDER BY 1",
     )?;
     let mut events = statement.query(params![start, end])?;
     while let Some(event) = events.next()? {
-        let time: String = event.get(0)?;
+        let time: String = event.get(1)?;
         let event_day = date(&time, "event.time")?.date_naive();
-        let id: String = event.get(1)?;
-        let kind: String = event.get(2)?;
-        let payload: Value = serde_json::from_str(&event.get::<_, String>(3)?)?;
-        let request_account: Option<String> = event.get(4)?;
+        let id: String = event.get(2)?;
+        let kind: String = event.get(3)?;
+        let payload: Value = serde_json::from_str(&event.get::<_, String>(4)?)?;
+        let request_account: Option<String> = event.get(5)?;
         let p = &payload;
         match kind.as_str() {
             "budget.reading" => {
