@@ -4061,9 +4061,28 @@ async fn queued_session_waits_while_new_session_retries(paced: bool) {
         )
         .await;
     waiting_ids(&harness, &["synthetic-b"]).await;
-    // A server failure retries on the same route; with pacing, the resend also waits.
+    // A server failure retries on the same route after its cooldown.
     a_sent.reply.send(Reply::status(503)).ok().unwrap();
-    advance_clock(Duration::from_secs(if paced { 61 } else { 2 })).await;
+    harness
+        .health_where(|h| h["routes"][0]["retried_events"]["503"] == 1)
+        .await;
+    advance_clock(Duration::from_secs(2)).await;
+    if paced {
+        // The one-per-minute allowance is spent, so A's resend waits for pacing while
+        // B stays queued; neither reaches the provider until the allowance refills.
+        harness
+            .health_where(|h| {
+                h["routes"][0]["waiting"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w["request_id"] == "synthetic-a" && w["reason"] == "slot")
+            })
+            .await;
+        waiting_ids(&harness, &["synthetic-b"]).await;
+        assert!(fixture.incoming.try_recv().is_err());
+        advance_clock(Duration::from_secs(61)).await;
+    }
     let retry = fixture.next().await;
     assert!(retry.head.contains("session-id: a\r\n"));
     retry.reply.send(Reply::json()).ok().unwrap();
