@@ -834,7 +834,7 @@ async fn health_heartbeat_replaces_complete_sanitized_json_and_stopping_precedes
     let initial = harness.health_where(|h| h["state"] == "running").await;
     assert_eq!(
         initial,
-        json!({"version":1,"state":"running","updated_at":initial["updated_at"],"routes":[{"name":"responses","login":"static","expires_at":null,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null}]})
+        json!({"version":1,"state":"running","updated_at":initial["updated_at"],"routes":[{"name":"responses","login":"static","expires_at":null,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null,"cost":"price not configured","balance":null}]})
     );
     assert_eq!(
         fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -3200,7 +3200,7 @@ async fn chat_completions_pre_byte_throttle_and_server_failure_retry_through_sha
         let receipts = chat_receipts(&harness);
         assert_eq!(
             receipts.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-            ["unknown", "settled"]
+            ["released", "settled"]
         );
     }
 }
@@ -3551,4 +3551,603 @@ async fn chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after
         serde_json::to_value(Some(expected)).unwrap()
     );
     assert_eq!((measured.output, measured.recovery), (None, None));
+}
+
+fn money_config(config: &mut ProcessConfig) {
+    chat_config(config);
+    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+    route.price = Some(
+        serde_json::from_value(
+            json!({"rates":{"input_cache_miss":"0.15","input_cache_hit":"0.003","output":"0.6"}}),
+        )
+        .unwrap(),
+    );
+}
+fn balance_config(config: &mut ProcessConfig) {
+    money_config(config);
+    let route = &mut config.passthrough.as_mut().unwrap().routes[0];
+    route.destination = "https://api.deepseek.com/chat/completions".into();
+    route.balance=Some(serde_json::from_value(json!({"provider":"deepseek","interval_seconds":10,"debounce_seconds":1,"low_balance":{"currency":"USD","amount":"5"}})).unwrap());
+}
+fn balance_reply(amount: &str, available: bool) -> Reply {
+    Reply {status:200,headers:vec![("content-type".into(),"application/json".into())],body:serde_json::to_vec(&json!({"is_available":available,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"},{"currency":"USD","total_balance":amount,"granted_balance":"0","topped_up_balance":amount}]})).unwrap()}
+}
+#[tokio::test]
+async fn passthrough_money_priced_and_unpriced_sends_store_cost_time_and_request_id() {
+    for priced in [true, false] {
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |c| {
+            money_config(c);
+            if !priced {
+                c.passthrough.as_mut().unwrap().routes[0].price = None;
+            }
+        })
+        .await;
+        let caller = harness
+            .connect(
+                "/v1/chat/completions",
+                b"{}",
+                "x-symbiotic-request-id: job-1\r\n",
+            )
+            .await;
+        let sent = fixture.next().await;
+        assert!(!sent.head.contains("job-1"));
+        sent.reply.send(chat_reply(false, true)).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).0, 200);
+        let conn = rusqlite::Connection::open(
+            harness
+                .process
+                .config()
+                .state_dir
+                .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+        )
+        .unwrap();
+        let result: (Option<u64>, Option<i64>, String) = conn
+            .query_row(
+                "SELECT cost_nano_usd,sent_at_ms,caller_request_id FROM spend_receipts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        // 5 uncached, 2 cached, 3 output (one reasoning, already included).
+        assert_eq!(result.0, priced.then_some(2556));
+        assert!(result.1.is_some());
+        assert_eq!(result.2, "job-1");
+        let health = harness.health_where(|_| true).await;
+        assert_eq!(
+            health["routes"][0]["cost"],
+            if priced {
+                "priced"
+            } else {
+                "price not configured"
+            }
+        );
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_money_spent_and_unknown_holds_refuse_before_upstream_socket() {
+    let (capture, _guard) = LogCapture::install("symbiotic_credential_process=info");
+    for settled in [true, false] {
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, |c| {
+            money_config(c);
+            c.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(
+                serde_json::from_value(
+                    json!({"usd":"0.000003","window_seconds":3600,"max_request_usd":"0.000003"}),
+                )
+                .unwrap(),
+            );
+        })
+        .await;
+        let first = harness.connect("/v1/chat/completions", b"{}", "").await;
+        let upstream = fixture.next().await;
+        // While the first send is in flight, its maximum-cost hold blocks a second socket.
+        let second = harness.connect("/v1/chat/completions", b"{}", "").await;
+        let refused = decoded(&read(second).await);
+        assert_eq!(refused.0, 402);
+        assert!(
+            String::from_utf8(refused.2)
+                .unwrap()
+                .contains("spend_budget_exhausted")
+        );
+        assert!(fixture.incoming.try_recv().is_err());
+        upstream
+            .reply
+            .send(chat_reply(false, settled))
+            .ok()
+            .unwrap();
+        assert_eq!(decoded(&read(first).await).0, 200);
+        let third = harness.connect("/v1/chat/completions", b"{}", "").await;
+        assert_eq!(decoded(&read(third).await).0, 402);
+        assert!(fixture.incoming.try_recv().is_err());
+        assert_eq!(chat_receipts(&harness).len(), 1);
+    }
+    let completed: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|v| v["message"] == "request completed" && v["outcome"] == "spend_budget_exhausted")
+        .collect();
+    assert_eq!(completed.len(), 4);
+    for event in completed {
+        assert_eq!(
+            (event["status"].as_u64(), event["attempts"].as_u64()),
+            (Some(402), Some(0))
+        );
+    }
+}
+#[tokio::test]
+async fn passthrough_money_released_attempts_keep_budget_available_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = config(directory.path());
+    money_config(&mut settings);
+    settings.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(
+        serde_json::from_value(json!({"usd":"0.5","window_seconds":86400,"max_request_usd":"0.5"}))
+            .unwrap(),
+    );
+    let process = open(settings.clone()).unwrap();
+    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let mut references = Vec::new();
+    for _ in 0..4 {
+        let reference = route
+            .account
+            .reserve_passthrough_priced(
+                &route.config.identity(),
+                route.config.price.as_ref(),
+                route.config.spend_limit.as_ref(),
+                None,
+            )
+            .unwrap();
+        route.account.release_passthrough(&reference).unwrap();
+        references.push(reference);
+    }
+    drop(process);
+    let process = open(settings).unwrap();
+    let route = &process.inner.passthrough.as_ref().unwrap().routes[0];
+    let account = symbiotic_ai_runtime::account_scope(
+        &route.config.identity(),
+        route.config.account_sharing_key.as_ref(),
+    )
+    .unwrap();
+    for reference in references {
+        let receipt = process
+            .inner
+            .runtime
+            .spend_receipt(&reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                receipt.state,
+                receipt.cost_nano_usd,
+                serde_json::to_value(receipt.usage).unwrap()
+            ),
+            (
+                model::SpendState::Released,
+                Some(0),
+                serde_json::to_value(symbiotic_trace::UsageTrace {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                })
+                .unwrap()
+            )
+        );
+    }
+    assert_eq!(
+        process
+            .inner
+            .runtime
+            .spend_cost(
+                &account,
+                DateTime::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::days(1),
+                None,
+                None
+            )
+            .unwrap(),
+        symbiotic_ai_runtime::SpendCost::default()
+    );
+    route
+        .account
+        .reserve_passthrough_priced(
+            &route.config.identity(),
+            route.config.price.as_ref(),
+            route.config.spend_limit.as_ref(),
+            None,
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn passthrough_money_complete_http_failures_release_holds_and_known_zero_cost() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        money_config(c);
+        let route = &mut c.passthrough.as_mut().unwrap().routes[0];
+        route.spend_limit = Some(
+            serde_json::from_value(
+                json!({"usd":"0.5","window_seconds":86400,"max_request_usd":"0.5"}),
+            )
+            .unwrap(),
+        );
+        route.retry_policy.insert(
+            ErrorClass::Throttle,
+            RetryRule {
+                action: RetryAction::RetrySame,
+                max_attempts: Some(4),
+                backoff: RetryBackoff {
+                    base_delay_ms: Some(1),
+                },
+            },
+        );
+    })
+    .await;
+    let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+    for _ in 0..3 {
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply::status(429))
+            .ok()
+            .unwrap();
+    }
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::status(400))
+        .ok()
+        .unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 400);
+
+    let connection = rusqlite::Connection::open(
+        harness
+            .process
+            .config()
+            .state_dir
+            .join(symbiotic_ai_runtime::QUEUE_DATABASE),
+    )
+    .unwrap();
+    let refs: Vec<String> = connection
+        .prepare("SELECT reference FROM spend_receipts ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(refs.len(), 4);
+    let runtime = &harness.process.inner.runtime;
+    for reference in refs {
+        let receipt = runtime
+            .spend_receipt(&model::SpendReceiptRef::new(reference).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                receipt.state,
+                receipt.cost_nano_usd,
+                serde_json::to_value(receipt.usage).unwrap()
+            ),
+            (
+                model::SpendState::Released,
+                Some(0),
+                serde_json::to_value(symbiotic_trace::UsageTrace {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                })
+                .unwrap()
+            )
+        );
+    }
+    let route = &harness.process.inner.passthrough.as_ref().unwrap().routes[0];
+    let account = symbiotic_ai_runtime::account_scope(
+        &route.config.identity(),
+        route.config.account_sharing_key.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(
+        runtime
+            .spend_cost(
+                &account,
+                DateTime::from_timestamp(0, 0).unwrap(),
+                Utc::now() + chrono::Duration::days(1),
+                None,
+                None
+            )
+            .unwrap(),
+        symbiotic_ai_runtime::SpendCost::default()
+    );
+    let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
+    let reply = chat_reply(false, true);
+    let expected = String::from_utf8(reply.body.clone())
+        .unwrap()
+        .replace(KEY, "[REDACTED]")
+        .into_bytes();
+    fixture.next().await.reply.send(reply).ok().unwrap();
+    let response = decoded(&read(caller).await);
+    assert_eq!((response.0, response.2), (200, expected));
+}
+
+#[test]
+fn passthrough_money_configuration_refuses_missing_prices_and_conflicting_account_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    money_config(&mut config);
+    let limit: SpendLimit =
+        serde_json::from_value(json!({"usd":"1","window_seconds":60,"max_request_usd":"0.1"}))
+            .unwrap();
+    config.passthrough.as_mut().unwrap().routes[0].spend_limit = Some(limit.clone());
+    validate(&config).unwrap();
+    config.passthrough.as_mut().unwrap().routes[0].price = None;
+    assert!(validate(&config).is_err());
+    money_config(&mut config);
+    for sharing in [false, true] {
+        let pass = config.passthrough.as_mut().unwrap();
+        if sharing {
+            pass.routes[0].account_sharing_key =
+                Some(symbiotic_ai_runtime::AccountSharingKey::new("shared"));
+        }
+        let mut other = pass.routes[0].clone();
+        other.name = "other".into();
+        other.path = "/other".into();
+        if sharing {
+            other.tenant = "another".into();
+            other.account = "another".into();
+        }
+        other.spend_limit = None;
+        pass.routes.push(other);
+        assert!(validate(&config).is_err());
+        config.passthrough.as_mut().unwrap().routes[1].spend_limit = Some(limit.clone());
+        assert!(validate(&config).is_ok());
+        config.passthrough.as_mut().unwrap().routes.pop();
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_money_low_balance_polls_warn_once_and_recovery_rearms() {
+    let (capture, _guard) = LogCapture::install("warn");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, balance_config).await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::status(503))
+        .ok()
+        .unwrap();
+    let initial = harness
+        .health_where(|h| h["routes"][0]["balance"]["last_read_error"] == "upstream_status")
+        .await;
+    assert_eq!(
+        initial["routes"][0]["balance"],
+        json!({
+            "currency":"USD", "total_nano_units":null, "is_available":null,
+            "read_at":null, "error_at":initial["routes"][0]["balance"]["error_at"],
+            "last_read_error":"upstream_status", "low":false
+        })
+    );
+    assert!(initial["routes"][0]["balance"]["error_at"].is_i64());
+    advance_clock(Duration::from_secs(11)).await;
+    let mut warning_count = 0;
+    for (index, amount, available, low, expected_warnings) in [
+        (0, "4.25", true, true, 1),
+        (1, "4.00", true, true, 1),
+        (2, "5.00", true, false, 1),
+        (3, "6.00", false, true, 2),
+        (4, "1.00", false, true, 2),
+    ] {
+        if index > 0 {
+            advance_clock(Duration::from_secs(11)).await;
+        }
+        let request = fixture.next().await;
+        assert!(request.head.starts_with("GET /user/balance "));
+        assert!(
+            request
+                .head
+                .contains(&format!("authorization: Bearer {KEY}"))
+        );
+        request
+            .reply
+            .send(balance_reply(amount, available))
+            .ok()
+            .unwrap();
+        let health = harness
+            .health_where(|h| {
+                h["routes"][0]["balance"]["total_nano_units"]
+                    == DecimalAmount::parse(amount).unwrap().nano_units()
+                    && h["routes"][0]["balance"]["low"] == low
+            })
+            .await;
+        assert_eq!(
+            health["routes"][0]["balance"]["last_read_error"],
+            Value::Null
+        );
+        assert_eq!(health["routes"][0]["balance"]["error_at"], Value::Null);
+        assert!(health["routes"][0]["balance"]["read_at"].is_i64());
+        warning_count = capture
+            .lines()
+            .iter()
+            .filter(|v| v["message"] == "provider balance low")
+            .count();
+        assert_eq!(warning_count, expected_warnings);
+    }
+    assert_eq!(warning_count, 2);
+    // Failure streaks retain the last observation and emit only one safe diagnostic.
+    for index in 0..2 {
+        let previous_health = harness.health_where(|_| true).await;
+        let previous = previous_health["routes"][0]["balance"]["read_at"]
+            .as_i64()
+            .unwrap();
+        let previous_attempt = previous_health["routes"][0]["balance"]["error_at"]
+            .as_i64()
+            .unwrap_or(previous);
+        advance_clock(Duration::from_secs(11)).await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply::status(503))
+            .ok()
+            .unwrap();
+        let health = harness
+            .health_where(|h| {
+                h["routes"][0]["balance"]["last_read_error"] == "upstream_status"
+                    && h["routes"][0]["balance"]["error_at"]
+                        .as_i64()
+                        .is_some_and(|at| at > previous_attempt)
+            })
+            .await;
+        assert_eq!(
+            health["routes"][0]["balance"],
+            json!({
+                "currency":"USD", "total_nano_units":1_000_000_000u64,
+                "is_available":false, "read_at":previous,
+                "last_read_error":"upstream_status", "error_at":health["routes"][0]["balance"]["error_at"],
+                "low":true
+            })
+        );
+        if index == 0 {
+            assert_eq!(
+                capture
+                    .lines()
+                    .iter()
+                    .filter(|v| v["message"] == "provider balance read failed")
+                    .count(),
+                2
+            );
+        }
+    }
+    assert_eq!(
+        capture
+            .lines()
+            .iter()
+            .filter(|v| v["message"] == "provider balance read failed")
+            .count(),
+        2
+    );
+    advance_clock(Duration::from_secs(11)).await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(balance_reply("10", true))
+        .ok()
+        .unwrap();
+    let health = harness
+        .health_where(|h| h["routes"][0]["balance"]["total_nano_units"] == 10_000_000_000u64)
+        .await;
+    assert_eq!(
+        health["routes"][0]["balance"]["last_read_error"],
+        Value::Null
+    );
+    assert_eq!(health["routes"][0]["balance"]["error_at"], Value::Null);
+    assert!(health["routes"][0]["balance"]["read_at"].is_i64());
+}
+#[tokio::test(flavor = "current_thread")]
+async fn passthrough_money_insufficient_balance_is_final_one_attempt_and_single_flight_read() {
+    let (capture, _guard) = LogCapture::install("symbiotic_credential_process=info");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |c| {
+        balance_config(c);
+        c.passthrough.as_mut().unwrap().routes[0]
+            .balance
+            .as_mut()
+            .unwrap()
+            .interval_seconds = 3600;
+    })
+    .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(balance_reply("10", true))
+        .ok()
+        .unwrap();
+    harness
+        .health_where(|h| h["routes"][0]["balance"]["is_available"] == true)
+        .await;
+    advance_clock(Duration::from_secs(2)).await;
+    let a = harness.connect("/v1/chat/completions", b"{}", "").await;
+    let b = harness.connect("/v1/chat/completions", b"{}", "").await;
+    let first = fixture.next().await;
+    let second = fixture.next().await;
+    for upstream in [first, second] {
+        upstream
+            .reply
+            .send(Reply {
+                status: 402,
+                headers: vec![],
+                body: br#"{"error":{"message":"402 - iNsUfFiCiEnT bAlAnCe: top up your account"}}"#
+                    .to_vec(),
+            })
+            .ok()
+            .unwrap();
+    }
+    let balance = fixture.next().await;
+    assert!(balance.head.starts_with("GET /user/balance "));
+    for caller in [a, b] {
+        let response = decoded(&read(caller).await);
+        assert_eq!(response.0, 402);
+        assert!(
+            String::from_utf8(response.2)
+                .unwrap()
+                .contains("provider_balance_exhausted")
+        );
+    }
+    balance.reply.send(balance_reply("0", false)).ok().unwrap();
+    harness
+        .health_where(|h| h["routes"][0]["balance"]["low"] == true)
+        .await;
+    assert!(fixture.incoming.try_recv().is_err());
+    let completed: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|v| v["message"] == "request completed")
+        .collect();
+    assert_eq!(completed.len(), 2);
+    for event in completed {
+        assert_eq!(
+            (event["outcome"].as_str(), event["attempts"].as_u64()),
+            (Some("provider_balance_exhausted"), Some(1))
+        );
+    }
+    let failures: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|v| v["message"] == "upstream failure")
+        .collect();
+    assert_eq!(failures.len(), 2);
+    for failure in failures {
+        assert_eq!(failure["class"], "Final");
+        assert_eq!(failure["code"], "provider_balance_exhausted");
+    }
+}
+
+#[tokio::test]
+async fn passthrough_money_unpriced_health_reports_unknown_price_without_sending() {
+    let directory = tempfile::tempdir().unwrap();
+    let process = open(config(directory.path())).unwrap();
+    let pass = process.inner.passthrough.as_ref().unwrap();
+    let settings = process.config().passthrough.as_ref().unwrap();
+    pass.publish_health(settings, "running").await.unwrap();
+    let health: Value =
+        serde_json::from_slice(&fs::read(settings.health_path.as_ref().unwrap()).unwrap()).unwrap();
+    assert_eq!(health["routes"][0]["cost"], "price not configured");
+}
+#[test]
+fn passthrough_money_price_setting_accepts_exact_decimal_strings() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = config(directory.path());
+    let mut route = serde_json::to_value(&settings.passthrough.unwrap().routes[0]).unwrap();
+    route["price"] =
+        json!({"rates":{"input_cache_hit":"0.003","input_cache_miss":"0.15","output":"0.6"}});
+    let result = serde_json::from_value::<PassthroughRoute>(route.clone());
+    assert!(
+        result.is_ok(),
+        "valid exact price was refused: {:?}",
+        result.err()
+    );
+    route["price"]["rates"]["output"] = json!(0.6);
+    assert!(serde_json::from_value::<PassthroughRoute>(route).is_err());
 }

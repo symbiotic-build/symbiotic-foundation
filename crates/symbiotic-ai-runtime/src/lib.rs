@@ -59,7 +59,11 @@ mod execution;
 mod maintained;
 pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
 pub mod jobs;
+mod passthrough_spend;
 pub mod spend;
+pub use passthrough_spend::{
+    DecimalAmount, PassthroughPrice, PeakWindow, SpendCost, SpendLimit, TokenRates,
+};
 #[cfg(test)]
 mod spend_tests;
 pub use model::{
@@ -426,6 +430,31 @@ impl Runtime {
         reference: &SpendReceiptRef,
     ) -> Result<Option<SpendReceipt>, ModelError> {
         self.inner.spend.receipt(reference)
+    }
+
+    /// Sum canonical passthrough costs by account, send time [start, end), and optional filters.
+    /// Request identifiers match literal prefixes, including SQL wildcard characters.
+    pub fn spend_cost(
+        &self,
+        account: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        invocation: Option<&str>,
+        request_id_prefix: Option<&str>,
+    ) -> Result<SpendCost, ModelError> {
+        self.inner
+            .job_ledger
+            .as_ref()
+            .ok_or(ModelError::Queue(
+                model::DiagnosticCode::SpendLedgerUnavailable,
+            ))?
+            .cost(
+                account,
+                start.timestamp_millis(),
+                end.timestamp_millis(),
+                invocation,
+                request_id_prefix,
+            )
     }
 
     /// Foundation-owned reconciliation; callers must establish external charge evidence.
@@ -1035,6 +1064,17 @@ impl AccountAdmission {
         &self,
         binding: &BindingIdentity,
     ) -> Result<SpendReceiptRef, ModelError> {
+        self.reserve_passthrough_priced(binding, None, None, None)
+    }
+
+    /// Atomically reserve money at send time with the frozen price and caller correlation id.
+    pub fn reserve_passthrough_priced(
+        &self,
+        binding: &BindingIdentity,
+        price: Option<&PassthroughPrice>,
+        limit: Option<&SpendLimit>,
+        request_id: Option<&str>,
+    ) -> Result<SpendReceiptRef, ModelError> {
         let reference = SpendReceiptRef::new(format!("passthrough:{}", QueueItemId::new().0))?;
         let reservation = SpendReservation {
             reference: reference.clone(),
@@ -1043,12 +1083,35 @@ impl AccountAdmission {
             binding: model::configuration_revision(binding)?.0,
             request_limit: None,
         };
-        if !self.runtime.inner.spend.reserve(&reservation)? {
+        let ledger = self
+            .runtime
+            .inner
+            .job_ledger
+            .as_ref()
+            .ok_or(ModelError::Queue(
+                model::DiagnosticCode::SpendLedgerUnavailable,
+            ))?;
+        if !ledger.reserve_passthrough(&reservation, request_id, price, limit)? {
             return Err(ModelError::Queue(
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
         }
         Ok(reference)
+    }
+
+    /// Release a complete non-2xx provider failure with no output and known zero usage.
+    pub fn release_passthrough(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
+        self.runtime.inner.spend.finish(
+            reference,
+            SpendState::Released,
+            Some(symbiotic_trace::UsageTrace {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
     }
 
     /// Settle reported numeric usage without storing provider text or response bytes.

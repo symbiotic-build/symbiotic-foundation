@@ -187,7 +187,7 @@ even after lease reclaim marks the queue item dead. A later identical call can
 reconsider a pre-dispatch storage failure once the ledger is available again.
 `Runtime::reconcile_spend` requires external charge evidence. An unresolved reservation
 counts against the absolute account request allowance until reconciliation; unknown
-replay returns `SpendReconciliationRequired`. Money is reporting, never a hard ceiling.
+replay returns `SpendReconciliationRequired`. Typed-route money remains reporting. Passthrough can configure the rolling reservation budget described below.
 
 Ledger accounting receipts survive queue retention. Only explicit invocations save
 recovery answers, until completion time plus `RuntimeConfig::retention`, host acceptance
@@ -235,6 +235,66 @@ Tenant erasure matches `binding.tenant`, independently of free-text source label
 hot path. Until the Foundation job queue implements its purge flag and settlement
 without an answer (queue PR 3), the host drains in-flight calls for the affected
 input before declaring erasure complete.
+
+## Passthrough money accounting
+
+Chat Completions POST sends use the canonical ledger's existing reservation and
+settlement transactions. `AccountAdmission::reserve_passthrough_priced` records
+`sent_at_ms` (UTC Unix milliseconds), the optional caller `caller_request_id`, and
+the token rates selected at send time. Settlement uses those frozen rates even
+if the stream crosses a peak boundary or the process configuration changes.
+`SpendReceipt::cost_nano_usd` is absent until both price and complete input/output
+usage are known, except that `Released` receipts have zero cost. A failed
+passthrough attempt with a complete non-2xx HTTP response and no provider output
+is `Released` with known zero usage. Transport failures before a response and
+2xx streams cut before usage remain `Unknown` because they may have been charged.
+An unpriced receipt remains unpriced after reconciliation.
+Provider bodies and credentials never enter these fields.
+
+One stored money unit is one billionth of USD (nano-USD). Configuration accepts
+nonnegative decimal strings with at most nine fractional digits, bounded by
+SQLite's signed 64-bit maximum. Each request sums token count times rate using
+saturating integer arithmetic, divides by one million, and rounds up once.
+The result saturates at `i64::MAX` nano-USD. Output includes reasoning tokens;
+separately priced reasoning replaces that part of the output charge.
+Missing cache splits charge all input at the miss price. One reported split
+component derives the other from total input. Incomplete input/output usage
+leaves cost unknown.
+
+`spend_limit` supplies a rolling account budget. Reservation takes SQLite's
+IMMEDIATE write lock before it reads any costs. It admits a send only when
+settled costs plus `max_request_usd` for every unresolved cost, including the
+new send, fit `usd`. The window includes sends newer than
+`sent_at_ms - window_seconds * 1000`; the lower bound is exclusive.
+Released receipts do not count. A settled receipt whose cost remains unknown
+also holds the maximum. Unknown sends survive restart and retain that hold
+until settlement, release, or window expiry. `max_request_usd` must be a
+conservative bound chosen for the route's requests; it does not rewrite or
+limit caller output-token settings. Actual settled cost can exceed this hold.
+Admission refusal returns `BudgetExhausted(SpendBudgetExhausted)` before transport.
+
+`Runtime::spend_cost(account, start, end, invocation, request_id_prefix)` reads
+canonical receipts over the half-open UTC send-time window `[start, end)`.
+Use `account_scope(identity, sharing)` for the account argument. Optional invocation
+matches exactly; optional request ID matches a literal prefix, including `%`
+and `_` without wildcard interpretation. The result contains
+`settled_nano_usd`, `unknown_usage_count`, and `unpriced_count`. The two counts
+are independent: an unpriced unknown receipt contributes to both. Priced partial
+usage whose cost cannot be computed contributes to unknown usage. Released
+receipts are excluded. Totals saturate at `u64::MAX`.
+
+Schema 18 adds four nullable receipt columns: `sent_at_ms`, `caller_request_id`,
+`price`, and `cost_nano_usd`. One native `(account, sent_at_ms)` index bounds rolling
+budget reads and reports to the requested account/window. The bare SQLite cost
+is one index range scan and receipt updates in the existing transaction. There
+is no new ledger, summary table, or accounting cache. Older schemas, including
+version 17, are refused without migration. Deploying version 18 requires
+rebuilding the queue database.
+
+Verification: the `passthrough_money_*` tests in
+[`spend_tests.rs`](../../crates/symbiotic-ai-runtime/src/spend_tests.rs)
+cover cost arithmetic, UTC peak selection, reports, concurrent holds, expiry,
+and refusal of the previous queue schema.
 
 ## Calls in flight
 
@@ -341,7 +401,7 @@ now enforce charge certainty across the shared queued chat, embedding, rerank an
 paths; timeout or unknown charge requires reconciliation.
 
 `provider_request_limit` (default `None`) is an absolute account request allowance
-with no implicit reset/window; `Some(0)` refuses dispatch. Money remains reporting.
+with no implicit reset/window; `Some(0)` refuses dispatch. Typed-route money remains reporting.
 
 `ModelQueueConfig` fields:
 
@@ -586,8 +646,9 @@ them in CI:
 - unknown items.
 
 A new backend passes the same macro. SQLite creates only the current schema;
-queue files require schema version 7 and the current queue table layouts.
-Other layouts are refused without migration. Queue and ledger mutations acquire
+queue files require schema version 18 and the current queue table layouts.
+Older schemas are refused without migration; deploying version 18 requires
+rebuilding the queue database. Queue and ledger mutations acquire
 the SQLite write lock before reading state, so concurrent writers do not require
 a read-to-write transaction upgrade. Unknown stored failure codes/classes
 are refused with a static error. Terminal items without a recorded error class

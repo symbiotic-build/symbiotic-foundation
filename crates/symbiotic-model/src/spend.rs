@@ -134,6 +134,15 @@ pub fn handoff_input_identity(
 pub struct SpendReceipt {
     pub reservation: SpendReservation,
     pub state: SpendState,
+    /// Passthrough send time; absent for older receipts and typed calls.
+    #[serde(default)]
+    pub sent_at_ms: Option<i64>,
+    /// Caller correlation identifier, never sent to the provider.
+    #[serde(default)]
+    pub caller_request_id: Option<String>,
+    /// Settled cost in billionths of USD; absent when usage or price is unknown.
+    #[serde(default)]
+    pub cost_nano_usd: Option<u64>,
     /// Confirmed release before transport: this queue claim used no provider attempt.
     /// Ordinary Released accounting, including known-zero provider failures, still did.
     #[serde(default)]

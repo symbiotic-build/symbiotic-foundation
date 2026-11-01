@@ -134,8 +134,11 @@ Memory's job adapter must call `purge_owner` when erasing an input owner.
 `ProcessConfig.jobs` and `.job_runner` use the existing versioned `JobConfig` and
 `RunnerConfig` defaults. Admission bytes count against pending utilization and
 follow the same confirmation, cancellation and erasure deletion rules as input.
-Queue schema 17 adds the current admission column and `AwaitingAdmission` to the
-existing bounded live-row indexes; older formats are refused without migration.
+Queue schema 18 retains the admission column and `AwaitingAdmission` in the
+existing bounded live-row indexes. It adds four receipt columns: `sent_at_ms`,
+`caller_request_id`, `price`, and `cost_nano_usd`. The `spend_account_time` index
+covers `(account, sent_at_ms)`. Older formats are refused without migration.
+Deploying version 18 requires rebuilding the queue database.
 Workers attach to an authenticated scope on its first job request (also after
 restart). Dropped consumer futures leave Foundation-owned execution running.
 The process state lock remains held until its runners drain. Worker failures
@@ -309,7 +312,7 @@ timestamp restoration and expiry.
 ## Same-attempt recovery (v4)
 
 V4 replaces earlier versions without aliases or fallback. Both request and credential-operation
-versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 9 and queue schema is 17.
+versions, configuration version and HMAC domains are 4; the egress registry schema stamp is 9 and queue schema is 18. Older queue formats are refused; deployment requires rebuilding the queue database.
 Opening a registry with a different stamp fails with `Version`; no migration or reset is
 performed. An incomplete registry refuses startup instead of recreating lost
 canonical permit, grant-revision or request-budget tables. Its result-expiry index
@@ -1080,10 +1083,13 @@ After that byte, a failure stays visible and no policy or hook may retry or swit
 The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
 A final usage chunk supplies prompt, completion, cached and reasoning token counts.
 Non-streaming JSON uses its `usage` object. Successful terminal responses settle
-reported numeric usage in the canonical ledger. Missing usage, errors, cancellation
-and disconnects keep `Unknown`. Provider identity text and answer bytes are excluded.
+reported numeric usage in the canonical ledger. A failed attempt with a complete
+non-2xx HTTP response and no provider output is `Released` with known zero usage
+and zero cost. Transport failures before a response, incomplete error bodies,
+cancellation, and 2xx responses without complete usage keep `Unknown`.
+Provider identity text and answer bytes are excluded.
 The ledger adds one existing receipt row per dispatched Chat Completions POST attempt and uses its
-native reserve/finish transactions. It adds no table or index. Independent generated
+native reserve/finish transactions. It uses the existing ledger; money settings add the receipt columns and account/time index described below. Independent generated
 attempt invocations prevent unknown receipts from blocking subsequent passthrough sends.
 Settlement precedes the final HTTP chunk; a ledger failure leaves HTTP incomplete.
 
@@ -1093,6 +1099,111 @@ value. GET accepts JSON only and uses the same scrubber and account admission.
 No new configuration key or spend receipt is needed for listings.
 Responses receipts and usage trailers remain tracked by
 [#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165).
+
+### Passthrough prices, spend limits, and provider balance
+
+Route configuration uses lower snake case fields and enum values. Rust public
+types use UpperCamelCase. Closed diagnostic codes use lower snake case, subject
+first. All money settings are exact decimal strings; binary floats are refused.
+Configuration version stays 4. These optional settings do not infer a model's price.
+
+- `price.rates` supplies USD per million `input_cache_miss`, `input_cache_hit`,
+  and `output` tokens. Optional `reasoning` defaults to `output`.
+- `price.peak` supplies nonoverlapping UTC windows with ISO `weekdays` (Monday=1,
+  Sunday=7), `start` and `end` in HH:MM, and their own `rates`. Start is inclusive;
+  end is exclusive and can be 24:00. Split overnight windows into two days.
+- `spend_limit` supplies `usd`, positive `window_seconds`, and positive
+  `max_request_usd`. Every route sharing the account must have the same limit,
+  including omission. A limit requires a configured price and Chat Completions
+  POST accounting. Sharing with a typed route therefore requires no money limit.
+  Invalid policies refuse startup with the existing `InvalidRequest` configuration error.
+- `balance` supplies `provider: "deepseek"`, positive `interval_seconds`,
+  positive `debounce_seconds` (default 1), and
+  `low_balance: {currency: "USD" | "CNY", amount: "..."}`.
+  `balance.low_balance.currency` must match the currency held by the provider account.
+  A response without that currency reports `invalid_response` and never emits a
+  low-balance warning.
+
+The [runtime money contract](ai-runtime.md#passthrough-money-accounting) defines
+rounding, conservative unknown holds, and cost queries. A route without `price`
+records unknown cost and publishes `cost: "price not configured"`; configured
+prices publish `cost: "priced"`. An exhausted local budget returns HTTP 402 with
+`spend_budget_exhausted`, zero upstream attempts, and that outcome in the
+`request completed` event. The local response carries no upstream headers.
+
+DeepSeek balance monitoring uses the route's own secret and HTTPS client for
+`GET https://api.deepseek.com/user/balance`. Configuration requires that the model
+route already targets the same HTTPS origin. Redirects, automatic retries,
+ambient proxies, and compression stay disabled. The route's `max_response_bytes`
+bounds the balance body. The parser accepts decimal strings and retains only
+the selected currency, numeric total, and availability.
+The endpoint and response shape were verified on 2026-11-01 against
+[DeepSeek's balance documentation](https://api-docs.deepseek.com/api/get-user-balance).
+
+The server reads once at startup, then every `interval_seconds`, and after HTTP
+402 on that route. One owned poller per route permits one read in flight.
+Repeated 402 signals coalesce, and reads triggered within `debounce_seconds` of
+the last read's start are suppressed. Pollers stop with the server.
+`balance` health is null before the first read or when monitoring is absent.
+After a read it contains `currency`, integer `total_nano_units` (billionths of
+that currency), `is_available`, UTC Unix-second `read_at` and `error_at`,
+`last_read_error`, and `low`. `read_at` timestamps the last successful read and
+is null until one succeeds. `error_at` timestamps the last failed read.
+Read failures retain the last numeric observation, `low`, and `read_at`;
+an initial failure has null total/availability and `low: false`.
+Success clears `last_read_error` and `error_at`. A successful read sets `low`
+when the total is below the threshold or availability is false.
+
+A transition to low logs exactly one `provider balance low` warning with numeric
+fields. A successful available reading at or above the threshold re-arms it.
+A failed read logs `provider balance read failed` once per failure streak, with
+only a static diagnostic. Success re-arms failure warnings. No response body,
+transport error text, or secret enters balance health or warnings.
+
+HTTP 402 whose error message contains `insufficient balance`
+(case-insensitive, with surrounding text allowed) produces the typed diagnostic
+`provider_balance_exhausted`, class `Final`. It never retries or switches, even
+under a retry override. Completion records one attempt and this distinct code.
+Other 402 responses retain the existing Final classification and fixed body.
+Every 402 also signals the optional balance poller.
+
+#### DeepSeek Flash example
+
+This fragment extends a Chat Completions POST route targeting
+`https://api.deepseek.com/chat/completions`. The caller selects `deepseek-flash`
+in its unchanged request body. Prices below were verified on 2026-11-01 against
+[DeepSeek's pricing page](https://api-docs.deepseek.com/quick_start/pricing).
+The limit and warning threshold are example deployment choices, not provider prices.
+
+```json
+{
+  "price": {
+    "rates": {"input_cache_hit": "0.003", "input_cache_miss": "0.15", "output": "0.6"},
+    "peak": [
+      {"weekdays": [1, 2, 3, 4, 5], "start": "01:00", "end": "04:00",
+       "rates": {"input_cache_hit": "0.006", "input_cache_miss": "0.3", "output": "1.2"}},
+      {"weekdays": [1, 2, 3, 4, 5], "start": "06:00", "end": "10:00",
+       "rates": {"input_cache_hit": "0.006", "input_cache_miss": "0.3", "output": "1.2"}}
+    ]
+  },
+  "spend_limit": {"usd": "20", "window_seconds": 86400, "max_request_usd": "1"},
+  "balance": {"provider": "deepseek", "interval_seconds": 60, "debounce_seconds": 1,
+              "low_balance": {"currency": "USD", "amount": "5"}}
+}
+```
+
+Reasoning uses the output rate. A request sent on Monday at 02:00 UTC with
+1 000 input tokens, 800 cache hits, and 300 output tokens costs 424 800 nano-USD
+($0.0004248), even if 100 output tokens are reasoning. Off-peak it costs
+212 400 nano-USD. The schedule deliberately does not model Chinese holidays:
+holidays use their weekday's scheduled rate, overstating the documented holiday
+discount rather than understating cost. Separate search/fetch fees are outside
+this token-price calculation.
+
+Verification: `passthrough_money_*` in
+[`passthrough_tests.rs`](../../crates/symbiotic-credential-process/src/passthrough_tests.rs)
+cover priced/unpriced receipts, socket-level pre-send refusal, concurrent and
+unknown holds, low-balance warning re-arming, and Final 402 balance refresh.
 
 For a MiMo host, this example is one entry in `passthrough.routes`. The host
 provisions the key file with owner-only access and raw key bytes without a trailing
@@ -1191,7 +1302,7 @@ notifications also trigger publication when typed providers set the deadline.
 Each replacement is synced and has mode 0640; the provisioned directory supplies its group. The file contains
 only `version`, `state`, `updated_at` and per-route `name`, `login`, `expires_at`
 and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
-`rate_limits_seen_at` and `new_session_hold_until`. Login states are `ok`,
+`rate_limits_seen_at` and `new_session_hold_until`, plus `cost` and optional `balance` described below. Login states are `ok`,
 `expiring` within 300 s for Grok or two days for Codex and Kimi,
 `renewal_failed`, `login_required`, or `static`. SIGTERM and SIGINT publish
 `state: "stopping"` before closing the socket. Readers reject missing or malformed
