@@ -261,6 +261,31 @@ async fn request_records_responses_json_uses_request_model_and_preserves_missing
 }
 
 #[tokio::test]
+async fn request_records_unreadable_responses_usage_keeps_the_call_and_records_no_usage() {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, |_| {}).await;
+    let caller = harness
+        .connect("/v1/responses", br#"{"model":"requested"}"#, "")
+        .await;
+    provider
+        .next()
+        .await
+        .reply
+        .send(Reply {
+            body: br#"{"usage":{"input_tokens":"four"}}"#.to_vec(),
+            ..Reply::json()
+        })
+        .ok()
+        .unwrap();
+    let (status, _, body) = decoded(&read(caller).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, br#"{"usage":{"input_tokens":"four"}}"#);
+    let records = request_records(&harness).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["usage"], Value::Null);
+}
+
+#[tokio::test]
 async fn request_records_weekly_exhaustion_refuses_without_upstream_until_core_allows_credits() {
     let dir = tempfile::tempdir().unwrap();
     let mut core = FakeCore::start(&dir.path().join("core.sock"), false).await;

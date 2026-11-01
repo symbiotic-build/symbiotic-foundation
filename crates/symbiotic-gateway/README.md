@@ -87,7 +87,11 @@ minutes. Other header readings carry no limit. Before every upstream attempt,
 the gate compares each account's latest local reading with the core's latest
 budget, using reading time. Used quota at or above its limit, or a core budget
 marked `exhausted`, closes the gate unless the core's latest budget permits
-`over_limit_allowed`. A passed reset time opens it. Closed gates return local
+`over_limit_allowed`. Only Codex readings gate requests (operator decision 5,
+2026-11-01); a DeepSeek budget at its allowance warns through the core and does
+not refuse. A passed reset time opens the gate, and an `over_limit_allowed`
+answer lapses with the reset of the window it answered, so a later window at
+100 % refuses again even while the core is unreachable. Closed gates return local
 HTTP 402 with `quota_exhausted`; a request refused before any attempt also records
 `refused: "quota_exhausted"` and null usage. Every gate transition logs the
 account, reading name and reason.

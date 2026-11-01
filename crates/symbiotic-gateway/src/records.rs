@@ -1,5 +1,5 @@
 //! Request records, provider-unit meters and the in-memory quota gate.
-use crate::{GatewayConfig, GatewayError, item_stream::ResponsesAdapter, outbox::Outbox};
+use crate::{GatewayConfig, GatewayError, outbox::Outbox};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use symbiotic_ai_runtime::model::item_stream::ResponsesAdapter;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -188,7 +189,12 @@ impl Sources {
             (_, Some(core)) => Some(core),
             (local, _) => local.as_ref(),
         };
-        let reason = if self.core.as_ref().is_some_and(|s| s.allowed) {
+        // An allowance answers one window; it lapses with that window's reset.
+        let reason = if self
+            .core
+            .as_ref()
+            .is_some_and(|s| s.allowed && s.reading.resets_at.is_none_or(|t| t > now))
+        {
             "over_limit_allowed"
         } else if newest.is_some_and(|s| s.reading.resets_at.is_some_and(|t| t <= now)) {
             "window_reset"
@@ -218,9 +224,11 @@ struct AccountGate {
 }
 impl AccountGate {
     fn closed(&mut self, account: &str, now: DateTime<Utc>) -> bool {
-        // Evaluate every reading so every transition is logged.
+        // Only Codex readings gate requests (operator decision 5, 2026-11-01); other budgets
+        // warn through the core. Evaluate every gated reading so every transition is logged.
         self.readings
             .iter_mut()
+            .filter(|(name, _)| name.starts_with("codex."))
             .fold(false, |closed, (name, sources)| {
                 sources.closed(account, name, now) || closed
             })
@@ -421,7 +429,14 @@ impl Records {
                     .call("request.record", record.clone())
                     .await?;
                 if reply.get("ok").is_some() {
-                    self.budgets(&reply["ok"]["budgets"])?;
+                    // The core stored the record; an unreadable budget list must not resend it.
+                    if self.budgets(&reply["ok"]["budgets"]).is_err() {
+                        tracing::error!(
+                            code = "budget_reply_invalid",
+                            request_id = record["request_id"].as_str().unwrap_or(""),
+                            "core budget reply unreadable"
+                        );
+                    }
                 } else if reply["error"]["reason"] == "request_id_conflict" {
                     tracing::error!(
                         code = "request_id_conflict",
@@ -490,7 +505,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::item_stream::{ChatCompletionsAdapter, ItemEvent};
+    use symbiotic_ai_runtime::model::item_stream::{ChatCompletionsAdapter, ItemEvent};
 
     #[test]
     fn request_records_state_missing_cache_hit_stays_absent() {
@@ -542,6 +557,55 @@ mod tests {
                 .unwrap(),
             "wal"
         );
+    }
+
+    fn one_account(directory: &Path, now: DateTime<Utc>) -> Records {
+        Records {
+            outbox: Outbox::open(directory).unwrap(),
+            core_path: directory.join("core.sock"),
+            core_timeout: Duration::from_secs(2),
+            accounts: [(
+                "account".into(),
+                Account {
+                    gate: Mutex::new(AccountGate::default()),
+                    refresh: tokio::sync::Mutex::new(()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            clock: Arc::new(move || now),
+        }
+    }
+
+    #[test]
+    fn request_records_state_exhausted_deepseek_budget_does_not_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let records = one_account(directory.path(), now);
+        records.budgets(&json!([{"account":"account","name":"deepseek.balance","limit":50.0,"spent":50.0,"state":"exhausted","over_limit_allowed":false,"reading":{"name":"deepseek.balance","unit":"CNY","remaining":0.0,"limit":50.0,"read_at":now},"updated":now}])).unwrap();
+        assert!(!records.is_closed("account").unwrap());
+    }
+
+    #[test]
+    fn request_records_state_allowance_lapses_with_its_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let records = one_account(directory.path(), now);
+        let past = now - chrono::Duration::days(1);
+        // Last week's answered allowance, from the core.
+        records.budgets(&json!([{"account":"account","name":"codex.secondary","limit":100.0,"spent":100.0,"state":"exhausted","over_limit_allowed":true,"reading":{"name":"codex.secondary","unit":"percent","used":100.0,"limit":100.0,"read_at":past - chrono::Duration::days(1),"resets_at":past},"updated":past}])).unwrap();
+        // This week's own reading at 100 %, while the core is unreachable.
+        let reading = Reading {
+            name: "codex.secondary".into(),
+            unit: "percent".into(),
+            used: Some(100.0),
+            limit: Some(100.0),
+            window_minutes: Some(10080),
+            resets_at: Some(now + chrono::Duration::days(6)),
+            ..Default::default()
+        };
+        records.observe("account", &[reading], now);
+        assert!(records.is_closed("account").unwrap());
     }
 
     #[test]

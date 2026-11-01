@@ -1177,10 +1177,11 @@ impl Passthrough {
                             }
                         };
                         wait.report_model(&value, false);
+                        // Recording never fails a call: unreadable usage is recorded as absent.
                         if route.config.method == PassthroughMethod::Post {
-                            let trace = ResponsesAdapter::json_usage(&value)
-                                .map_err(|_| GatewayError::InvalidProviderJson)?;
-                            usage = crate::records::Usage::new(&value["usage"], &trace);
+                            usage = ResponsesAdapter::json_usage(&value).ok().and_then(|trace| {
+                                crate::records::Usage::new(&value["usage"], &trace)
+                            });
                         }
                     }
                     if let Some(scrubber) = &mut scrubber {
