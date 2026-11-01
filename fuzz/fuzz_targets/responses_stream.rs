@@ -7,7 +7,9 @@ use symbiotic_model::responses::FunctionCall;
 
 fuzz_target!(|data: &[u8]| {
     // The first byte picks where the stream splits, so records also cross feed calls.
-    let split = data.first().map_or(0, |&byte| usize::from(byte) % (data.len() + 1));
+    let split = data
+        .first()
+        .map_or(0, |&byte| usize::from(byte) % (data.len() + 1));
     let mut adapter = ResponsesAdapter::default();
     for chunk in [&data[..split], &data[split..]] {
         let Ok(events) = adapter.feed(chunk, 1 << 16) else {
