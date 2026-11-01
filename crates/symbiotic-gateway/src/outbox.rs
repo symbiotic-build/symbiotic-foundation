@@ -143,10 +143,10 @@ fn storage(_: impl std::fmt::Debug) -> GatewayError {
 impl Drop for Outbox {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Stop);
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                tracing::error!(code = "outbox_worker_failed", "outbox worker failed");
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!(code = "outbox_worker_failed", "outbox worker failed");
         }
     }
 }
