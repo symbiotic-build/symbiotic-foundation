@@ -1,5 +1,7 @@
 //! Same-user HTTP passthrough with runtime account admission and renewable logins.
-//! Process protection, process locking and socket binding are copied from the credential process; a later retirement step removes those copies.
+//! Process protection, the state lock, the socket bind and the owner-only file reader are
+//! temporary copies of the credential process's helpers, because neither binary may depend on
+//! the other; issue #207 tracks their removal with the credential process's typed path.
 #![cfg(unix)]
 
 mod error;
@@ -101,6 +103,14 @@ impl Gateway {
                 _process_lock: process_lock,
             }),
         })
+    }
+
+    /// Install an embedded-only retry decision hook. JSON cannot configure the hook.
+    /// Call it on a freshly opened gateway, before cloning or serving it.
+    pub fn with_retry_hook(mut self, hook: passthrough::RetryHook) -> Result<Self, GatewayError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(GatewayError::StateUnavailable)?;
+        inner.passthrough.retry_hook = Some(hook);
+        Ok(self)
     }
 
     /// Deployment settings without credential values.

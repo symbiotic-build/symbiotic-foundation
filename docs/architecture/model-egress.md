@@ -985,15 +985,14 @@ cookies, host, forwarding and hop-by-hop headers are excluded. The process injec
 the credential and `Accept-Encoding: identity`. The client ignores ambient proxies,
 disables HTTP retries and follows no redirects.
 
-Routes register with `Runtime::account_admission`. This facade uses the same
-`ModelAdmission` FIFO semaphore, `ModelRateState` request bucket and queue backend
-as typed providers. The backend's existing cooldown row remains authoritative;
-no passthrough queue, cooldown database or second scheduler is created. Registration
-requires matching slot caps, request rates and `rate_burst_seconds`. The burst
-setting defaults to zero, as in the existing runtime. Typed configuration routes
-use that default. Shared typed bindings must leave input-unit pacing and provider
-request limits unset. Raw requests consume the shared request bucket; their
-undecoded bodies have no typed input-unit estimate.
+Routes register with `Runtime::account_admission`, which uses the runtime's
+`ModelAdmission` FIFO semaphore, `ModelRateState` request bucket and queue backend.
+The gateway opens its own runtime, so admission is shared among the gateway's routes
+of one account and never with another process. The backend's existing cooldown row
+remains authoritative; no second cooldown database or scheduler is created. Routes
+that share an account must use matching slot caps, request rates and
+`rate_burst_seconds`. The burst setting defaults to zero. Raw requests consume the
+shared request bucket; their undecoded bodies have no input-unit estimate.
 Chat Completions POST reserves each dispatched attempt in the existing spend ledger.
 GET listings and Responses do not create reservations.
 `ModelRequestGrant::start_checked` holds a consumer's admission guard through the
@@ -1026,7 +1025,7 @@ consecutive account failures. Successful completion resets that count. Optional
 `fallback_routes` names are used only by `switch`; an empty list means fail.
 `PassthroughConfig.retry_policies` contains named overrides selected through the
 local `x-symbiotic-retry-policy` header. Unknown names get 400.
-`CredentialProcess::open_with_retry_hook` supplies the embedded-only hook.
+`Gateway::with_retry_hook` installs the embedded-only hook on a freshly opened gateway.
 Neither the header nor hook is sent upstream. The queue never relies on provider
 retry behavior in client tools.
 

@@ -192,9 +192,11 @@ impl Harness {
         let mut config = config(dir.path());
         change(&mut config);
         let mut process = open_with_clock(config, clock.unwrap_or_else(test_clock::clock)).unwrap();
+        if let Some(hook) = hook {
+            process = process.with_retry_hook(hook).unwrap();
+        }
         let pass = &mut Arc::get_mut(&mut process.inner).unwrap().passthrough;
         pass.wire_base = Some(fixture.base.clone());
-        pass.retry_hook = hook;
         for mut route in std::mem::take(&mut pass.routes) {
             route.client = reqwest::Client::builder()
                 .no_proxy()

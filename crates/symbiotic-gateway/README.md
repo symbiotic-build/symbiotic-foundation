@@ -44,5 +44,9 @@ symbiotic-gateway --child <config>
 symbiotic-gateway login import --family <chatgpt_codex|xai_grok|kimi_code> --native <path> --store <path> [--replace]
 ```
 
+`<config>` names a regular file owned by the gateway's user, with no group or other
+permissions (`0600` or stricter), at most 1 MiB, and not a symbolic link as its last
+path component. Any other file fails with `credential unavailable` before startup.
+
 `--child` watches its parent through `symbiotic-supervise`. The server runs until
 SIGTERM or SIGINT. Import refuses an existing store unless `--replace` is given.
