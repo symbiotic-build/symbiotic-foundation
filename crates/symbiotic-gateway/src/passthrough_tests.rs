@@ -2990,7 +2990,22 @@ async fn kimi_429_account_limits_reach_caller_after_one_attempt_as_final() {
     ] {
         let (capture, _subscriber) = LogCapture::install("warn");
         let mut fixture = Fixture::start().await;
-        let harness = Harness::start(&fixture, chat_config).await;
+        let harness = Harness::start(&fixture, |config| {
+            chat_config(config);
+            quota_config(config);
+            config.passthrough.routes[0].error_messages.extend(
+                [
+                    "credit balance is insufficient",
+                    "Extra Usage balance has run out",
+                    "Extra Usage limit set for your account",
+                ]
+                .map(|contains| ErrorMessageRule {
+                    contains: contains.into(),
+                    code: "provider_quota_exhausted".into(),
+                }),
+            );
+        })
+        .await;
         let caller = harness.connect("/v1/chat/completions", b"{}", "").await;
         fixture
             .next()
@@ -3033,7 +3048,18 @@ async fn kimi_429_account_limits_reach_caller_after_one_attempt_as_final() {
             .collect();
         assert_eq!(
             failures,
-            vec![json!([429, "429", "Final", "fail", 1, message])]
+            vec![json!([
+                429,
+                if message.contains("concurrent request limit") {
+                    "provider_risk_control"
+                } else {
+                    "provider_quota_exhausted"
+                },
+                "Final",
+                "fail",
+                1,
+                message
+            ])]
         );
     }
 }
@@ -3064,7 +3090,7 @@ async fn kimi_429_transient_and_unknown_messages_still_retry_as_throttle() {
             .ok()
             .unwrap();
         harness
-            .health_where(|h| h["routes"][0]["retried_events"]["429"] == 1)
+            .health_where(|h| h["routes"][0]["retried_events"]["rate_limit_error"] == 1)
             .await;
         advance_clock(Duration::from_secs(61)).await;
         let reply = chat_reply(false, true);
@@ -3096,7 +3122,14 @@ async fn kimi_429_transient_and_unknown_messages_still_retry_as_throttle() {
             .collect();
         assert_eq!(
             failures,
-            vec![json!([429, "429", "Throttle", "retry_same", 1, message])]
+            vec![json!([
+                429,
+                "rate_limit_error",
+                "Throttle",
+                "retry_same",
+                1,
+                message
+            ])]
         );
     }
 }
@@ -3494,3 +3527,465 @@ async fn passthrough_money_insufficient_balance_is_final_one_attempt_and_single_
 
 #[path = "request_record_tests.rs"]
 mod request_record_tests;
+
+fn quota_config(config: &mut GatewayConfig) {
+    let mut route = serde_json::to_value(&config.passthrough.routes[0]).unwrap();
+    route["error_classes"] = json!({
+        "exceeded_current_quota_error":"final",
+        "provider_quota_exhausted":"final",
+        "provider_risk_control":"final"
+    });
+    route["error_messages"] = json!([
+        {"contains":"usage limit","code":"provider_quota_exhausted"},
+        {"contains":"token plan has been exhausted","code":"provider_quota_exhausted"},
+        {"contains":"concurrent request limit","code":"provider_risk_control"}
+    ]);
+    config.passthrough.routes[0] = serde_json::from_value(route).unwrap();
+}
+
+#[tokio::test]
+async fn gateway_429_quota_type_and_message_fail_after_one_send() {
+    for (error, code) in [
+        (
+            json!({"type":"exceeded_current_quota_error","message":"Synthetic quota"}),
+            "exceeded_current_quota_error",
+        ),
+        (
+            json!({"message":"The quota of Token Plan has been exhausted"}),
+            "provider_quota_exhausted",
+        ),
+        (
+            json!({"message":"Synthetic USAGE LIMIT reached"}),
+            "provider_quota_exhausted",
+        ),
+        (
+            json!({"message":"Synthetic concurrent request limit"}),
+            "provider_risk_control",
+        ),
+        // Both entries match; the first configured entry wins.
+        (
+            json!({"code":null,"message":"usage limit and concurrent request limit"}),
+            "provider_quota_exhausted",
+        ),
+        // An explicit code takes precedence over type and message.
+        (
+            json!({"code":"provider_risk_control","type":"exceeded_current_quota_error","message":"usage limit"}),
+            "provider_risk_control",
+        ),
+        // A matching message takes precedence over a type, as Kimi's generic type requires.
+        (
+            json!({"type":"rate_limit_error","message":"usage limit"}),
+            "provider_quota_exhausted",
+        ),
+    ] {
+        let (capture, _subscriber) = LogCapture::install("info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, quota_config).await;
+        let call = harness.call().await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 429,
+                headers: vec![],
+                body: serde_json::to_vec(&json!({"error":error})).unwrap(),
+            })
+            .ok()
+            .unwrap();
+        let (status, _, body) = decoded(&call.await.unwrap());
+        assert_eq!(
+            (status, body),
+            (429, br#"{"error":{"code":"upstream_status"}}"#.to_vec())
+        );
+        assert!(fixture.incoming.try_recv().is_err());
+        let failures: Vec<_> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line["message"] == "upstream failure")
+            .map(|line| json!([line["code"], line["class"], line["action"], line["attempt"]]))
+            .collect();
+        assert_eq!(failures, vec![json!([code, "Final", "fail", 1])]);
+        assert!(harness.account().cooldown_until().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn gateway_429_stream_messages_use_route_codes_and_preserve_provider_events() {
+    for terminal in ["error", "response.failed", "response.incomplete"] {
+        let (capture, _subscriber) = LogCapture::install("info");
+        let mut fixture = Fixture::start().await;
+        let harness = Harness::start(&fixture, quota_config).await;
+        let call = harness.call().await;
+        let error = json!({"message":"Token Plan has been exhausted"});
+        let value = if terminal == "error" {
+            json!({"type":terminal,"error":error})
+        } else {
+            json!({"type":terminal,"response":{"error":error}})
+        };
+        let wire = format!("data: {value}\n\n").into_bytes();
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply {
+                status: 200,
+                headers: vec![("content-type".into(), "text/event-stream".into())],
+                body: wire.clone(),
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(decoded(&call.await.unwrap()).2, wire);
+        let failures: Vec<_> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line["message"] == "upstream failure")
+            .map(|line| json!([line["code"], line["class"], line["action"], line["attempt"]]))
+            .collect();
+        assert_eq!(
+            failures,
+            vec![json!(["provider_quota_exhausted", "Final", "fail", 1])]
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_429_burst_retries_after_two_seconds_then_succeeds() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let caller = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "x-symbiotic-request-id: synthetic-burst\r\n",
+        )
+        .await;
+    let sent = Instant::now();
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::rate(2))
+        .ok()
+        .unwrap();
+    harness
+        .health_where(|h| {
+            h["routes"][0]["retried_events"]["429"] == 1
+                && h["routes"][0]["waiting"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w["reason"] == "cooldown")
+        })
+        .await;
+    advance_clock(Duration::from_secs(1)).await;
+    assert!(fixture.incoming.try_recv().is_err());
+    advance_clock(Duration::from_secs(1)).await;
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert!(sent.elapsed() >= Duration::from_secs(2));
+    assert_eq!(decoded(&read(caller).await).2, Reply::json().body);
+}
+
+#[tokio::test]
+async fn gateway_429_throttle_stops_after_ten_total_attempts() {
+    let (capture, _subscriber) = LogCapture::install("info");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    // Do not start the caller read timeout until all simulated waits have elapsed.
+    let caller = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "x-symbiotic-request-id: synthetic-ten\r\n",
+        )
+        .await;
+    for attempt in 1..=10 {
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply::rate(1))
+            .ok()
+            .unwrap();
+        if attempt < 10 {
+            harness
+                .health_where(|h| {
+                    h["routes"][0]["retried_events"]["429"] == attempt
+                        && h["routes"][0]["waiting"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|w| w["reason"] == "cooldown")
+                })
+                .await;
+            advance_clock(Duration::from_secs(1)).await;
+        }
+    }
+    let (status, _, body) = decoded(&read(caller).await);
+    assert_eq!(
+        (status, body),
+        (429, br#"{"error":{"code":"upstream_status"}}"#.to_vec())
+    );
+    let decisions: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|l| l["message"] == "upstream failure")
+        .map(|l| json!([l["code"], l["action"], l["attempt"]]))
+        .collect();
+    let expected: Vec<_> = (1..=10)
+        .map(|n| json!(["429", if n == 10 { "fail" } else { "retry_same" }, n]))
+        .collect();
+    assert_eq!(decisions, expected);
+    assert!(fixture.incoming.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn gateway_429_message_rules_validate_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(dir.path());
+    quota_config(&mut settings);
+    assert!(settings.validate_routes().is_ok());
+    let route = serde_json::to_value(&settings.passthrough.routes[0]).unwrap();
+    let mut boundary = route.clone();
+    boundary["error_messages"] = json!(vec![
+        json!({"contains":"é".repeat(128),"code":"x".repeat(128)});
+        32
+    ]);
+    settings.passthrough.routes[0] = serde_json::from_value(boundary).unwrap();
+    assert!(settings.validate_routes().is_ok());
+    for entries in [
+        json!([{"contains":"","code":"quota"}]),
+        json!(vec![json!({"contains":"quota","code":"quota"}); 33]),
+        json!([{"contains":"x".repeat(257),"code":"quota"}]),
+        json!([{"contains":"quota","code":"x".repeat(129)}]),
+        json!([{"contains":"quota","code":"bad\ncode"}]),
+        json!([{"contains":"quota","code":""}]),
+    ] {
+        let mut invalid = route.clone();
+        invalid["error_messages"] = entries;
+        settings.passthrough.routes[0] = serde_json::from_value(invalid).unwrap();
+        assert!(matches!(
+            settings.validate_routes(),
+            Err(GatewayError::InvalidRequest)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn gateway_429_adaptive_concurrency_halves_held_accounts_and_recovers_to_ceiling() {
+    let (capture, _subscriber) = LogCapture::install("info");
+    let mut fixture = Fixture::start().await;
+    fixture.idle_timeout = Some(Duration::from_secs(30));
+    let harness = Harness::start(&fixture, |config| {
+        let route = &mut config.passthrough.routes[0];
+        route.max_in_flight = 4;
+        route.retry_policy.insert(
+            ErrorClass::Throttle,
+            RetryRule {
+                action: RetryAction::Fail,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
+        let mut shared = route.clone();
+        shared.name = "shared".into();
+        shared.path = "/v1/shared".into();
+        config.passthrough.routes.push(shared);
+    })
+    .await;
+    let mut held = std::collections::VecDeque::new();
+    for _ in 0..4 {
+        let caller = harness.connect("/v1/responses", b"{}", "").await;
+        held.push_back((caller, fixture.next().await));
+    }
+    // All four permits are held. Each failure applies to the account immediately.
+    for _ in 0..3 {
+        let (caller, upstream) = held.pop_front().unwrap();
+        upstream.reply.send(Reply::rate(0)).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).0, 429);
+    }
+    // A sibling route on this account must wait while one original holder remains.
+    let blocked = harness
+        .connect(
+            "/v1/shared",
+            b"{}",
+            "x-symbiotic-request-id: synthetic-adaptive\r\n",
+        )
+        .await;
+    harness
+        .health_where(|h| {
+            h["routes"][1]["waiting"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["request_id"] == "synthetic-adaptive" && w["reason"] == "slot")
+        })
+        .await;
+    assert!(fixture.incoming.try_recv().is_err());
+    let (caller, upstream) = held.pop_front().unwrap();
+    upstream.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(blocked).await).0, 200);
+    // The original holder and sibling completion count as the first two successes.
+    for _ in 2..10 {
+        let call = harness.call().await;
+        fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&call.await.unwrap()).0, 200);
+    }
+    for limit in 2..=4 {
+        for _ in 0..limit {
+            let caller = harness.connect("/v1/responses", b"{}", "").await;
+            held.push_back((caller, fixture.next().await));
+        }
+        let blocked = harness
+            .connect(
+                "/v1/shared",
+                b"{}",
+                "x-symbiotic-request-id: synthetic-adaptive\r\n",
+            )
+            .await;
+        harness
+            .health_where(|h| {
+                h["routes"][1]["waiting"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w["request_id"] == "synthetic-adaptive" && w["reason"] == "slot")
+            })
+            .await;
+        assert!(fixture.incoming.try_recv().is_err());
+        // Returning a permit admits a waiter without waiting for all holders to finish.
+        let (caller, upstream) = held.pop_front().unwrap();
+        upstream.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).0, 200);
+        fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&read(blocked).await).0, 200);
+        while let Some((caller, upstream)) = held.pop_front() {
+            upstream.reply.send(Reply::json()).ok().unwrap();
+            assert_eq!(decoded(&read(caller).await).0, 200);
+        }
+        for _ in (limit + 1)..10 {
+            let call = harness.call().await;
+            fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+            assert_eq!(decoded(&call.await.unwrap()).0, 200);
+        }
+    }
+    let changes: Vec<_> = capture
+        .lines()
+        .into_iter()
+        .filter(|line| line["message"] == "account concurrency changed")
+        .map(|line| json!([line["route"], line["account"], line["effective_limit"]]))
+        .collect();
+    assert_eq!(
+        changes,
+        [2, 1, 2, 3, 4].map(|n| json!(["responses", "account", n]))
+    );
+}
+
+#[tokio::test]
+async fn gateway_429_recovery_requires_ten_successes_after_latest_throttle() {
+    let (capture, _subscriber) = LogCapture::install("info");
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |config| {
+        config.passthrough.routes[0].max_in_flight = 4;
+        config.passthrough.routes[0].retry_policy.insert(
+            ErrorClass::Throttle,
+            RetryRule {
+                action: RetryAction::Fail,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
+    })
+    .await;
+    for successes_before_next_throttle in [9, 10] {
+        let call = harness.call().await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(Reply::rate(0))
+            .ok()
+            .unwrap();
+        assert_eq!(decoded(&call.await.unwrap()).0, 429);
+        for successes in 1..=successes_before_next_throttle {
+            let call = harness.call().await;
+            fixture.next().await.reply.send(Reply::json()).ok().unwrap();
+            assert_eq!(decoded(&call.await.unwrap()).0, 200);
+            let changes: Vec<_> = capture
+                .lines()
+                .into_iter()
+                .filter(|line| line["message"] == "account concurrency changed")
+                .map(|line| line["effective_limit"].clone())
+                .collect();
+            let expected = if successes_before_next_throttle == 9 {
+                vec![json!(2)]
+            } else if successes < 10 {
+                vec![json!(2), json!(1)]
+            } else {
+                vec![json!(2), json!(1), json!(2)]
+            };
+            assert_eq!(changes, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_429_new_session_waiter_takes_adaptive_permit_before_probe() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |config| {
+        config.passthrough.routes[0].new_session = Some(NewSessionConfig {
+            session_headers: vec!["session-id".into()],
+        });
+    })
+    .await;
+    let first = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "session-id: first\r\nx-symbiotic-request-id: synthetic-first\r\n",
+        )
+        .await;
+    fixture
+        .next()
+        .await
+        .reply
+        .send(Reply::rate(1))
+        .ok()
+        .unwrap();
+    harness
+        .health_where(|h| {
+            h["routes"][0]["waiting"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["request_id"] == "synthetic-first" && w["reason"] == "new_session")
+        })
+        .await;
+    let second = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "session-id: second\r\nx-symbiotic-request-id: synthetic-second\r\n",
+        )
+        .await;
+    harness
+        .health_where(|h| {
+            h["routes"][0]["waiting"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["request_id"] == "synthetic-second" && w["reason"] == "slot")
+        })
+        .await;
+    advance_clock(Duration::from_secs(1)).await;
+    let retry = fixture.next().await;
+    assert!(retry.head.contains("session-id: first\r\n"));
+    retry.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(first).await).2, Reply::json().body);
+    let next = fixture.next().await;
+    assert!(next.head.contains("session-id: second\r\n"));
+    next.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(second).await).2, Reply::json().body);
+}

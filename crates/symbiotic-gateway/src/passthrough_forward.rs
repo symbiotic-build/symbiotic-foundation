@@ -372,6 +372,9 @@ impl Passthrough {
             .get(&failure.code)
             .copied()
             .unwrap_or(failure.class);
+        if class == ErrorClass::Throttle {
+            route.retries.concurrency.outcome(true, &route.config)?;
+        }
         let context = RetryContext {
             class,
             code: failure.code.clone(),
@@ -513,6 +516,7 @@ impl Passthrough {
         );
         *buffered.body_mut() = Some(original.clone().into());
         let mut slot = None;
+        let mut concurrency = None;
         let mut authentication: Option<(HeaderMap, Option<LoginRequest>)> = None;
         loop {
             if self.records.closed(&route.config.account).await? {
@@ -537,6 +541,14 @@ impl Passthrough {
                 if hold.probing {
                     slot = None;
                 }
+            }
+            // Acquire before the session probe too: a probe holder must never wait
+            // for a permit held by a retry that needs that same probe.
+            if concurrency.is_none() {
+                let _entry = self.waiting(route, id, "slot")?;
+                wait.wait_started();
+                concurrency = Some(route.retries.concurrency.acquire().await?);
+                wait.waited(route, "slot");
             }
             let mut session = match self.session_permit(route, &key, id, wait).await {
                 Ok(Ok(p)) => p,
@@ -798,6 +810,7 @@ impl Passthrough {
                             AnswerOutcome::Complete => {
                                 finish(write).await?;
                                 route.retries.failures.store(0, Ordering::Release);
+                                route.retries.concurrency.outcome(false, &route.config)?;
                                 wait.outcome = "complete".into();
                                 return Ok(());
                             }
@@ -873,6 +886,10 @@ impl Passthrough {
                                 let message = failure_message(&value, &route.secrets().await)?;
                                 let (mut code, mut class) =
                                     ResponsesAdapter::http_failure(status, &bytes);
+                                if let Some(extended) = route.error_code(&value, false) {
+                                    code = extended.to_owned();
+                                    class = ResponsesAdapter::classify(Some(status), &code);
+                                }
                                 if status == 402
                                     && message.as_deref().is_some_and(|m| {
                                         m.to_ascii_lowercase().contains("insufficient balance")
@@ -881,25 +898,6 @@ impl Passthrough {
                                     code = model::DiagnosticCode::ProviderBalanceExhausted
                                         .code()
                                         .into();
-                                    class = ErrorClass::Final;
-                                }
-                                // Kimi Code reports account limits only in the message;
-                                // transient 429s must keep the adapter's retry classification.
-                                if status == 429
-                                    && message.as_deref().is_some_and(|message| {
-                                        [
-                                            "You've reached your 5-hour usage limit",
-                                            "You've reached your weekly (7-day) usage limit",
-                                            "You've reached your monthly usage limit for this billing cycle",
-                                            "Your credit balance is insufficient",
-                                            "Your organization's Extra Usage balance has run out",
-                                            "You've reached the Extra Usage limit set for your account by your organization",
-                                            "You've reached your concurrent request limit",
-                                        ]
-                                        .iter()
-                                        .any(|prefix| message.starts_with(prefix))
-                                    })
-                                {
                                     class = ErrorClass::Final;
                                 }
                                 Failure {
@@ -1048,6 +1046,7 @@ impl Passthrough {
                     wait.route = Some(route.config.name.clone());
                     slot = None;
                     authentication = None;
+                    concurrency = None;
                 }
                 RetryAction::RetrySame => {}
             }
@@ -1263,10 +1262,12 @@ impl Passthrough {
                     if wire.len() > route.config.max_held_event_bytes {
                         return Ok(AnswerOutcome::Terminated("max_held_event_bytes"));
                     }
+                    let extended = route.error_code(&event.record().value, true);
                     let next_failure = Failure {
                         status: 502,
-                        code: code.clone(),
-                        class: *kind,
+                        code: extended.unwrap_or(code).to_owned(),
+                        class: extended
+                            .map_or(*kind, |code| ResponsesAdapter::classify(None, code)),
                         headers: response.headers().clone(),
                         event: Some(wire),
                         message,
@@ -1376,4 +1377,41 @@ async fn error_body(response: &mut reqwest::Response, limit: usize) -> Result<Ve
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+impl Route {
+    /// Select provider code, then type, then the first configured message match.
+    /// Stream terminal errors nest under `response`; flat stream codes retain priority.
+    fn error_code<'a>(&'a self, value: &'a serde_json::Value, stream: bool) -> Option<&'a str> {
+        let error = if stream {
+            value
+                .pointer("/response/error")
+                .or_else(|| value.get("error"))
+        } else {
+            value.get("error")
+        };
+        let code = error
+            .and_then(|e| e.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                stream
+                    .then(|| value.get("code").and_then(serde_json::Value::as_str))
+                    .flatten()
+            });
+        // Message rules come before `error.type`: Kimi sends its quota and risk-control
+        // 429s with the generic type `rate_limit_error`, so only the message tells them apart.
+        code.or_else(|| {
+            let message = error?.get("message")?.as_str()?.to_lowercase();
+            self.config
+                .error_messages
+                .iter()
+                .find(|rule| message.contains(&rule.contains.to_lowercase()))
+                .map(|rule| rule.code.as_str())
+        })
+        .or_else(|| {
+            error
+                .and_then(|e| e.get("type"))
+                .and_then(serde_json::Value::as_str)
+        })
+    }
 }

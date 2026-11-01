@@ -61,10 +61,10 @@ pub(super) fn rule(policy: &RetryPolicy, class: ErrorClass) -> RetryRule {
         } else {
             RetryAction::RetrySame
         },
-        max_attempts: if class == ErrorClass::Server {
-            Some(3)
-        } else {
-            None
+        max_attempts: match class {
+            ErrorClass::Throttle => Some(10),
+            ErrorClass::Server => Some(3),
+            _ => None,
         },
         backoff: Default::default(),
     })
@@ -102,7 +102,7 @@ mod tests {
         };
         let mut policy = RetryPolicy::new();
         for (class, action, max) in [
-            (ErrorClass::Throttle, RetryAction::RetrySame, None),
+            (ErrorClass::Throttle, RetryAction::RetrySame, Some(10)),
             (ErrorClass::Network, RetryAction::RetrySame, None),
             (ErrorClass::Server, RetryAction::RetrySame, Some(3)),
             (ErrorClass::Final, RetryAction::Fail, None),
@@ -111,6 +111,21 @@ mod tests {
             let actual = decision(&policy, None, &context);
             assert_eq!((actual.action, actual.max_attempts), (action, max));
         }
+        context.class = ErrorClass::Throttle;
+        context.attempt = 10;
+        assert_eq!(decision(&policy, None, &context).action, RetryAction::Fail);
+        policy.insert(
+            ErrorClass::Throttle,
+            RetryRule {
+                action: RetryAction::RetrySame,
+                max_attempts: None,
+                backoff: Default::default(),
+            },
+        );
+        assert_eq!(
+            decision(&policy, None, &context).action,
+            RetryAction::RetrySame
+        );
         context.class = ErrorClass::Server;
         context.attempt = 3;
         assert_eq!(decision(&policy, None, &context).action, RetryAction::Fail);

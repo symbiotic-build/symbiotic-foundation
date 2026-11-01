@@ -1,4 +1,4 @@
-//! Bounded route-local session history and login-wide new-session hold.
+//! Account retry and concurrency state, route session history and login-wide new-session hold.
 use super::*;
 use std::collections::VecDeque;
 
@@ -43,9 +43,10 @@ impl SeenSessions {
         self.order.push_back((key, now));
     }
 }
-/// This state is shared by routes on the same login, never written to durable storage.
+/// Retry counts and concurrency share account scope; session admission shares the login.
 pub(super) struct AccountRetries {
     pub failures: Arc<std::sync::atomic::AtomicU32>,
+    pub concurrency: Arc<AccountConcurrency>,
     pub sessions: Arc<SessionAdmission>,
 }
 pub(super) struct SessionAdmission {
@@ -92,5 +93,88 @@ impl Route {
                 .contains(key)),
             None => Ok(false),
         }
+    }
+}
+
+/// An account's adaptive cap. Existing holders survive decreases; only new acquisitions wait.
+pub(super) struct AccountConcurrency {
+    ceiling: usize,
+    state: Mutex<ConcurrencyState>,
+    changes: tokio::sync::watch::Sender<()>,
+}
+struct ConcurrencyState {
+    limit: usize,
+    active: usize,
+    successes: u8,
+}
+pub(super) struct ConcurrencyPermit(Arc<AccountConcurrency>);
+impl AccountConcurrency {
+    pub(super) fn new(ceiling: usize) -> Self {
+        Self {
+            ceiling,
+            state: Mutex::new(ConcurrencyState {
+                limit: ceiling,
+                active: 0,
+                successes: 0,
+            }),
+            changes: tokio::sync::watch::channel(()).0,
+        }
+    }
+    pub(super) async fn acquire(self: &Arc<Self>) -> Result<ConcurrencyPermit> {
+        // Subscribe before checking capacity, so a release cannot be missed.
+        let mut changes = self.changes.subscribe();
+        loop {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| GatewayError::StateUnavailable)?;
+                if state.active < state.limit {
+                    state.active += 1;
+                    return Ok(ConcurrencyPermit(self.clone()));
+                }
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| GatewayError::StateUnavailable)?;
+        }
+    }
+    pub(super) fn outcome(&self, throttle: bool, route: &PassthroughRoute) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GatewayError::StateUnavailable)?;
+        let previous = state.limit;
+        if throttle {
+            state.limit = (state.limit / 2).max(1);
+            state.successes = 0;
+        } else {
+            state.successes += 1;
+            if state.successes == 10 {
+                state.limit = (state.limit + 1).min(self.ceiling);
+                state.successes = 0;
+            }
+        }
+        if state.limit != previous {
+            tracing::info!(
+                route = route.name,
+                account = route.account,
+                effective_limit = state.limit,
+                "account concurrency changed"
+            );
+            self.changes.send_replace(());
+        }
+        Ok(())
+    }
+}
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active -= 1;
+        self.0.changes.send_replace(());
     }
 }
