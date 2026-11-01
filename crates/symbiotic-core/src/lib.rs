@@ -6,12 +6,9 @@
 #[cfg(feature = "logging")]
 pub mod logging;
 
-pub mod campaign;
 pub mod decision;
 pub mod event;
-pub mod incident;
 pub mod retry;
-pub mod signal;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,6 +19,11 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Timestamp(pub String);
+
+/// Stable campaign identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CampaignId(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceId(pub String);
