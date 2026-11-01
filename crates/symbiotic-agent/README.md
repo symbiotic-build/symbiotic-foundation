@@ -84,6 +84,29 @@ Each request sends one `session-id` header, a random UUID fixed for the job, so 
 
 The model answers with tool calls, several in one answer. The runtime runs them in order and builds the next step. An answer with no tool call is an error result in the next step.
 
+### Tail text layout
+
+The tail uses LF newlines and this exact layout (angle-bracket values are replaced):
+
+```text
+Step <n> of <max_steps>; <left> steps left after this one.
+This is the last step. You must call finish.
+Notes
+<compact notes JSON>
+
+Result step <n> tool <JSON string of tool name> arguments <JSON string of original arguments>
+<result text>
+
+Error step <n> tool <JSON string of tool name> arguments <JSON string of original arguments>
+error: <reason>
+```
+
+The last-step line appears only on the final step. Each kept successful result
+gets a `Result` block in call order; kept errors follow in call order with `Error`
+blocks. Each block starts and ends with one added LF; result text stays verbatim.
+Names and argument text are JSON strings, so each header occupies one line.
+An answer with no tool call uses name `none` and argument text `{}`. Results and errors expire after `keep_results_steps`.
+
 ## Tools
 
 All tool schemas are strict. Optional arguments are nullable.
@@ -144,3 +167,11 @@ Paths are relative, slash-separated, and may not contain `..` or leave `--root`,
 - `2`: a model call failed.
 - `3`: the step budget was spent without a valid report.
 - `4`: the step log or notes record could not be written.
+
+## Build and test
+
+Use `cargo check --release --locked -p symbiotic-agent --all-targets` to compile.
+Run the fake-server integration tests with
+`cargo test --release --locked -p symbiotic-agent --test runtime`.
+Run schema and cap unit tests with
+`cargo test --release --locked -p symbiotic-agent --bins`.
