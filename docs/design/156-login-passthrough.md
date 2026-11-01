@@ -726,8 +726,12 @@ Verification: `chat_completions_and_get_model_listing_routes_validate_without_io
 `chat_completions_scrubs_credentials_split_across_provider_chunks`,
 `chat_completions_failure_after_first_byte_is_visible_even_with_retry_override`,
 `chat_completions_disconnect_before_first_byte_retries_original_request` and
-`chat_completions_get_model_listing_relays_json_with_scrubbing` and
-`chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after_restart`.
+`chat_completions_get_model_listing_relays_json_with_scrubbing`.
+
+The receipt-restart check `chat_completions_receipts_keep_numeric_usage_and_unknown_attempts_after_restart`
+was superseded by the removal of USD accounting in [#203](https://github.com/symbiotic-build/symbiotic-foundation/issues/203).
+The current restart check is
+`request_records_core_outage_survives_restart_and_drains_in_order`.
 
 ### Continue and join
 

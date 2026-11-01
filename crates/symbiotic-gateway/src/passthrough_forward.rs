@@ -81,6 +81,9 @@ pub(super) struct RequestLog {
     usage: Option<crate::records::Usage>,
     meter: crate::records::Meter,
     refused: bool,
+    record_pending: bool,
+    record_status: Option<u16>,
+    record_attempt: u32,
     // Start of the wait in progress, so cancellation still counts it.
     waiting_since: Option<Instant>,
 }
@@ -101,6 +104,9 @@ impl RequestLog {
             usage: None,
             meter: Default::default(),
             refused: false,
+            record_pending: true,
+            record_status: None,
+            record_attempt: 1,
             started_at: Instant::now(),
             outcome: "cancelled".into(),
             status: None,
@@ -118,6 +124,19 @@ impl RequestLog {
         };
         if let Some(model) = model.and_then(serde_json::Value::as_str) {
             self.model = model.to_owned();
+        }
+    }
+    fn json_usage(&mut self, value: &serde_json::Value, chat: bool) {
+        let trace = if chat {
+            ChatCompletionsAdapter::json_usage(value)
+        } else {
+            ResponsesAdapter::json_usage(value)
+        };
+        if let Some(usage) = trace
+            .ok()
+            .and_then(|trace| crate::records::Usage::new(&value["usage"], &trace))
+        {
+            self.usage = Some(usage);
         }
     }
     fn wait_started(&mut self) {
@@ -140,16 +159,24 @@ impl RequestLog {
         }
     }
 }
-impl Drop for RequestLog {
-    fn drop(&mut self) {
+impl RequestLog {
+    fn finish_record(&mut self) {
+        if !std::mem::replace(&mut self.record_pending, false) {
+            return;
+        }
         if let Some(records) = &self.records {
             let time = (records.clock)();
             let mut meter = std::mem::take(&mut self.meter);
             if let Some(reading) = records.balance(&self.account) {
                 meter.readings.push(reading);
             }
+            let request_id = if self.record_attempt == 1 {
+                self.request_id.clone()
+            } else {
+                format!("{}.{}", self.request_id, self.record_attempt)
+            };
             let record = crate::records::RequestRecord {
-                request_id: self.request_id.clone(),
+                request_id: request_id.clone(),
                 job_id: self
                     .request_id
                     .rsplit_once('-')
@@ -158,18 +185,17 @@ impl Drop for RequestLog {
                 account: self.account.clone(),
                 route: self.record_route.clone(),
                 model: self.model.clone(),
-                status: self.status.unwrap_or(502),
+                status: self
+                    .record_status
+                    .or_else(|| (self.attempts == 0).then_some(self.status).flatten())
+                    .unwrap_or(502),
                 time,
                 refused: self.refused.then_some("quota_exhausted"),
-                usage: if self.outcome == "complete" {
-                    self.usage.take()
-                } else {
-                    None
-                },
+                usage: self.usage.take(),
                 meter,
             };
             match serde_json::to_string(&record) {
-                Ok(body) => records.outbox.insert(self.request_id.clone(), body),
+                Ok(body) => records.outbox.insert(request_id, body),
                 Err(_) => tracing::error!(
                     code = "outbox_write_failed",
                     request_id = self.request_id,
@@ -177,6 +203,24 @@ impl Drop for RequestLog {
                 ),
             }
         }
+    }
+    fn prepare_record(&mut self, route: &Route, model: &str) {
+        if !self.record_pending {
+            self.record_pending = true;
+            self.record_status = None;
+            self.refused = false;
+            self.usage = None;
+            self.meter = Default::default();
+            self.record_attempt = self.attempts.saturating_add(1);
+        }
+        self.account = route.config.record_account();
+        self.record_route = route.config.name.clone();
+        self.model = model.to_owned();
+    }
+}
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        self.finish_record();
         // Cancellation can drop the future outside Instrument's polling scope.
         self.span.in_scope(|| {
             tracing::info!(
@@ -325,6 +369,9 @@ impl Passthrough {
         until: Option<DateTime<Utc>>,
     ) -> Result<()> {
         wait.outcome = code.into();
+        if wait.record_pending && wait.attempts < wait.record_attempt {
+            wait.record_status = Some(status);
+        }
         if !started {
             wait.status = Some(status);
         }
@@ -519,8 +566,9 @@ impl Passthrough {
         let mut concurrency = None;
         let mut authentication: Option<(HeaderMap, Option<LoginRequest>)> = None;
         loop {
-            if self.records.closed(&route.config.account).await? {
-                wait.refused = wait.attempts == 0;
+            wait.prepare_record(route, &request_model);
+            if self.records.closed(&wait.account).await? {
+                wait.refused = true;
                 return self
                     .local_error(write, started, 402, "quota_exhausted", wait, None)
                     .await;
@@ -709,7 +757,7 @@ impl Passthrough {
             let sent = grant
                 .start_checked(
                     || {
-                        if self.records.is_closed(&route.config.account).map_err(|_| {
+                        if self.records.is_closed(&wait.account).map_err(|_| {
                             model::ModelError::Queue(model::DiagnosticCode::QueueFailure)
                         })? {
                             quota_refused = true;
@@ -750,7 +798,7 @@ impl Passthrough {
             };
             let Some(sent) = sent else {
                 if quota_refused {
-                    wait.refused = wait.attempts == 0;
+                    wait.refused = true;
                     return self
                         .local_error(write, started, 402, "quota_exhausted", wait, None)
                         .await;
@@ -775,10 +823,11 @@ impl Passthrough {
             let failure = match sent {
                 Err(_) => Failure::network("network", None),
                 Ok(mut response) => {
-                    self.observed_headers(route, response.headers()).await?;
+                    wait.record_status = Some(response.status().as_u16());
                     wait.meter = crate::records::Meter::headers(response.headers());
+                    self.observed_headers(route, response.headers()).await?;
                     self.records
-                        .observe(&route.config.account, &wait.meter.readings, self.now());
+                        .observe(&wait.account, &wait.meter.readings, self.now());
                     let status = response.status().as_u16();
                     if status == 402 {
                         route.balance_refresh.notify_one();
@@ -812,6 +861,7 @@ impl Passthrough {
                             .await?
                         {
                             AnswerOutcome::Complete => {
+                                wait.finish_record();
                                 finish(write).await?;
                                 route.retries.failures.store(0, Ordering::Release);
                                 route.retries.concurrency.outcome(false, &route.config)?;
@@ -827,6 +877,17 @@ impl Passthrough {
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
+                        let body = error_body(&mut response, route.config.max_response_bytes).await;
+                        let value = body
+                            .as_ref()
+                            .ok()
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(bytes).ok()
+                            })
+                            .unwrap_or(serde_json::Value::Null);
+                        let chat = route.config.stream == StreamDialect::OpenaiChatCompletions;
+                        wait.report_model(&value, chat);
+                        wait.json_usage(&value, chat);
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
                             log.warn(
                                 "upstream_status",
@@ -855,6 +916,7 @@ impl Passthrough {
                                     None,
                                 );
                                 *injected = login_request.headers().clone();
+                                wait.finish_record();
                                 continue;
                             }
                             if !renewed {
@@ -878,15 +940,8 @@ impl Passthrough {
                                     .await;
                             }
                         }
-                        let body = error_body(&mut response, route.config.max_response_bytes).await;
                         match body {
                             Ok(bytes) => {
-                                let value = serde_json::from_slice::<serde_json::Value>(&bytes)
-                                    .unwrap_or(serde_json::Value::Null);
-                                wait.report_model(
-                                    &value,
-                                    route.config.stream == StreamDialect::OpenaiChatCompletions,
-                                );
                                 let message = failure_message(&value, &route.secrets().await)?;
                                 let (mut code, mut class) =
                                     ResponsesAdapter::http_failure(status, &bytes);
@@ -934,11 +989,15 @@ impl Passthrough {
                                     )
                                     .await;
                             }
-                            Err(_) => Failure::network("network", Some(&response_headers)),
+                            Err(_) => {
+                                wait.record_status = Some(502);
+                                Failure::network("network", Some(&response_headers))
+                            }
                         }
                     }
                 }
             };
+            wait.finish_record();
             let mut policy = route.config.retry_policy.clone();
             if let Some(named) = named {
                 policy.extend(named.clone());
@@ -1123,7 +1182,6 @@ impl Passthrough {
         };
         let mut adapter = ResponsesAdapter::default();
         let mut chat_adapter = ChatCompletionsAdapter::default();
-        let mut usage = None;
         let mut received = 0usize;
         let mut json = Vec::new();
         let mut failure: Option<Failure> = None;
@@ -1131,6 +1189,7 @@ impl Passthrough {
             let next = match response.chunk().await {
                 Ok(c) => c,
                 Err(_) => {
+                    wait.record_status = Some(502);
                     return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
                         Failure::network("upstream_disconnect", Some(response.headers()))
                     })));
@@ -1152,10 +1211,13 @@ impl Passthrough {
                                 usage: reported,
                                 ..
                             } => {
-                                usage =
+                                wait.usage =
                                     crate::records::Usage::new(&record.value["usage"], &reported);
                             }
-                            ItemEvent::Error { code, kind, .. } => {
+                            ItemEvent::Error {
+                                record, code, kind, ..
+                            } => {
+                                wait.json_usage(&record.value, true);
                                 return Ok(AnswerOutcome::Failure(Failure {
                                     status: 502,
                                     code,
@@ -1182,9 +1244,10 @@ impl Passthrough {
                         wait.report_model(&value, false);
                         // Recording never fails a call: unreadable usage is recorded as absent.
                         if route.config.method == PassthroughMethod::Post {
-                            usage = ResponsesAdapter::json_usage(&value).ok().and_then(|trace| {
-                                crate::records::Usage::new(&value["usage"], &trace)
-                            });
+                            wait.usage =
+                                ResponsesAdapter::json_usage(&value).ok().and_then(|trace| {
+                                    crate::records::Usage::new(&value["usage"], &trace)
+                                });
                         }
                     }
                     if let Some(scrubber) = &mut scrubber {
@@ -1198,9 +1261,9 @@ impl Passthrough {
                         *started = true;
                     }
                     chunk(write, &json).await?;
-                    wait.usage = usage;
                     return Ok(AnswerOutcome::Complete);
                 }
+                wait.record_status = Some(502);
                 return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
                     Failure::network("upstream_disconnect", Some(response.headers()))
                 })));
@@ -1239,16 +1302,23 @@ impl Passthrough {
                         &record.value["response"]["usage"]
                     };
                     if let Some(reported) = crate::records::Usage::new(raw, trace) {
-                        usage = Some(reported);
+                        wait.usage = Some(reported);
                     }
                 }
                 if let ItemEvent::Error { code, kind, .. } = &event {
-                    if !chat {
-                        join.add_usage(
-                            &ResponsesAdapter::event_usage(&event)
-                                .map_err(|_| GatewayError::InvalidProviderJson)?,
-                        )
-                        .map_err(|_| GatewayError::InvalidProviderJson)?;
+                    if chat {
+                        wait.json_usage(&event.record().value, true);
+                    } else {
+                        let trace = ResponsesAdapter::event_usage(&event)
+                            .map_err(|_| GatewayError::InvalidProviderJson)?;
+                        if let Some(usage) = crate::records::Usage::new(
+                            &event.record().value["response"]["usage"],
+                            &trace,
+                        ) {
+                            wait.usage = Some(usage);
+                        }
+                        join.add_usage(&trace)
+                            .map_err(|_| GatewayError::InvalidProviderJson)?;
                     }
                     let terminal = chat
                         || matches!(
@@ -1324,7 +1394,6 @@ impl Passthrough {
                     chunk(write, &clean).await?;
                 }
                 if completed {
-                    wait.usage = usage;
                     return Ok(AnswerOutcome::Complete);
                 }
             }

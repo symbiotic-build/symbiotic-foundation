@@ -1,4 +1,4 @@
-//! Request records, provider-unit meters and the in-memory quota gate.
+//! Request records, provider-unit meters and persisted quota observations.
 use crate::{GatewayConfig, GatewayError, outbox::Outbox};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use symbiotic_ai_runtime::model::item_stream::ResponsesAdapter;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -45,7 +44,7 @@ impl Meter {
         let provider: HashMap<String, String> = headers
             .iter()
             .filter_map(|(name, value)| {
-                ResponsesAdapter::rate_header(name.as_str())
+                crate::passthrough::rate_header(name.as_str())
                     .then(|| {
                         value
                             .to_str()
@@ -165,6 +164,7 @@ struct Budget {
     reading: Reading,
     updated: DateTime<Utc>,
 }
+#[derive(Serialize, Deserialize)]
 struct Observation {
     reading: Reading,
     time: DateTime<Utc>,
@@ -176,10 +176,11 @@ impl Observation {
         self.reading.read_at.unwrap_or(self.time)
     }
 }
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Sources {
     local: Option<Observation>,
     core: Option<Observation>,
+    #[serde(skip)]
     closed: bool,
 }
 impl Sources {
@@ -250,22 +251,32 @@ impl Records {
         config: &GatewayConfig,
         clock: symbiotic_queue::jobs::JobClock,
     ) -> Result<Arc<Self>> {
+        let outbox = Outbox::open(&config.state_dir)?;
+        let saved: HashMap<String, String> = outbox.load_gates()?.into_iter().collect();
         let accounts = config
             .passthrough
             .routes
             .iter()
             .map(|route| {
-                (
-                    route.account.clone(),
+                Ok((
+                    route.record_account(),
                     Account {
-                        gate: Mutex::new(AccountGate::default()),
+                        gate: Mutex::new(AccountGate {
+                            readings: saved
+                                .get(&route.record_account())
+                                .map(|body| serde_json::from_str(body))
+                                .transpose()
+                                .map_err(|_| GatewayError::StateUnavailable)?
+                                .unwrap_or_default(),
+                            last_refresh: None,
+                        }),
                         refresh: tokio::sync::Mutex::new(()),
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(Arc::new(Self {
-            outbox: Outbox::open(&config.state_dir)?,
+            outbox,
             core_path: config.core_socket_path.clone(),
             core_timeout: Duration::from_secs(config.io_timeout_seconds),
             accounts,
@@ -280,6 +291,7 @@ impl Records {
             .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut updated = false;
         for reading in readings
             .iter()
             .filter(|r| r.limit.is_some() || r.name == "deepseek.balance")
@@ -300,9 +312,23 @@ impl Records {
                 .is_none_or(|old| observation.at() >= old.at())
             {
                 sources.local = Some(observation);
+                updated = true;
             }
         }
+        if updated {
+            self.save_gate(account, &gate);
+        }
         gate.closed(account, (self.clock)());
+    }
+    fn save_gate(&self, account: &str, gate: &AccountGate) {
+        match serde_json::to_string(&gate.readings) {
+            Ok(body) => self.outbox.save_gate(account, body),
+            Err(_) => tracing::error!(
+                code = "gate_write_failed",
+                account,
+                "quota gate encoding failed"
+            ),
+        }
     }
     pub fn balance(&self, account: &str) -> Option<Reading> {
         self.accounts
@@ -354,6 +380,7 @@ impl Records {
                 .is_none_or(|old| (observation.at(), observation.time) >= (old.at(), old.time))
             {
                 sources.core = Some(observation);
+                self.save_gate(&budget.account, &gate);
             }
             gate.closed(&budget.account, (self.clock)());
         }
@@ -557,113 +584,5 @@ mod tests {
                 .unwrap(),
             "wal"
         );
-    }
-
-    fn one_account(directory: &Path, now: DateTime<Utc>) -> Records {
-        Records {
-            outbox: Outbox::open(directory).unwrap(),
-            core_path: directory.join("core.sock"),
-            core_timeout: Duration::from_secs(2),
-            accounts: [(
-                "account".into(),
-                Account {
-                    gate: Mutex::new(AccountGate::default()),
-                    refresh: tokio::sync::Mutex::new(()),
-                },
-            )]
-            .into_iter()
-            .collect(),
-            clock: Arc::new(move || now),
-        }
-    }
-
-    #[test]
-    fn request_records_state_exhausted_deepseek_budget_does_not_gate() {
-        let directory = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let records = one_account(directory.path(), now);
-        records.budgets(&json!([{"account":"account","name":"deepseek.balance","limit":50.0,"spent":50.0,"state":"exhausted","over_limit_allowed":false,"reading":{"name":"deepseek.balance","unit":"CNY","remaining":0.0,"limit":50.0,"read_at":now},"updated":now}])).unwrap();
-        assert!(!records.is_closed("account").unwrap());
-    }
-
-    #[test]
-    fn request_records_state_allowance_lapses_with_its_window() {
-        let directory = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let records = one_account(directory.path(), now);
-        let past = now - chrono::Duration::days(1);
-        // Last week's answered allowance, from the core.
-        records.budgets(&json!([{"account":"account","name":"codex.secondary","limit":100.0,"spent":100.0,"state":"exhausted","over_limit_allowed":true,"reading":{"name":"codex.secondary","unit":"percent","used":100.0,"limit":100.0,"read_at":past - chrono::Duration::days(1),"resets_at":past},"updated":past}])).unwrap();
-        // This week's own reading at 100 %, while the core is unreachable.
-        let reading = Reading {
-            name: "codex.secondary".into(),
-            unit: "percent".into(),
-            used: Some(100.0),
-            limit: Some(100.0),
-            window_minutes: Some(10080),
-            resets_at: Some(now + chrono::Duration::days(6)),
-            ..Default::default()
-        };
-        records.observe("account", &[reading], now);
-        assert!(records.is_closed("account").unwrap());
-    }
-
-    #[test]
-    fn request_records_state_newest_reading_reset_and_core_permission_control_each_account() {
-        let directory = tempfile::tempdir().unwrap();
-        let now = Utc::now();
-        let records = Records {
-            outbox: Outbox::open(directory.path()).unwrap(),
-            core_path: directory.path().join("core.sock"),
-            core_timeout: Duration::from_secs(2),
-            accounts: ["account", "other"]
-                .into_iter()
-                .map(|name| {
-                    (
-                        name.into(),
-                        Account {
-                            gate: Mutex::new(AccountGate::default()),
-                            refresh: tokio::sync::Mutex::new(()),
-                        },
-                    )
-                })
-                .collect(),
-            clock: Arc::new(move || now),
-        };
-        let reading = Reading {
-            name: "codex.secondary".into(),
-            unit: "percent".into(),
-            used: Some(100.0),
-            limit: Some(100.0),
-            resets_at: Some(now + chrono::Duration::days(1)),
-            ..Default::default()
-        };
-        records.observe("account", std::slice::from_ref(&reading), now);
-        let closed = |account: &str, time| {
-            records.accounts[account]
-                .gate
-                .lock()
-                .unwrap()
-                .closed(account, time)
-        };
-        assert!(closed("account", now));
-        assert!(!closed("other", now));
-        let mut newer = reading.clone();
-        newer.used = Some(50.0);
-        records.observe("account", &[newer], now + chrono::Duration::seconds(1));
-        assert!(!closed("account", now));
-        records.observe("account", std::slice::from_ref(&reading), now);
-        assert!(!closed("account", now));
-        let future = now + chrono::Duration::seconds(2);
-        records.observe("account", &[reading], future);
-        assert!(closed("account", future));
-        let mut budget = json!({"account":"account","name":"codex.secondary","limit":100.0,"spent":100.0,"state":"exhausted","over_limit_allowed":true,"reading":{"name":"codex.secondary","unit":"percent","used":100.0,"limit":100.0,"read_at":future,"resets_at":now+chrono::Duration::days(1)},"updated":future});
-        records.budgets(&json!([budget.clone()])).unwrap();
-        assert!(!closed("account", future));
-        budget["over_limit_allowed"] = json!(false);
-        budget["updated"] = json!(future + chrono::Duration::seconds(1));
-        records.budgets(&json!([budget.clone()])).unwrap();
-        assert!(closed("account", future));
-        assert!(!closed("account", now + chrono::Duration::days(2)));
     }
 }

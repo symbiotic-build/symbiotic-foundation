@@ -199,7 +199,7 @@ impl Passthrough {
                     ..Default::default()
                 };
                 self.records.observe(
-                    &route.config.account,
+                    &route.config.record_account(),
                     std::slice::from_ref(&reading),
                     self.now(),
                 );
