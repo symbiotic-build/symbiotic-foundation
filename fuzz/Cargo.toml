@@ -1,0 +1,23 @@
+[package]
+name = "symbiotic-foundation-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+symbiotic-model = { path = "../crates/symbiotic-model", default-features = false }
+
+# Its own workspace: the fuzz build needs nightly sanitizer flags the main workspace never uses.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "responses_stream"
+path = "fuzz_targets/responses_stream.rs"
+test = false
+doc = false
+bench = false
