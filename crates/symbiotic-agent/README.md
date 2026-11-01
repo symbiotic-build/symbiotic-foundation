@@ -109,11 +109,11 @@ An answer with no tool call uses name `none` and argument text `{}`. Results and
 
 ## Tools
 
-All tool schemas are strict. Optional arguments are nullable.
+Tool schemas are strict except `finish`, whose Warden-supplied report schema may exceed the provider's strict subset and is checked by the runtime. Optional arguments are nullable.
 
 - `read {path, start, end}`: lines `start` to `end` of one file, inclusive, numbered. At most `read_max_lines` lines; a longer range is cut and says so.
-- `search {pattern, path, max_hits}`: a regular-expression search over the files under `path` (null: the whole root). Hits are `path:line: text`, at most `min(max_hits, search_max_hits)`. Files with a NUL byte in their first 8 KiB and `.git` directories are skipped.
-- `list {path}`: the entries of one directory, sorted, directories ending in `/`.
+- `search {pattern, path, max_hits}`: a regular-expression search over the files under `path` (null: the whole root). Hits are `path:line: text`, at most `min(max_hits, search_max_hits)`. Files with a NUL byte in their first 8 KiB, non-UTF-8 files, special files (including sockets, FIFOs and dangling links), unreadable files and directories, and `.git` directories are skipped. Missing or out-of-root starting paths remain errors.
+- `list {path}`: the entries of one directory (null: the root), sorted, directories ending in `/`.
 - `note {kind, text, refs}`: adds one notes item and returns its id. `kind` is `covered`, `finding`, `question` or `plan`. `refs` is a list of `{path, ranges}` with inclusive `[start, end]` line ranges.
 - `note_drop {id}`: removes one notes item.
 - `finish {report}`: ends the job with a report.

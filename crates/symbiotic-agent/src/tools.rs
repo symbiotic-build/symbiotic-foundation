@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -46,7 +47,8 @@ struct Search {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct List {
-    path: String,
+    #[serde(deserialize_with = "crate::policy::present")]
+    path: Option<String>,
 }
 
 pub(crate) fn arguments<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
@@ -112,8 +114,12 @@ impl Tools {
     }
 
     fn list(&self, args: List) -> Result<String, String> {
+        let path = match args.path {
+            Some(path) => self.resolve(&path)?,
+            None => self.root.clone(),
+        };
         let mut names = Vec::new();
-        for entry in fs::read_dir(self.resolve(&args.path)?).map_err(|e| e.to_string())? {
+        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry
                 .file_name()
@@ -165,18 +171,31 @@ impl Tools {
         hits: &mut Vec<String>,
         ancestors: &mut HashSet<PathBuf>,
     ) -> Result<(), String> {
-        if path.is_dir() {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.is_dir() {
             if path.file_name().is_some_and(|name| name == ".git")
                 || relative.rsplit('/').next() == Some(".git")
             {
                 return Ok(());
             }
+            let entries = match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
             let canonical = fs::canonicalize(path).map_err(|e| e.to_string())?;
             if !ancestors.insert(canonical.clone()) {
                 return Ok(());
             }
-            let mut entries = fs::read_dir(path)
-                .map_err(|e| e.to_string())?
+            let mut entries = entries
+                .filter_map(|entry| match entry {
+                    Err(error) if error.kind() == ErrorKind::PermissionDenied => None,
+                    entry => Some(entry),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             entries.sort_by_key(|entry| entry.file_name());
@@ -190,7 +209,18 @@ impl Tools {
                 } else {
                     format!("{relative}/{name}")
                 };
-                let resolved = fs::canonicalize(entry.path()).map_err(|e| e.to_string())?;
+                let resolved = match fs::canonicalize(entry.path()) {
+                    Ok(resolved) => resolved,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::PermissionDenied | ErrorKind::NotFound
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
                 if !resolved.starts_with(&self.root) {
                     continue;
                 }
@@ -200,12 +230,18 @@ impl Tools {
                 }
             }
             ancestors.remove(&canonical);
-        } else if path.is_file() {
-            let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        } else if metadata.is_file() {
+            let bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
+                Err(error) => return Err(error.to_string()),
+            };
             if bytes[..bytes.len().min(8192)].contains(&0) {
                 return Ok(());
             }
-            let text = std::str::from_utf8(&bytes).map_err(|e| format!("{relative}: {e}"))?;
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return Ok(());
+            };
             for (index, line) in text.lines().enumerate() {
                 if pattern.is_match(line) {
                     hits.push(format!("{relative}:{}: {line}", index + 1));
@@ -214,8 +250,6 @@ impl Tools {
                     }
                 }
             }
-        } else {
-            return Err(format!("{relative}: not a regular file or directory"));
         }
         Ok(())
     }
@@ -250,14 +284,14 @@ pub(crate) fn definitions(report_schema: &Value, final_step: bool) -> Vec<Functi
             ),
             (
                 "list",
-                "List sorted directory entries.",
-                object(json!({"path":{"type":"string"}})),
+                "List sorted directory entries; null path lists the root.",
+                object(json!({"path":{"type":["string","null"]}})),
             ),
             (
                 "note",
                 "Add a note with syntactically checked references.",
                 object(
-                    json!({"kind":{"type":"string","enum":["covered","finding","question","plan"]},"text":{"type":"string"},"refs":{"type":"array","items":object(json!({"path":{"type":"string"},"ranges":{"type":"array","items":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}}}))}}),
+                    json!({"kind":{"type":"string","enum":["covered","finding","question","plan"]},"text":{"type":"string"},"refs":{"type":"array","items":object(json!({"path":{"type":"string"},"ranges":{"type":"array","items":{"type":"array","items":{"type":"integer"}}}}))}}),
                 ),
             ),
             (
@@ -278,7 +312,7 @@ pub(crate) fn definitions(report_schema: &Value, final_step: bool) -> Vec<Functi
         name: "finish".into(),
         description: "Finish the job with a valid report.".into(),
         parameters: object(json!({"report":report_schema})),
-        strict: true,
+        strict: false,
     });
     tools
 }
@@ -316,6 +350,148 @@ pub(crate) fn cap(text: &str, limit: usize) -> Capped {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy() -> Policy {
+        serde_json::from_value(json!({"model":"test","reasoning_effort":null,"max_output_tokens":null,"max_steps":2,"read_max_lines":2,"reads_per_step":8,"tool_output_max_chars":1000,"search_max_hits":10,"outline":null})).unwrap()
+    }
+
+    #[test]
+    fn list_with_null_path_returns_sorted_root_entries() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("z.txt"), "last").unwrap();
+        fs::create_dir(root.path().join("a")).unwrap();
+        fs::write(root.path().join("b.txt"), "middle").unwrap();
+        let tools = Tools::new(root.path()).unwrap();
+        assert_eq!(
+            tools.run("list", r#"{"path":null}"#, &policy()).unwrap(),
+            "a/\nb.txt\nz.txt"
+        );
+    }
+
+    #[test]
+    fn search_skips_non_utf8_and_special_files_and_returns_text_hits() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a-invalid.txt"), b"needle\xff").unwrap();
+        #[cfg(unix)]
+        {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(root.path().join("b-fifo"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            std::os::unix::fs::symlink("missing", root.path().join("d-dangling")).unwrap();
+        }
+        fs::write(root.path().join("z-text.txt"), "needle text\n").unwrap();
+        let tools = Tools::new(root.path()).unwrap();
+        assert_eq!(
+            tools
+                .run(
+                    "search",
+                    r#"{"pattern":"needle","path":null,"max_hits":null}"#,
+                    &policy()
+                )
+                .unwrap(),
+            "z-text.txt:1: needle text"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_skips_unreadable_files_and_directories_and_returns_text_hits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a-unreadable.txt");
+        let directory = root.path().join("b-unreadable");
+        fs::write(&file, "needle unreadable").unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("hidden.txt"), "needle hidden").unwrap();
+        fs::write(root.path().join("z-text.txt"), "needle text\n").unwrap();
+        let file_permissions = fs::metadata(&file).unwrap().permissions();
+        let directory_permissions = fs::metadata(&directory).unwrap().permissions();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o0)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o0)).unwrap();
+        let tools = Tools::new(root.path()).unwrap();
+        let result = tools.run(
+            "search",
+            r#"{"pattern":"needle","path":null,"max_hits":null}"#,
+            &policy(),
+        );
+        fs::set_permissions(&file, file_permissions).unwrap();
+        fs::set_permissions(&directory, directory_permissions).unwrap();
+        assert_eq!(result.unwrap(), "z-text.txt:1: needle text");
+    }
+
+    #[test]
+    fn search_refuses_missing_or_outside_starting_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(directory.path().join("outside"), "needle outside").unwrap();
+        let tools = Tools::new(&root).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path().join("outside"), root.join("link"))
+                .unwrap();
+        }
+        for path in ["missing", "../outside", "link"] {
+            assert!(
+                tools
+                    .run(
+                        "search",
+                        &json!({"pattern":"needle","path":path,"max_hits":null}).to_string(),
+                        &policy()
+                    )
+                    .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_tools_use_strict_schemas_except_finish() {
+        use symbiotic_model::responses::{ResponsesRequest, ToolChoice};
+
+        let schema = json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["items"]});
+        for final_step in [false, true] {
+            let request = ResponsesRequest {
+                model: "test".into(),
+                instructions: "Return a report.".into(),
+                input: Vec::new(),
+                tools: definitions(&schema, final_step),
+                tool_choice: if final_step {
+                    ToolChoice::Required
+                } else {
+                    ToolChoice::Auto
+                },
+                parallel_tool_calls: true,
+                reasoning_effort: None,
+                max_output_tokens: None,
+            };
+            let body: Value = serde_json::from_slice(&request.encode().unwrap()).unwrap();
+            let flags: Vec<_> = body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| json!({"name":tool["name"],"strict":tool["strict"]}))
+                .collect();
+            let expected = if final_step {
+                json!([{"name":"finish","strict":false}])
+            } else {
+                json!([
+                    {"name":"read","strict":true},
+                    {"name":"search","strict":true},
+                    {"name":"list","strict":true},
+                    {"name":"note","strict":true},
+                    {"name":"note_drop","strict":true},
+                    {"name":"finish","strict":false}
+                ])
+            };
+            assert_eq!(json!(flags), expected);
+        }
+    }
 
     #[test]
     fn cut_marker_counts_unicode_scalars_and_preserves_whole_characters() {
