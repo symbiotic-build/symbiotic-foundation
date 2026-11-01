@@ -93,10 +93,12 @@ none. It still halves the account's adaptive concurrency limit.
 Each account scope shares one memory-only adaptive concurrency limit across its
 routes. It starts at `max_in_flight`, which remains its ceiling. Waiters get
 permits in arrival order. A request acquires its adaptive permit after any
-new-session hold or probe wait and before runtime account admission, and holds it
-through retries until the response ends. A new-session request gives its permit
-back before it waits for a hold or probe again, so a new-session refusal never
-blocks sessions already admitted. Permit waiting uses the existing `slot` wait log
+new-session hold or probe wait and before runtime account admission, and holds it,
+with its runtime slot, through pacing waits and retries until the response ends. A
+new-session request gives back its permit and its slot together only when it must
+wait for a hold or the probe, so a new-session refusal never blocks sessions
+already admitted, and no request waits for a permit while holding the slot another
+waiter needs. Permit waiting uses the existing `slot` wait log
 and health entry. A classified `throttle` halves the limit, rounding down with a
 floor of one, even when retry policy says fail. Existing holders keep their permits;
 the permits they return pay off the part of the decrease that could not take effect at once.

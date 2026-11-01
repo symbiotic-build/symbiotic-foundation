@@ -3972,47 +3972,119 @@ async fn gateway_429_recovery_requires_ten_successes_after_latest_throttle() {
     }
 }
 
+async fn waiting_ids(harness: &Harness, ids: &[&str]) {
+    harness
+        .health_where(|h| {
+            let waiting = h["routes"][0]["waiting"].as_array().unwrap();
+            ids.iter()
+                .all(|id| waiting.iter().any(|w| w["request_id"] == *id))
+        })
+        .await;
+}
+
 #[tokio::test]
-async fn gateway_429_adaptive_waiters_take_permits_in_arrival_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let route = config(dir.path()).passthrough.routes.remove(0);
-    let limit = Arc::new(session::AccountConcurrency::new(4));
-    let mut held = Vec::new();
-    for _ in 0..4 {
-        held.push(limit.acquire().await.unwrap());
+async fn gateway_429_adaptive_waiters_reach_the_provider_in_arrival_order() {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |_| {}).await;
+    let call = |name: &'static str| {
+        let harness = &harness;
+        async move {
+            harness
+                .connect(
+                    "/v1/responses",
+                    format!("{{\"n\":\"{name}\"}}").as_bytes(),
+                    &format!("x-symbiotic-request-id: synthetic-{name}\r\n"),
+                )
+                .await
+        }
+    };
+    // Two requests hold the two permits of `max_in_flight` 2.
+    let a = call("a").await;
+    let a_sent = fixture.next().await;
+    let b = call("b").await;
+    let b_sent = fixture.next().await;
+    // A throttle halves the limit to 1 while both permits are held.
+    a_sent.reply.send(Reply::rate(1)).ok().unwrap();
+    harness
+        .health_where(|h| h["routes"][0]["retried_events"]["429"] == 1)
+        .await;
+    let mut queued = Vec::new();
+    for name in ["c", "d", "e"] {
+        queued.push((name, call(name).await));
+        waiting_ids(&harness, &[&format!("synthetic-{name}")]).await;
     }
-    // Two throttles take 4 to 2 to 1 while every permit is held.
-    limit.outcome(true, &route).unwrap();
-    limit.outcome(true, &route).unwrap();
-    let (sent, mut order) = mpsc::unbounded_channel();
-    let mut waiters = Vec::new();
-    for name in ["a", "b", "c"] {
-        let (limit, sent) = (limit.clone(), sent.clone());
-        let (release, released) = oneshot::channel::<()>();
-        waiters.push((
-            release,
-            tokio::spawn(async move {
-                let _permit = limit.acquire().await.unwrap();
-                sent.send(name).unwrap();
-                let _ = released.await;
-            }),
-        ));
-        // Let each waiter queue before the next one arrives.
-        tokio::task::yield_now().await;
+    // B's returned permit pays off the decrease, so nothing is freed yet.
+    b_sent.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(b).await).0, 200);
+    advance_clock(Duration::from_secs(1)).await;
+    let retry = fixture.next().await;
+    assert_eq!(retry.body, br#"{"n":"a"}"#);
+    retry.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(a).await).0, 200);
+    for (name, caller) in queued {
+        let sent = fixture.next().await;
+        assert_eq!(sent.body, format!("{{\"n\":\"{name}\"}}").as_bytes());
+        // One permit remains, so the next waiter has not been sent yet.
+        assert!(fixture.incoming.try_recv().is_err());
+        sent.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).0, 200);
     }
-    // Returning the four permits pays off three; one remains for the first waiter.
-    held.clear();
-    assert_eq!(order.recv().await, Some("a"));
-    tokio::task::yield_now().await;
-    assert!(order.try_recv().is_err());
-    for (expected, (release, task)) in ["b", "c"].into_iter().zip(waiters.drain(..2)) {
-        release.send(()).unwrap();
-        task.await.unwrap();
-        assert_eq!(order.recv().await, Some(expected));
+}
+
+async fn queued_session_waits_while_new_session_retries(paced: bool) {
+    let mut fixture = Fixture::start().await;
+    let harness = Harness::start(&fixture, |config| {
+        let route = &mut config.passthrough.routes[0];
+        route.max_in_flight = 1;
+        route.new_session = Some(NewSessionConfig {
+            session_headers: vec!["session-id".into()],
+        });
+        if paced {
+            route.requests_per_minute = Some(1);
+        }
+    })
+    .await;
+    let a = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "session-id: a\r\nx-symbiotic-request-id: synthetic-a\r\n",
+        )
+        .await;
+    let a_sent = fixture.next().await;
+    // B queues for the account while A, a session not yet admitted, is in flight.
+    let b = harness
+        .connect(
+            "/v1/responses",
+            b"{}",
+            "session-id: b\r\nx-symbiotic-request-id: synthetic-b\r\n",
+        )
+        .await;
+    waiting_ids(&harness, &["synthetic-b"]).await;
+    // A server failure retries on the same route; with pacing, the resend also waits.
+    a_sent.reply.send(Reply::status(503)).ok().unwrap();
+    advance_clock(Duration::from_secs(if paced { 61 } else { 2 })).await;
+    let retry = fixture.next().await;
+    assert!(retry.head.contains("session-id: a\r\n"));
+    retry.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(a).await).0, 200);
+    if paced {
+        advance_clock(Duration::from_secs(61)).await;
     }
-    let (release, task) = waiters.pop().unwrap();
-    release.send(()).unwrap();
-    task.await.unwrap();
+    let next = fixture.next().await;
+    assert!(next.head.contains("session-id: b\r\n"));
+    next.reply.send(Reply::json()).ok().unwrap();
+    assert_eq!(decoded(&read(b).await).0, 200);
+}
+
+#[tokio::test]
+async fn gateway_429_new_session_retry_keeps_its_permits_while_others_queue() {
+    queued_session_waits_while_new_session_retries(false).await;
+}
+
+#[tokio::test]
+async fn gateway_429_new_session_paced_retry_keeps_its_permits_while_others_queue() {
+    queued_session_waits_while_new_session_retries(true).await;
 }
 
 #[tokio::test]

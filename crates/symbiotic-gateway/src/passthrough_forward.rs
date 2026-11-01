@@ -260,6 +260,7 @@ impl Passthrough {
         key: &Option<Vec<Option<Vec<u8>>>>,
         id: Option<&str>,
         wait: &mut RequestLog,
+        release: &mut (dyn FnMut() + Send),
     ) -> Result<std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, DateTime<Utc>>> {
         let mut changes = route.retries.sessions.changes.subscribe();
         loop {
@@ -287,6 +288,7 @@ impl Passthrough {
                 if budget == Some(Duration::ZERO) {
                     return Ok(Err(until));
                 }
+                release();
                 self.pause(
                     route,
                     id,
@@ -301,6 +303,7 @@ impl Passthrough {
             if !probing {
                 return Ok(Ok(None));
             }
+            release();
             let _entry = self.waiting(route, id, "new_session")?;
             wait.wait_started();
             let permit = tokio::select! {
@@ -579,24 +582,18 @@ impl Passthrough {
                     .await;
             }
             let key = route.session_key(request);
-            if route.is_new(&key)? {
-                let hold = route
-                    .retries
-                    .sessions
-                    .state
-                    .lock()
-                    .map_err(|_| GatewayError::StateUnavailable)?;
-                if hold.probing {
-                    slot = None;
-                }
-            }
-            // A new session waits for its hold or probe without an adaptive permit, so a
-            // new-session refusal never blocks sessions already admitted, and a probe holder
-            // never waits for a permit held by a request that waits for that probe.
-            if route.is_new(&key)? {
+            // A new session gives back its runtime slot and adaptive permit together, and
+            // only when it actually waits for a hold or the probe. Sessions already admitted
+            // keep moving during the hold, a probe holder never waits for permits held by a
+            // request that waits for that probe, and pacing or ordinary retries keep both.
+            let mut release = || {
+                slot = None;
                 concurrency = None;
-            }
-            let mut session = match self.session_permit(route, &key, id, wait).await {
+            };
+            let mut session = match self
+                .session_permit(route, &key, id, wait, &mut release)
+                .await
+            {
                 Ok(Ok(p)) => p,
                 Ok(Err(until)) => {
                     return self

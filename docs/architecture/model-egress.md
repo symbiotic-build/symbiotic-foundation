@@ -1014,10 +1014,13 @@ same ordering. Waiting repeats the lookup after each deadline. The facade adds
 no stored copy.
 
 Gateway account concurrency starts at `max_in_flight` and retains that ceiling.
-A memory-only limiter shares the retry failure counter's account scope. Each request
-acquires its permit before the new-session probe and runtime account admission.
-It holds the permit through retries until its response ends. Throttle failures halve the effective limit, rounding down
-with a floor of one; existing holders retain permits. Ten successful responses with
+A memory-only FIFO limiter shares the retry failure counter's account scope. Each
+request acquires its permit after any new-session hold or probe wait and before
+runtime account admission, and holds the permit and its runtime slot through pacing
+waits and retries until its response ends. Only when a new-session request must wait
+for a hold or the probe does it give back both together, and it takes them again
+afterwards. Throttle failures halve the effective limit, rounding down with a floor of
+one; existing holders retain permits, and permits they return pay off the decrease. Ten successful responses with
 no intervening throttle increase it by one, up to the ceiling. Throttles and increases
 reset the success counter. Changes log route, account and effective limit at info level.
 Adaptive permit waits use the existing `slot` log and health waiting entry without new
