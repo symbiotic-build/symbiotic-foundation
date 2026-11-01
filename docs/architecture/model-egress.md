@@ -1045,7 +1045,7 @@ setting account cooldown. New-session waiters release their slots; seen sessions
 continue. After the hold, one probe is allowed until a new-session 2xx opens the
 gate. Another 429 extends the hold. Health exposes the hold's Unix deadline.
 
-The provider-neutral `symbiotic-gateway::item_stream` enum carries complete opaque
+The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque
 items, deltas and their identity, provider sequence, usage and classified errors.
 The adapters support `stream: "openai_responses"` and `stream: "openai_chat_completions"`.
 Chat Completions accepts SSE and non-streaming JSON. Original bytes are relayed

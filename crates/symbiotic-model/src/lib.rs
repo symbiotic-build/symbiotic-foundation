@@ -23,7 +23,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::time::Instant;
 /// Provider-neutral output item stream and wire adapters.
+pub mod item_stream;
+
 pub use symbiotic_core::retry;
 pub use symbiotic_core::{
     DiagnosticCode, FailureClass, ModelIdentity, ProviderPrincipalId, TenantId,
@@ -33,7 +36,6 @@ use symbiotic_trace::{
     CacheStatus, CacheTrace, InvocationOutcome, ModelInvocationTrace, TimingTrace, UsageTrace,
 };
 use thiserror::Error;
-use tokio::time::Instant;
 
 // The queue runtime behind the `Queued*` providers.
 #[cfg(feature = "queue")]

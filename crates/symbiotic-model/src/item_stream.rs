@@ -479,7 +479,7 @@ fn decode_usage(
     } else {
         (None, None)
     };
-    let (cached, cache_miss) = normalize_prompt_cache_counts(input, hit, miss, nested_hit)
+    let (cached, cache_miss) = crate::normalize_prompt_cache_counts(input, hit, miss, nested_hit)
         .map_err(|_| ItemStreamError::InvalidEvent)?;
     Ok(UsageTrace {
         input_tokens: input,
@@ -596,42 +596,6 @@ impl ChatCompletionsAdapter {
             Ok(ItemEvent::ItemDelta(record))
         }
     }
-}
-
-/// Copied from `symbiotic-model`, which keeps its own copy for its typed path.
-fn normalize_prompt_cache_counts(
-    total: Option<u64>,
-    hit: Option<u64>,
-    miss: Option<u64>,
-    nested_hit: Option<u64>,
-) -> Result<(Option<u64>, Option<u64>), symbiotic_ai_runtime::model::ModelError> {
-    let invalid = || {
-        symbiotic_ai_runtime::model::ModelError::Provider(
-            symbiotic_core::DiagnosticCode::InvalidResponse,
-        )
-    };
-    if hit.zip(nested_hit).is_some_and(|(a, b)| a != b) {
-        return Err(invalid());
-    }
-    let hit = hit.or(nested_hit).or_else(|| {
-        total
-            .zip(miss)
-            .and_then(|(total, miss)| total.checked_sub(miss))
-    });
-    let miss = miss.or_else(|| {
-        total
-            .zip(hit)
-            .and_then(|(total, hit)| total.checked_sub(hit))
-    });
-    if total.zip(hit).is_some_and(|(total, hit)| hit > total)
-        || total.zip(miss).is_some_and(|(total, miss)| miss > total)
-        || total
-            .zip(hit.zip(miss))
-            .is_some_and(|(total, (hit, miss))| hit.checked_add(miss) != Some(total))
-    {
-        return Err(invalid());
-    }
-    Ok((hit, miss))
 }
 
 #[cfg(test)]

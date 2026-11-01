@@ -1,8 +1,8 @@
 //! One retry engine for HTTP failures, connection failures and interrupted items.
 use super::*;
-use crate::item_stream::ChatCompletionsAdapter;
 use model::CredentialScrubber;
 use std::sync::atomic::Ordering;
+use symbiotic_ai_runtime::model::item_stream::ChatCompletionsAdapter;
 
 struct AttemptLog<'a> {
     route: &'a str,

@@ -663,7 +663,7 @@ Chat Completions forwards complete SSE records progressively after scrubbing;
 
 ### Internal item stream
 
-`symbiotic-gateway::item_stream` defines the provider-neutral enum `ItemEvent`:
+`symbiotic-model::item_stream` defines the provider-neutral enum `ItemEvent`:
 `ItemStarted`, `ItemDelta`, `ItemDone`, `Usage`, `Error`, and opaque `Other` events.
 `ItemDone` carries complete provider JSON for exact replay. `Usage` carries
 `symbiotic_trace::UsageTrace`. Error events carry provider code and class. Event

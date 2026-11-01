@@ -56,9 +56,9 @@ pub use retry_policy::{
 };
 #[path = "passthrough_session.rs"]
 mod session;
-use crate::item_stream::{ItemEvent, ResponsesAdapter};
 pub use session::NewSessionConfig;
 use session::{AccountRetries, SeenSessions};
+use symbiotic_ai_runtime::model::item_stream::{ItemEvent, ResponsesAdapter};
 use tokio::time::Instant;
 
 type Result<T> = std::result::Result<T, GatewayError>;

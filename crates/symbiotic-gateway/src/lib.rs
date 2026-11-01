@@ -9,7 +9,6 @@ pub use process_security::protect_process;
 pub mod login;
 pub mod passthrough;
 pub use passthrough::{PassthroughConfig, PassthroughMethod, PassthroughRoute};
-pub mod item_stream;
 pub mod secrets;
 mod server;
 pub mod stream;
