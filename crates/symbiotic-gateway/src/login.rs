@@ -3,6 +3,7 @@
 //! Ordering: fence sync and parent sync precede exchange; store sync, atomic
 //! installation and parent sync precede fence clear. Cancellation leaves the
 //! fence set. Only a successful install or explicit import clears it.
+use crate::GatewayError;
 use crate::secrets::{LoginFamily, read_private_file};
 use base64::Engine;
 use reqwest::{
@@ -21,15 +22,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use symbiotic_ai_runtime::model::SecretValue;
-use symbiotic_egress::EgressError;
 use tokio::sync::Mutex;
 
 const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const GROK_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const KIMI_CLIENT: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const RENEWAL_WINDOW_SECS: u64 = 300;
-const UNAVAILABLE: EgressError = EgressError::CredentialUnavailable;
-type Result<T> = std::result::Result<T, EgressError>;
+const UNAVAILABLE: GatewayError = GatewayError::CredentialUnavailable;
+type Result<T> = std::result::Result<T, GatewayError>;
 
 impl LoginFamily {
     fn issuer(self) -> &'static str {
@@ -210,7 +210,7 @@ impl Login {
             return Ok(());
         }
         let runtime =
-            tokio::runtime::Handle::try_current().map_err(|_| EgressError::StateUnavailable)?;
+            tokio::runtime::Handle::try_current().map_err(|_| GatewayError::StateUnavailable)?;
         let login = std::sync::Arc::downgrade(self);
         let mut health = self.health_state.subscribe();
         runtime.spawn(async move {
@@ -1141,7 +1141,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let login = login(dir.path(), family, now().unwrap() - 1, &fixture);
             let error = login.request().await.err().unwrap();
-            assert_eq!(error, EgressError::CredentialUnavailable);
+            assert_eq!(error, GatewayError::CredentialUnavailable);
             let diagnostic = format!("{error:?}: {error}");
             for secret in ["old-access", "old-refresh", "synthetic secret error body"] {
                 assert!(!diagnostic.contains(secret));
@@ -1321,7 +1321,7 @@ mod tests {
                 &fixture,
             );
             let error = login.request().await.err().unwrap();
-            assert_eq!(error, EgressError::CredentialUnavailable);
+            assert_eq!(error, GatewayError::CredentialUnavailable);
             assert!(!error.to_string().contains("synthetic"));
             assert_eq!(login.health().await.unwrap().0, LoginHealth::LoginRequired);
             assert!(login.request().await.is_err());

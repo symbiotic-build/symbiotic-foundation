@@ -13,7 +13,7 @@
 //! Failure warnings use the message `"upstream failure"`; optional `provider_message` contains
 //! the full scrubbed provider message from the stream or HTTP error body.
 use crate::{
-    CredentialProcess, ProcessConfig,
+    Gateway, GatewayConfig,
     login::{Login, LoginHealth, LoginRequest},
     secrets::{LoginFamily, SecretSource},
     stream::{ItemJoin, StreamDialect},
@@ -24,6 +24,7 @@ pub use symbiotic_ai_runtime::{
 };
 #[path = "passthrough_balance.rs"]
 mod balance;
+use crate::GatewayError;
 pub use balance::{BalanceConfig, BalanceProvider, Currency, LowBalance};
 use forward::RequestLog;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -40,7 +41,6 @@ use symbiotic_ai_runtime::{
     model::{SecretValue, retry},
 };
 use symbiotic_core::logging::REQUEST_ID_HEADER;
-use symbiotic_egress::EgressError;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -61,13 +61,13 @@ use session::{AccountRetries, SeenSessions};
 use symbiotic_ai_runtime::model::item_stream::{ItemEvent, ResponsesAdapter};
 use tokio::time::Instant;
 
-type Result<T> = std::result::Result<T, EgressError>;
+type Result<T> = std::result::Result<T, GatewayError>;
 
-/// Configuration for a second, same-UID HTTP/1.1 socket. Configuration version stays 4.
+/// Configuration for a same-UID HTTP/1.1 socket.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassthroughConfig {
-    /// Socket in a provisioned owner-only directory, distinct from the typed socket.
+    /// Socket in a provisioned owner-only directory.
     pub socket_path: PathBuf,
     /// Optional sanitized, atomically replaced health file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,12 +232,9 @@ fn header_list_valid(headers: &[String], response: bool) -> bool {
     })
 }
 
-pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
-    let Some(pass) = &config.passthrough else {
-        return Ok(());
-    };
-    if pass.socket_path == config.socket_path
-        || !pass.socket_path.is_absolute()
+pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
+    let pass = &config.passthrough;
+    if !pass.socket_path.is_absolute()
         || pass.max_connections == 0
         || pass.max_connections > Semaphore::MAX_PERMITS
         || pass.routes.is_empty()
@@ -245,55 +242,34 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             .retry_policies
             .iter()
             .any(|(n, p)| !printable(n.as_bytes(), 128) || !retry_policy::valid(p))
-        || pass.health_path.as_ref().is_some_and(|path| {
-            !path.is_absolute() || path == &pass.socket_path || path == &config.socket_path
-        })
+        || pass
+            .health_path
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || path == &pass.socket_path)
     {
-        return Err(EgressError::InvalidRequest);
+        return Err(GatewayError::InvalidRequest);
     }
     if let Some(health) = &pass.health_path {
-        let sources = std::iter::once(&config.admission_key)
-            .chain(config.routes.iter().map(|r| &r.secret))
-            .chain(pass.routes.iter().map(|r| &r.secret));
+        let sources = pass.routes.iter().map(|r| &r.secret);
         for source in sources {
-            if let SecretSource::LoginFile { path, .. } | SecretSource::OwnerOnlyFile { path } =
-                source
-            {
-                let mut fence = path.as_os_str().to_owned();
-                fence.push(".renewal");
-                let mut lock = path.as_os_str().to_owned();
-                lock.push(".lock");
-                if health == path || health.as_os_str() == fence || health.as_os_str() == lock {
-                    return Err(EgressError::InvalidRequest);
-                }
+            let (SecretSource::LoginFile { path, .. } | SecretSource::OwnerOnlyFile { path }) =
+                source;
+            let mut fence = path.as_os_str().to_owned();
+            fence.push(".renewal");
+            let mut lock = path.as_os_str().to_owned();
+            lock.push(".lock");
+            if health == path || health.as_os_str() == fence || health.as_os_str() == lock {
+                return Err(GatewayError::InvalidRequest);
             }
         }
         if health.starts_with(&config.state_dir) {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
     }
-    let mut names: HashSet<&str> = config.routes.iter().map(|r| r.route.as_str()).collect();
+    let mut names = HashSet::new();
     let mut paths = HashSet::new();
     let mut spend_limits = HashMap::new();
-    // Same account policy comparison as typed routes, without opening state or secrets.
     let mut policies = HashMap::new();
-    for route in &config.routes {
-        let scope = symbiotic_ai_runtime::account_scope(
-            &BindingIdentity::new(&route.tenant, &route.route, "validation", &route.account),
-            route.account_sharing_key.as_ref(),
-        )
-        .map_err(|_| EgressError::InvalidRequest)?;
-        spend_limits.insert(scope.clone(), None);
-        policies.insert(
-            scope,
-            (
-                route.max_in_flight,
-                route.requests_per_minute,
-                ModelQueueConfig::default().rate_burst_seconds,
-                route.input_units_per_minute.is_some() || route.provider_request_limit.is_some(),
-            ),
-        );
-    }
     for route in &pass.routes {
         if route.name.is_empty()
             || route.name.len() > 128
@@ -325,7 +301,7 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             || !header_list_valid(&route.forward_headers, false)
             || !header_list_valid(&route.return_headers, true)
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         if route.price.as_ref().is_some_and(|p| !p.valid())
             || route
@@ -340,14 +316,14 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
                 .as_ref()
                 .is_some_and(|b| !b.valid(&route.destination))
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         route
             .policy()
             .validate()
-            .map_err(|_| EgressError::InvalidRequest)?;
+            .map_err(|_| GatewayError::InvalidRequest)?;
         let url =
-            reqwest::Url::parse(&route.destination).map_err(|_| EgressError::InvalidRequest)?;
+            reqwest::Url::parse(&route.destination).map_err(|_| GatewayError::InvalidRequest)?;
         if url.scheme() != "https"
             || url.host_str().is_none()
             || !url.username().is_empty()
@@ -355,35 +331,34 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             || url.query().is_some()
             || url.fragment().is_some()
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         if !matches!(&route.secret, SecretSource::LoginFile { path, .. } | SecretSource::OwnerOnlyFile { path } if path.is_absolute())
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         let scope = symbiotic_ai_runtime::account_scope(
             &route.identity(),
             route.account_sharing_key.as_ref(),
         )
-        .map_err(|_| EgressError::InvalidRequest)?;
+        .map_err(|_| GatewayError::InvalidRequest)?;
         if route.method != PassthroughMethod::Get
             && spend_limits
                 .insert(scope.clone(), route.spend_limit.clone())
                 .is_some_and(|existing| existing != route.spend_limit)
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         let policy = (
             route.max_in_flight,
             route.requests_per_minute,
             route.rate_burst_seconds,
-            false,
         );
         if policies
             .insert(scope, policy)
             .is_some_and(|existing| existing != policy)
         {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
     }
     Ok(())
@@ -414,13 +389,11 @@ pub(crate) struct Passthrough {
 }
 impl Passthrough {
     pub(crate) fn open(
-        config: &ProcessConfig,
+        config: &GatewayConfig,
         runtime: &Runtime,
         clock: symbiotic_queue::jobs::JobClock,
-    ) -> Result<Option<Self>> {
-        let Some(pass) = &config.passthrough else {
-            return Ok(None);
-        };
+    ) -> Result<Self> {
+        let pass = &config.passthrough;
         let changed = Arc::new(Notify::new());
         let mut logins: HashMap<PathBuf, (LoginFamily, Arc<Login>)> = HashMap::new();
         let mut routes = Vec::new();
@@ -433,13 +406,13 @@ impl Passthrough {
                     config_route.account_sharing_key.as_ref(),
                     config_route.policy(),
                 )
-                .map_err(|_| EgressError::InvalidRequest)?;
+                .map_err(|_| GatewayError::InvalidRequest)?;
             let credential = match &config_route.secret {
                 SecretSource::LoginFile { path, family } => {
                     let entry = match logins.entry(path.clone()) {
                         std::collections::hash_map::Entry::Occupied(entry) => {
                             if entry.get().0 != *family {
-                                return Err(EgressError::InvalidRequest);
+                                return Err(GatewayError::InvalidRequest);
                             }
                             entry.into_mut()
                         }
@@ -457,15 +430,14 @@ impl Passthrough {
                     let bytes = config_route.secret.load(config.max_secret_bytes)?;
                     let key = SecretValue::new(
                         std::str::from_utf8(&bytes)
-                            .map_err(|_| EgressError::CredentialUnavailable)?
+                            .map_err(|_| GatewayError::CredentialUnavailable)?
                             .to_owned(),
                     );
                     if key.is_empty() || !key.bytes().all(|b| (b'!'..=b'~').contains(&b)) {
-                        return Err(EgressError::CredentialUnavailable);
+                        return Err(GatewayError::CredentialUnavailable);
                     }
                     Credential::Static(key)
                 }
-                _ => return Err(EgressError::InvalidRequest),
             };
             let client = reqwest::Client::builder()
                 .https_only(true)
@@ -480,12 +452,12 @@ impl Passthrough {
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
                 .build()
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             let scope = symbiotic_ai_runtime::account_scope(
                 &config_route.identity(),
                 config_route.account_sharing_key.as_ref(),
             )
-            .map_err(|_| EgressError::InvalidRequest)?;
+            .map_err(|_| GatewayError::InvalidRequest)?;
             let session_key = match &config_route.secret {
                 SecretSource::LoginFile { path, .. } => format!("login:{}", path.display()),
                 _ => scope.clone(),
@@ -505,7 +477,7 @@ impl Passthrough {
                 balance_refresh: Notify::new(),
             });
         }
-        Ok(Some(Self {
+        Ok(Self {
             routes,
             changed,
             retry_policies: pass.retry_policies.clone(),
@@ -513,7 +485,7 @@ impl Passthrough {
             #[cfg(test)]
             wire_base: None,
             clock,
-        }))
+        })
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -542,7 +514,7 @@ impl Route {
             Credential::Static(key) => {
                 let mut headers = HeaderMap::new();
                 let mut value = HeaderValue::from_str(&format!("Bearer {}", **key))
-                    .map_err(|_| EgressError::CredentialUnavailable)?;
+                    .map_err(|_| GatewayError::CredentialUnavailable)?;
                 value.set_sensitive(true);
                 headers.insert("authorization", value);
                 Ok((headers, None))
@@ -552,22 +524,18 @@ impl Route {
 }
 
 /// Bind the configured passthrough socket with the same directory and bind-lock rules.
-pub fn bind(process: &CredentialProcess) -> Result<UnixListener> {
-    let config = process
-        .config()
-        .passthrough
-        .as_ref()
-        .ok_or(EgressError::InvalidRequest)?;
+pub fn bind(process: &Gateway) -> Result<UnixListener> {
+    let config = &process.config().passthrough;
     crate::server::bind_path(&config.socket_path)
 }
 
 /// Serve HTTP until SIGTERM/SIGINT. Publish `stopping` before closing the listener.
 /// Every handler is owned here and cancelled on shutdown or server failure.
-pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result<()> {
+pub async fn serve(process: Gateway, listener: UnixListener) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).map_err(|_| EgressError::StateUnavailable)?;
+    let mut term = signal(SignalKind::terminate()).map_err(|_| GatewayError::StateUnavailable)?;
     let mut interrupt =
-        signal(SignalKind::interrupt()).map_err(|_| EgressError::StateUnavailable)?;
+        signal(SignalKind::interrupt()).map_err(|_| GatewayError::StateUnavailable)?;
     serve_until(
         process,
         listener,
@@ -576,7 +544,7 @@ pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result
                 received = term.recv() => received,
                 received = interrupt.recv() => received,
             };
-            received.ok_or(EgressError::StateUnavailable)
+            received.ok_or(GatewayError::StateUnavailable)
         },
         current_uid(),
     )
@@ -584,25 +552,17 @@ pub async fn serve(process: CredentialProcess, listener: UnixListener) -> Result
 }
 
 async fn serve_until(
-    process: CredentialProcess,
+    process: Gateway,
     listener: UnixListener,
     shutdown: impl std::future::Future<Output = Result<()>>,
     owner_uid: u32,
 ) -> Result<()> {
-    let pass = process
-        .inner
-        .passthrough
-        .as_ref()
-        .ok_or(EgressError::InvalidRequest)?;
-    let config = process
-        .config()
-        .passthrough
-        .as_ref()
-        .ok_or(EgressError::InvalidRequest)?;
+    let pass = &process.inner.passthrough;
+    let config = &process.config().passthrough;
     let mut cooldown_changes = pass
         .routes
         .first()
-        .ok_or(EgressError::InvalidRequest)?
+        .ok_or(GatewayError::InvalidRequest)?
         .account
         .subscribe_cooldowns();
     pass.publish_health(config, "running").await?;
@@ -614,11 +574,7 @@ async fn serve_until(
         if route.config.balance.is_some() {
             let owner = process.clone();
             balances.spawn(async move {
-                let pass = owner
-                    .inner
-                    .passthrough
-                    .as_ref()
-                    .ok_or(EgressError::StateUnavailable)?;
+                let pass = &owner.inner.passthrough;
                 pass.balance_loop(&pass.routes[index]).await
             });
         }
@@ -638,19 +594,19 @@ async fn serve_until(
             _ = heartbeat.tick() => { pass.publish_health(config, "running").await?; }
             () = pass.changed.notified() => { pass.publish_health(config, "running").await?; }
             result = cooldown_changes.changed() => {
-                result.map_err(|_| EgressError::StateUnavailable)?;
+                result.map_err(|_| GatewayError::StateUnavailable)?;
                 pass.publish_health(config, "running").await?;
             }
             Some(result) = balances.join_next(), if !balances.is_empty() => {
-                result.map_err(|_| EgressError::StateUnavailable)??;
+                result.map_err(|_| GatewayError::StateUnavailable)??;
             }
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
-                if result.is_err() { return Err(EgressError::StateUnavailable); }
+                if result.is_err() { return Err(GatewayError::StateUnavailable); }
             }
             accepted = async {
-                let permit = connections.clone().acquire_owned().await.map_err(|_| EgressError::StateUnavailable)?;
-                let (socket, _) = listener.accept().await.map_err(|_| EgressError::Transport)?;
-                Ok::<_, EgressError>((socket, permit))
+                let permit = connections.clone().acquire_owned().await.map_err(|_| GatewayError::StateUnavailable)?;
+                let (socket, _) = listener.accept().await.map_err(|_| GatewayError::Transport)?;
+                Ok::<_, GatewayError>((socket, permit))
             } => {
                 let (socket, permit) = accepted?;
                 let Ok(peer) = socket.peer_cred() else { continue; };
@@ -687,13 +643,18 @@ struct Request {
     headers: Vec<(String, Vec<u8>)>,
     length: usize,
 }
-async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<Request> {
+async fn read_request(socket: &mut UnixStream, max_header_bytes: u32) -> Result<Request> {
     let mut bytes = Vec::new();
     loop {
-        if bytes.len() >= max_frame_bytes as usize {
-            return Err(EgressError::LimitExceeded);
+        if bytes.len() >= max_header_bytes as usize {
+            return Err(GatewayError::LimitExceeded);
         }
-        bytes.push(socket.read_u8().await.map_err(|_| EgressError::Transport)?);
+        bytes.push(
+            socket
+                .read_u8()
+                .await
+                .map_err(|_| GatewayError::Transport)?,
+        );
         if bytes.ends_with(b"\r\n\r\n") {
             break;
         }
@@ -702,14 +663,14 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
         .split_inclusive(|b| *b == b'\n')
         .map(|line| {
             line.strip_suffix(b"\r\n")
-                .ok_or(EgressError::InvalidRequest)
+                .ok_or(GatewayError::InvalidRequest)
         })
         .collect::<Result<_>>()?;
-    let first = std::str::from_utf8(lines.first().ok_or(EgressError::InvalidRequest)?)
-        .map_err(|_| EgressError::InvalidRequest)?;
+    let first = std::str::from_utf8(lines.first().ok_or(GatewayError::InvalidRequest)?)
+        .map_err(|_| GatewayError::InvalidRequest)?;
     let parts: Vec<_> = first.split(' ').collect();
     if parts.len() != 3 || parts[2] != "HTTP/1.1" {
-        return Err(EgressError::InvalidRequest);
+        return Err(GatewayError::InvalidRequest);
     }
     let (method, path) = (parts[0].to_owned(), parts[1].to_owned());
     let mut headers = Vec::new();
@@ -718,23 +679,23 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
         let colon = line
             .iter()
             .position(|b| *b == b':')
-            .ok_or(EgressError::InvalidRequest)?;
+            .ok_or(GatewayError::InvalidRequest)?;
         let name = &line[..colon];
         let name = HeaderName::from_bytes(name)
-            .map_err(|_| EgressError::InvalidRequest)?
+            .map_err(|_| GatewayError::InvalidRequest)?
             .as_str()
             .to_owned();
         if !names.insert(name.clone()) || matches!(name.as_str(), "transfer-encoding" | "expect") {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         let value = trim_ows(&line[colon + 1..]);
         if value.contains(&b'\r') || value.contains(&b'\n') {
-            return Err(EgressError::InvalidRequest);
+            return Err(GatewayError::InvalidRequest);
         }
         headers.push((name, value.to_vec()));
     }
     if !names.contains("host") {
-        return Err(EgressError::InvalidRequest);
+        return Err(GatewayError::InvalidRequest);
     }
     let length = headers
         .iter()
@@ -743,7 +704,7 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
         .or_else(|| (method == "GET").then_some(b"0".as_slice()))
         .filter(|v| !v.is_empty() && v.iter().all(u8::is_ascii_digit))
         .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok())
-        .ok_or(EgressError::InvalidRequest)?;
+        .ok_or(GatewayError::InvalidRequest)?;
     Ok(Request {
         method,
         path,
@@ -751,7 +712,7 @@ async fn read_request(socket: &mut UnixStream, max_frame_bytes: u32) -> Result<R
         length,
     })
 }
-async fn connection(process: &CredentialProcess, socket: UnixStream) -> Result<()> {
+async fn connection(process: &Gateway, socket: UnixStream) -> Result<()> {
     let wait = RequestLog::new();
     let span = wait.span.clone();
     async {
@@ -765,26 +726,22 @@ async fn connection(process: &CredentialProcess, socket: UnixStream) -> Result<(
     .await
 }
 async fn connection_request(
-    process: &CredentialProcess,
+    process: &Gateway,
     mut socket: UnixStream,
     mut wait: RequestLog,
 ) -> Result<()> {
     let timeout = Duration::from_secs(process.config().io_timeout_seconds);
     let request = match tokio::time::timeout(
         timeout,
-        read_request(&mut socket, process.config().max_frame_bytes),
+        read_request(&mut socket, process.config().max_header_bytes),
     )
     .await
     {
         Ok(Ok(request)) => request,
-        Ok(Err(EgressError::Transport)) => return Err(EgressError::Transport),
+        Ok(Err(GatewayError::Transport)) => return Err(GatewayError::Transport),
         _ => return refuse(process, socket, 400, "invalid_request", wait).await,
     };
-    let pass = process
-        .inner
-        .passthrough
-        .as_ref()
-        .ok_or(EgressError::InvalidRequest)?;
+    let pass = &process.inner.passthrough;
     let route = pass.routes.iter().find(|route| {
         path_valid(&request.path)
             && route.config.path == request.path
@@ -827,8 +784,8 @@ async fn connection_request(
     let mut body = vec![0; request.length];
     tokio::time::timeout(timeout, socket.read_exact(&mut body))
         .await
-        .map_err(|_| EgressError::Transport)?
-        .map_err(|_| EgressError::Transport)?;
+        .map_err(|_| GatewayError::Transport)?
+        .map_err(|_| GatewayError::Transport)?;
     let (mut read, mut write) = socket.into_split();
     // One request per connection. EOF or extra caller bytes cancel the entire work.
     let cancelled = async {
@@ -847,11 +804,11 @@ async fn connection_request(
     result
 }
 
-fn http_error(error: reqwest::Error) -> EgressError {
+fn http_error(error: reqwest::Error) -> GatewayError {
     if error.is_timeout() {
-        EgressError::Timeout
+        GatewayError::Timeout
     } else {
-        EgressError::Transport
+        GatewayError::Transport
     }
 }
 
@@ -923,7 +880,7 @@ async fn head(
     write
         .write_all(bytes.as_bytes())
         .await
-        .map_err(|_| EgressError::Transport)
+        .map_err(|_| GatewayError::Transport)
 }
 async fn chunk(write: &mut (impl tokio::io::AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
@@ -932,27 +889,27 @@ async fn chunk(write: &mut (impl tokio::io::AsyncWrite + Unpin), bytes: &[u8]) -
     write
         .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
         .await
-        .map_err(|_| EgressError::Transport)?;
+        .map_err(|_| GatewayError::Transport)?;
     write
         .write_all(bytes)
         .await
-        .map_err(|_| EgressError::Transport)?;
+        .map_err(|_| GatewayError::Transport)?;
     write
         .write_all(b"\r\n")
         .await
-        .map_err(|_| EgressError::Transport)
+        .map_err(|_| GatewayError::Transport)
 }
 async fn finish(write: &mut (impl tokio::io::AsyncWrite + Unpin)) -> Result<()> {
     write
         .write_all(b"0\r\n\r\n")
         .await
-        .map_err(|_| EgressError::Transport)
+        .map_err(|_| GatewayError::Transport)
 }
 /// Answer before the request body is read, then drain the caller's unread bytes.
 /// Closing a Unix stream with unread input resets the peer on Linux, which can
 /// discard this response before the caller reads it.
 async fn refuse(
-    process: &CredentialProcess,
+    process: &Gateway,
     mut socket: UnixStream,
     status: u16,
     code: &str,
@@ -963,7 +920,7 @@ async fn refuse(
     wait.status = Some(status);
     drop(wait);
     let _ = socket.shutdown().await;
-    let unread = u64::from(process.config().max_frame_bytes);
+    let unread = u64::from(process.config().max_header_bytes);
     let timeout = Duration::from_secs(process.config().io_timeout_seconds);
     let _ = tokio::time::timeout(
         timeout,

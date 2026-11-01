@@ -964,19 +964,19 @@ have explicit deadlines; they do not qualify live providers.
 
 ## Passthrough routes and login accounts
 
-Version-4 `ProcessConfig` accepts an optional `passthrough` section.
-`PassthroughConfig` names a second Unix socket, a connection limit, exact routes
-and an optional health file. A deployment may configure passthrough without typed
-routes. `ProcessConfig::validate_routes()` checks both route sets and their shared
-account policies without reading credentials or creating state. The existing
-free `validate_routes(routes, max_frame_bytes)` function checks typed routes only.
+`symbiotic-gateway` owns this path separately from the typed credential process.
+`GatewayConfig` requires a `passthrough` section and has no protocol version.
+`PassthroughConfig` retains the existing route JSON format, connection limit,
+socket path and optional health file. `GatewayConfig::validate_routes()` checks
+its routes and shared account policies without reading credentials or creating state.
+See the [gateway README](../../crates/symbiotic-gateway/README.md) for configuration and commands.
 
 Each `PassthroughRoute` binds an exact method and origin-form path to one HTTPS
 URL. Query strings, percent escapes, fragments, backslashes, duplicate request
 headers, `Transfer-Encoding` and `Expect` are refused. Requests require HTTP/1.1,
-`Host` and a bounded `Content-Length`. GET may omit Content-Length for an empty body. The existing `max_frame_bytes` setting
+`Host` and a bounded `Content-Length`. GET may omit Content-Length for an empty body. The `max_header_bytes` setting
 bounds the complete HTTP header block. Route byte settings bound the body.
-The second socket uses the typed socket's owner-only directory check, bind lock
+The gateway socket retains the owner-only directory check, bind lock
 and same-UID peer check. It accepts one request per connection.
 
 The provider receives the caller body unchanged. Only configured `forward_headers`
@@ -985,15 +985,14 @@ cookies, host, forwarding and hop-by-hop headers are excluded. The process injec
 the credential and `Accept-Encoding: identity`. The client ignores ambient proxies,
 disables HTTP retries and follows no redirects.
 
-Routes register with `Runtime::account_admission`. This facade uses the same
-`ModelAdmission` FIFO semaphore, `ModelRateState` request bucket and queue backend
-as typed providers. The backend's existing cooldown row remains authoritative;
-no passthrough queue, cooldown database or second scheduler is created. Registration
-requires matching slot caps, request rates and `rate_burst_seconds`. The burst
-setting defaults to zero, as in the existing runtime. Typed configuration routes
-use that default. Shared typed bindings must leave input-unit pacing and provider
-request limits unset. Raw requests consume the shared request bucket; their
-undecoded bodies have no typed input-unit estimate.
+Routes register with `Runtime::account_admission`, which uses the runtime's
+`ModelAdmission` FIFO semaphore, `ModelRateState` request bucket and queue backend.
+The gateway opens its own runtime, so admission is shared among the gateway's routes
+of one account and never with another process. The backend's existing cooldown row
+remains authoritative; no second cooldown database or scheduler is created. Routes
+that share an account must use matching slot caps, request rates and
+`rate_burst_seconds`. The burst setting defaults to zero. Raw requests consume the
+shared request bucket; their undecoded bodies have no input-unit estimate.
 Chat Completions POST reserves each dispatched attempt in the existing spend ledger.
 GET listings and Responses do not create reservations.
 `ModelRequestGrant::start_checked` holds a consumer's admission guard through the
@@ -1026,7 +1025,7 @@ consecutive account failures. Successful completion resets that count. Optional
 `fallback_routes` names are used only by `switch`; an empty list means fail.
 `PassthroughConfig.retry_policies` contains named overrides selected through the
 local `x-symbiotic-retry-policy` header. Unknown names get 400.
-`CredentialProcess::open_with_retry_hook` supplies the embedded-only hook.
+`Gateway::with_retry_hook` installs the embedded-only hook on a freshly opened gateway.
 Neither the header nor hook is sent upstream. The queue never relies on provider
 retry behavior in client tools.
 
@@ -1104,7 +1103,7 @@ Responses receipts and usage trailers remain tracked by
 Route configuration uses lower snake case fields and enum values. Rust public
 types use UpperCamelCase. Closed diagnostic codes use lower snake case, subject
 first. All money settings are exact decimal strings; binary floats are refused.
-Configuration version stays 4. These optional settings do not infer a model's price.
+The gateway configuration has no version field. These optional settings do not infer a model's price.
 
 - `price` requires Chat Completions POST accounting. `price.rates` supplies USD per
   million `input_cache_miss`, `input_cache_hit`, and `output` tokens. Optional
@@ -1116,7 +1115,7 @@ Configuration version stays 4. These optional settings do not infer a model's pr
   `max_request_usd`. Chat Completions POST routes sharing the account must have
   the same limit, including omission. A limit requires a configured price.
   Only GET listing routes are exempt from limit agreement and omit `spend_limit`
-  and `price`. A money-limited account cannot share Responses POST or typed routes.
+  and `price`. A money-limited account cannot share Responses POST routes.
   Invalid policies refuse startup with the existing `InvalidRequest` configuration error.
 - `balance` supplies `provider: "deepseek"`, positive `interval_seconds`,
   positive `debounce_seconds` (default 1), and
@@ -1208,7 +1207,7 @@ discount rather than understating cost. Separate search/fetch fees are outside
 this token-price calculation.
 
 Verification: `passthrough_money_*` in
-[`passthrough_tests.rs`](../../crates/symbiotic-credential-process/src/passthrough_tests.rs)
+[`passthrough_tests.rs`](../../crates/symbiotic-gateway/src/passthrough_tests.rs)
 cover priced/unpriced receipts, socket-level pre-send refusal, concurrent and
 unknown holds, low-balance warning re-arming, and Final 402 balance refresh.
 
@@ -1286,7 +1285,7 @@ The import command reads a native provider login without running a provider tool
 or making a network request:
 
 ```sh
-symbiotic-credential-process login import --family chatgpt_codex --native native-login.json --store login.json
+symbiotic-gateway login import --family chatgpt_codex --native native-login.json --store login.json
 ```
 
 For Kimi Code, use `--family kimi_code` and the Kimi CLI's owner-only
@@ -1305,7 +1304,7 @@ login file becomes stale after the first refresh-token rotation.
 
 When `health_path` is configured, the process atomically publishes version-1 JSON
 at startup, on state changes and at least every 10 s. Runtime cooldown-write
-notifications also trigger publication when typed providers set the deadline.
+notifications also trigger publication when account cooldowns change.
 Each replacement is synced and has mode 0640; the provisioned directory supplies its group. The file contains
 only `version`, `state`, `updated_at` and per-route `name`, `login`, `expires_at`
 and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
@@ -1321,22 +1320,22 @@ GET listings create none. Passthrough adds no usage trailers. Typed-route
 admission, accounting and recovery retain their existing protocol.
 Provider fixtures use a test-only mapping to loopback HTTP; production routes
 always require HTTPS. Tests cover real Unix sockets and executable shutdown in
-[`passthrough.rs`](../../crates/symbiotic-credential-process/tests/passthrough.rs),
+[`passthrough.rs`](../../crates/symbiotic-gateway/tests/passthrough.rs),
 with provider fixtures in
-[`passthrough_tests.rs`](../../crates/symbiotic-credential-process/src/passthrough_tests.rs).
+[`passthrough_tests.rs`](../../crates/symbiotic-gateway/src/passthrough_tests.rs).
 Login fixtures are in
-[`login.rs`](../../crates/symbiotic-credential-process/tests/login.rs)
+[`login.rs`](../../crates/symbiotic-gateway/tests/login.rs)
 and the login module's unit tests.
 
 ## Logs
 
-The credential-process binary uses `symbiotic_core::logging` (feature `logging`).
+The gateway and credential-process binaries use `symbiotic_core::logging` (feature `logging`).
 It writes one JSON object per line to stderr, which systemd sends to the journal.
 Event fields are at the top level, alongside `timestamp`, `level`, `target` and
 `spans`. A request event has this shape:
 
 ```json
-{"timestamp":"2026-10-27T00:00:00Z","level":"INFO","message":"request completed","route":"responses","outcome":"complete","status":200,"attempts":2,"queue_waited_ms":1000,"elapsed_ms":1200,"target":"symbiotic_credential_process::passthrough::forward","spans":[{"name":"model_request","request_id":"synthetic-request"}]}
+{"timestamp":"2026-10-27T00:00:00Z","level":"INFO","message":"request completed","route":"responses","outcome":"complete","status":200,"attempts":2,"queue_waited_ms":1000,"elapsed_ms":1200,"target":"symbiotic_gateway::passthrough::forward","spans":[{"name":"model_request","request_id":"synthetic-request"}]}
 ```
 
 Passthrough events are `request admitted`, `queue wait`, `request sent`,
@@ -1360,14 +1359,14 @@ provider's scrubbed error message from the failure event or HTTP error body.
 The field is omitted when no message is present.
 
 The optional top-level config field `log` accepts EnvFilter directives, for example
-`"log": "warn,symbiotic_credential_process::passthrough::forward=debug"`.
+`"log": "warn,symbiotic_gateway::passthrough::forward=debug"`.
 A nonempty `SYMBIOTIC_LOG` overrides it; the default is `info`.
 Invalid directives refuse startup. To override a systemd instance on build-i9,
 run `systemctl edit warden-model@codex` and add:
 
 ```ini
 [Service]
-Environment="SYMBIOTIC_LOG=info,symbiotic_credential_process::passthrough::forward=debug"
+Environment="SYMBIOTIC_LOG=info,symbiotic_gateway::passthrough::forward=debug"
 ```
 
 Restart the instance to apply the override.

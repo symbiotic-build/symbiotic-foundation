@@ -1,0 +1,31 @@
+[package]
+name = "symbiotic-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Same-user HTTP passthrough gateway with account admission"
+
+[dependencies]
+base64 = "0.22"
+chrono.workspace = true
+libc = "0.2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2 = "0.6"
+symbiotic-ai-runtime = { path = "../symbiotic-ai-runtime" }
+symbiotic-core = { path = "../symbiotic-core", features = ["logging"] }
+symbiotic-queue = { path = "../symbiotic-queue" }
+symbiotic-supervise = { path = "../symbiotic-supervise" }
+symbiotic-trace = { path = "../symbiotic-trace" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

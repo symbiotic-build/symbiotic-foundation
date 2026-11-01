@@ -9,7 +9,6 @@ description = "Credential-owning local model dispatch process"
 
 [dependencies]
 async-trait.workspace = true
-base64 = "0.22"
 libc = "0.2"
 reqwest.workspace = true
 rusqlite.workspace = true
@@ -22,13 +21,13 @@ symbiotic-queue = { path = "../symbiotic-queue" }
 symbiotic-supervise = { path = "../symbiotic-supervise" }
 symbiotic-egress = { path = "../symbiotic-egress" }
 symbiotic-trace = { path = "../symbiotic-trace" }
-tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }
 tracing.workspace = true
 symbiotic-core = { path = "../symbiotic-core", features = ["logging"] }
 uuid.workspace = true
-zeroize = "1"
 
 [dev-dependencies]
+base64 = "0.22"
 symbiotic-queue-sqlite = { path = "../symbiotic-queue-sqlite" }
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"

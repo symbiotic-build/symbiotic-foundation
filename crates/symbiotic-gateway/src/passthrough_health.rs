@@ -51,7 +51,7 @@ impl Passthrough {
         route
             .health
             .lock()
-            .map_err(|_| EgressError::StateUnavailable)?
+            .map_err(|_| GatewayError::StateUnavailable)?
             .waiting
             .insert(
                 id,
@@ -84,7 +84,7 @@ impl Passthrough {
             let mut h = route
                 .health
                 .lock()
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             h.rate_limits = values;
             h.rate_limits_seen_at = Some(Utc::now().timestamp());
             self.changed.notify_one();
@@ -142,20 +142,20 @@ impl Passthrough {
                 }
             };
             if !safe_value(route.config.name.as_bytes(), &route.secrets().await, 128) {
-                return Err(EgressError::CredentialUnavailable);
+                return Err(GatewayError::CredentialUnavailable);
             }
             let cooldown = route
                 .account
                 .cooldown_until()
                 .await
-                .map_err(|_| EgressError::StateUnavailable)?
+                .map_err(|_| GatewayError::StateUnavailable)?
                 .filter(|at| *at > self.now())
                 .map(|at| at.timestamp());
             let secrets = route.secrets().await;
             let h = route
                 .health
                 .lock()
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .map_err(|_| GatewayError::StateUnavailable)?;
             if h.waiting
                 .values()
                 .any(|w| !safe_value(w.request_id.as_bytes(), &secrets, 64))
@@ -163,14 +163,14 @@ impl Passthrough {
                     .keys()
                     .any(|code| contains_secret(code.as_bytes(), &secrets))
             {
-                return Err(EgressError::CredentialUnavailable);
+                return Err(GatewayError::CredentialUnavailable);
             }
             let hold = route
                 .retries
                 .sessions
                 .state
                 .lock()
-                .map_err(|_| EgressError::StateUnavailable)?
+                .map_err(|_| GatewayError::StateUnavailable)?
                 .until
                 .filter(|t| *t > self.now())
                 .map(|t| t.timestamp());
@@ -206,23 +206,23 @@ impl Passthrough {
             updated_at: Utc::now().timestamp(),
             routes,
         })
-        .map_err(|_| EgressError::StateUnavailable)?;
+        .map_err(|_| GatewayError::StateUnavailable)?;
         atomic_health(path, &bytes)
     }
 }
 fn atomic_health(path: &Path, bytes: &[u8]) -> Result<()> {
-    let directory = path.parent().ok_or(EgressError::InvalidRequest)?;
-    let meta = fs::symlink_metadata(directory).map_err(|_| EgressError::StateUnavailable)?;
+    let directory = path.parent().ok_or(GatewayError::InvalidRequest)?;
+    let meta = fs::symlink_metadata(directory).map_err(|_| GatewayError::StateUnavailable)?;
     // The deployment provisions this directory separately from the private socket
     // directory. Its ownership/group policy is not the socket's owner-only policy.
     if !meta.is_dir() {
-        return Err(EgressError::StateUnavailable);
+        return Err(GatewayError::StateUnavailable);
     }
     match fs::symlink_metadata(path) {
-        Ok(meta) if !meta.is_file() => return Err(EgressError::StateUnavailable),
+        Ok(meta) if !meta.is_file() => return Err(GatewayError::StateUnavailable),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(EgressError::StateUnavailable),
+        Err(_) => return Err(GatewayError::StateUnavailable),
     }
     let temporary = directory.join(format!(".health-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -231,27 +231,27 @@ fn atomic_health(path: &Path, bytes: &[u8]) -> Result<()> {
             .create_new(true)
             .mode(0o640)
             .open(&temporary)
-            .map_err(|_| EgressError::StateUnavailable)?;
+            .map_err(|_| GatewayError::StateUnavailable)?;
         if file
             .metadata()
-            .map_err(|_| EgressError::StateUnavailable)?
+            .map_err(|_| GatewayError::StateUnavailable)?
             .gid()
             != meta.gid()
         {
-            return Err(EgressError::StateUnavailable);
+            return Err(GatewayError::StateUnavailable);
         }
         file.set_permissions(fs::Permissions::from_mode(0o640))
-            .map_err(|_| EgressError::StateUnavailable)?;
+            .map_err(|_| GatewayError::StateUnavailable)?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
-            .map_err(|_| EgressError::StateUnavailable)?;
-        fs::rename(&temporary, path).map_err(|_| EgressError::StateUnavailable)?;
+            .map_err(|_| GatewayError::StateUnavailable)?;
+        fs::rename(&temporary, path).map_err(|_| GatewayError::StateUnavailable)?;
         File::open(directory)
             .and_then(|dir| dir.sync_all())
-            .map_err(|_| EgressError::StateUnavailable)
+            .map_err(|_| GatewayError::StateUnavailable)
     })();
     if temporary.exists() {
-        fs::remove_file(temporary).map_err(|_| EgressError::StateUnavailable)?;
+        fs::remove_file(temporary).map_err(|_| GatewayError::StateUnavailable)?;
     }
     result
 }
@@ -266,8 +266,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = super::super::tests::config(directory.path());
         let process = super::super::tests::open(config).unwrap();
-        let pass = process.inner.passthrough.as_ref().unwrap();
-        let config = process.config().passthrough.as_ref().unwrap();
+        let pass = &process.inner.passthrough;
+        let config = &process.config().passthrough;
         let path = config.health_path.as_ref().unwrap();
         let before = Utc::now().timestamp();
         pass.publish_health(config, "running").await.unwrap();

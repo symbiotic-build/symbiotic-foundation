@@ -37,18 +37,6 @@ pub type ResolverError = Box<dyn std::error::Error + Send + Sync>;
 /// or resend it. Opening the credential process still resolves its admission key.
 pub type SecretResolver = dyn Fn(&str) -> Result<SecretValue<Vec<u8>>, ResolverError> + Send + Sync;
 
-/// Fixed subscription protocol and token destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoginFamily {
-    /// ChatGPT subscription used by Codex.
-    ChatgptCodex,
-    /// First-party xAI subscription used by Grok.
-    XaiGrok,
-    /// Kimi Code subscription used by the Kimi CLI.
-    KimiCode,
-}
-
 /// Configured backend; references carry locations or callbacks, never secret values.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
@@ -57,13 +45,6 @@ pub enum SecretSource {
     None,
     /// Exact owner-only file, opened without following its final symlink.
     OwnerOnlyFile { path: PathBuf },
-    /// Renewable subscription, available only to passthrough routes.
-    LoginFile {
-        /// Owner-only versioned store.
-        path: PathBuf,
-        /// Fixed provider login protocol.
-        family: LoginFamily,
-    },
     /// App callback, available only in thread mode and never serialized.
     #[serde(skip)]
     Resolver {
@@ -79,7 +60,6 @@ impl fmt::Debug for SecretSource {
         match self {
             Self::None => f.write_str("None"),
             Self::OwnerOnlyFile { .. } => f.write_str("OwnerOnlyFile { .. }"),
-            Self::LoginFile { .. } => f.write_str("LoginFile { .. }"),
             Self::Resolver { .. } => f.write_str("Resolver { .. }"),
         }
     }
@@ -169,7 +149,7 @@ impl SecretSource {
             return Err(EgressError::CredentialUnavailable);
         }
         let bytes = match self {
-            Self::None | Self::LoginFile { .. } => return Err(EgressError::CredentialUnavailable),
+            Self::None => return Err(EgressError::CredentialUnavailable),
             Self::OwnerOnlyFile { path } => read_private_file(path, max_bytes)?,
             Self::Resolver { name, resolve } => {
                 let _scope = ResolverScope::enter()?;

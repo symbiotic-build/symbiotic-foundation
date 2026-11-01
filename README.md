@@ -7,6 +7,8 @@ Reusable Rust contracts for durable AI work:
 - `symbiotic-credential-process` — credential-owning daemon with owner-only-file
   credentials and keyless routes, single-use permits and typed usage. It reuses the
   model runtime with caching off. See [model egress](docs/architecture/model-egress.md).
+- `symbiotic-gateway` — same-user HTTP passthrough with account admission, streaming,
+  renewable login import and a health file. See [its README](crates/symbiotic-gateway/README.md).
 - `symbiotic-ai-runtime` — **the entry point for model calls.** Open one
   `Runtime` (dispatch requires an explicit state directory) and get
   ready chat, embedding, rerank and classifier providers. Queueing, retries,
