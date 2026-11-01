@@ -8,7 +8,7 @@ use std::{
     path::Path,
     process::Command,
 };
-use symbiotic_credential_process::{
+use symbiotic_gateway::{
     login::{Login, LoginHealth, import_native},
     protect_process,
     secrets::{LoginFamily, SecretSource},
@@ -45,31 +45,15 @@ fn native(path: &Path) -> String {
 fn store_value() -> Value {
     json!({"version":1,"family":"chatgpt_codex","issuer":"https://auth.openai.com","client_id":CLIENT,"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":null,"account_id":"synthetic-account","principal_type":null,"principal_id":null,"expires_at":now()+3600})
 }
-fn open(path: &Path) -> Result<Login, symbiotic_egress::EgressError> {
+fn open(path: &Path) -> Result<Login, symbiotic_gateway::GatewayError> {
     Login::open(path, LoginFamily::ChatgptCodex, LIMIT)
 }
 
 #[test]
-fn login_source_uses_the_design_encoding_and_typed_routes_refuse_it() {
+fn login_source_uses_the_design_encoding() {
     let value = json!({"backend":"login_file","path":"login.json","family":"chatgpt_codex"});
     let source: SecretSource = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(source).unwrap(), value);
-    // Route fields are the public version-4 config format, with valid defaults.
-    let mut route = json!({
-        "tenant":"tenant", "account":"account", "account_sharing_key":null,
-        "max_attempts":3, "route":"chat", "secret_ref":"login", "secret":{"backend":"none"},
-        "destination":"https://example.com/v1", "model":"test-model",
-        "provider":{"kind":"open_ai_chat","operator":"test"},
-        "allow_loopback_http":false, "max_field_bytes":1024, "max_output_tokens":100,
-        "max_in_flight":4, "requests_per_minute":null, "input_units_per_minute":null,
-        "timeout_seconds":1
-    });
-    route["secret"] = value;
-    let route = serde_json::from_value(route).unwrap();
-    assert!(matches!(
-        symbiotic_credential_process::validate_routes(&[route], 8 * 1024 * 1024),
-        Err(symbiotic_egress::EgressError::InvalidRequest)
-    ));
 }
 
 #[test]
@@ -223,14 +207,14 @@ fn native_import_refuses_other_login_scopes_and_expired_tokens() {
 }
 
 fn credential_binary() -> std::ffi::OsString {
-    std::env::var_os("CARGO_BIN_EXE_symbiotic-credential-process").unwrap_or_else(|| {
+    std::env::var_os("CARGO_BIN_EXE_symbiotic-gateway").unwrap_or_else(|| {
         std::env::current_exe()
             .unwrap()
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("symbiotic-credential-process")
+            .join("symbiotic-gateway")
             .into_os_string()
     })
 }
@@ -293,7 +277,7 @@ fn single_configuration_argument_reports_supported_secret_backends() {
         .unwrap();
     assert!(!result.status.success());
     let message = String::from_utf8_lossy(&result.stderr);
-    for backend in ["none", "owner_only_file", "login_file"] {
+    for backend in ["owner_only_file", "login_file"] {
         assert!(
             message.contains(backend),
             "supported backend missing from configuration refusal"

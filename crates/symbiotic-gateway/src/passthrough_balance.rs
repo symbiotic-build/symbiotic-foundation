@@ -99,7 +99,7 @@ impl Passthrough {
             .config
             .balance
             .as_ref()
-            .ok_or(EgressError::InvalidRequest)?;
+            .ok_or(GatewayError::InvalidRequest)?;
         let mut interval = tokio::time::interval(Duration::from_secs(config.interval_seconds));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_read: Option<Instant> = None;
@@ -119,12 +119,12 @@ impl Passthrough {
             .config
             .balance
             .as_ref()
-            .ok_or(EgressError::InvalidRequest)?;
+            .ok_or(GatewayError::InvalidRequest)?;
         let result = self.fetch_balance(route, config).await;
         let mut health = route
             .health
             .lock()
-            .map_err(|_| EgressError::StateUnavailable)?;
+            .map_err(|_| GatewayError::StateUnavailable)?;
         match result {
             Ok(value) => {
                 if value.low

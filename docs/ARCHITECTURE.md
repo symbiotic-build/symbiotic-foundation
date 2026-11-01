@@ -168,6 +168,16 @@ credentials and invokes existing HTTP adapters through `symbiotic-ai-runtime`.
 It extends the runtime database with durable replay metadata, has no second scheduler,
 and disables response caching. Details: [model egress](architecture/model-egress.md).
 
+### `symbiotic-gateway`
+
+Owns the same-user Unix-socket HTTP passthrough, renewable login stores and login
+import. It opens `symbiotic-ai-runtime` without a model registry for account
+admission and existing spend accounting. It publishes the configured health file.
+The typed credential process keeps the signed egress protocol.
+Until that typed path retires, both binaries hold their own copies of process protection,
+the state lock, the socket bind and the owner-only file reader; issue #207 tracks removing them.
+Details: [gateway configuration and commands](../crates/symbiotic-gateway/README.md).
+
 ### `symbiotic-trace`
 
 Owns normalized invocation traces:

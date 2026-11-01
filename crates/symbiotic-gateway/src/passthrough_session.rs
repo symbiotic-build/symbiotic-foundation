@@ -88,7 +88,7 @@ impl Route {
             Some(key) => Ok(!self
                 .seen
                 .lock()
-                .map_err(|_| EgressError::StateUnavailable)?
+                .map_err(|_| GatewayError::StateUnavailable)?
                 .contains(key)),
             None => Ok(false),
         }

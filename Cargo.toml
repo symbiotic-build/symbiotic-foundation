@@ -3,6 +3,7 @@ members = [
     "crates/symbiotic-supervise",
     "crates/symbiotic-egress",
     "crates/symbiotic-credential-process",
+    "crates/symbiotic-gateway",
     "crates/symbiotic-ai-runtime",
     "crates/symbiotic-core",
     "crates/symbiotic-queue",
