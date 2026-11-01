@@ -308,7 +308,7 @@ pub(crate) fn request_record(conn: &Connection, args: &Value) -> Result<Value> {
                 Some(args["usage"].to_string())
             },
             args["meter"].to_string(),
-            string(args, "time")?
+            date(string(args, "time")?, "time")?.to_rfc3339_opts(SecondsFormat::Millis, true)
         ],
     )?;
     let (seq, _) = append(conn, "request", id, "model.request", args)?;

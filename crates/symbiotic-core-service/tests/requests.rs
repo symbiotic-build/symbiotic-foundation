@@ -137,3 +137,35 @@ fn invalid_derived_reading_rolls_back_request_and_prior_readings() {
         json!({"requests":0,"requests_without_usage":0})
     );
 }
+
+#[test]
+fn request_time_is_stored_as_utc_milliseconds_while_event_preserves_original_args() {
+    let (dir, mut store) = store();
+    let conn = rusqlite::Connection::open(dir.path().join("core.sqlite")).unwrap();
+    for (id, time, expected) in [
+        (
+            "offset",
+            "2026-11-03T00:59:59.123456+01:00",
+            "2026-11-02T23:59:59.123Z",
+        ),
+        (
+            "seconds",
+            "2026-11-02T00:00:00Z",
+            "2026-11-02T00:00:00.000Z",
+        ),
+    ] {
+        let mut args = record(id, None);
+        args["time"] = json!(time);
+        ok(&mut store, "request.record", args.clone());
+        let stored: String = conn
+            .query_row(
+                "SELECT time FROM requests WHERE request_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(events(&mut store).last().unwrap()["payload"], args);
+        assert_eq!(ok(&mut store, "request.record", args)["duplicate"], true);
+    }
+}

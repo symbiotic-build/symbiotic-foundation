@@ -70,34 +70,44 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
     let mut warden = BTreeSet::new();
     let mut errors = vec![];
     walk(path, day, &mut warden, &mut errors);
-    let mut core = BTreeSet::new();
-    let mut all_jobs = BTreeSet::new();
-    for job in rows(conn, "SELECT id,created FROM jobs", [])? {
-        let id = string(&job, "id")?.to_owned();
-        if date(string(&job, "created")?, "created")?.date_naive() == day {
-            core.insert(id.clone());
-        }
-        all_jobs.insert(id);
-    }
+    let start = format!("{day}T00:00:00.000Z");
+    let end = format!(
+        "{}T00:00:00.000Z",
+        day.succ_opt().ok_or_else(|| invalid("day"))?
+    );
+    let core = rows(
+        conn,
+        "SELECT id FROM jobs WHERE created>=?1 AND created<?2",
+        params![start, end],
+    )?
+    .into_iter()
+    .map(|job| string(&job, "id").map(str::to_owned))
+    .collect::<Result<BTreeSet<_>>>()?;
     let missing = warden.difference(&core).cloned().collect::<Vec<_>>();
     let extra = core.difference(&warden).cloned().collect::<Vec<_>>();
     let mut without = vec![];
-    let mut unknown = vec![];
+    let mut refused = vec![];
     let mut accounts = BTreeSet::new();
     let mut total = 0;
-    for request in rows(conn, "SELECT * FROM requests ORDER BY request_id", [])? {
-        if date(string(&request, "time")?, "time")?.date_naive() != day {
-            continue;
-        }
+    for request in rows(
+        conn,
+        "SELECT request_id,account,route,status,refused,usage IS NULL AS usage_missing FROM requests WHERE time>=?1 AND time<?2 ORDER BY request_id",
+        params![start, end],
+    )? {
         total += 1;
         accounts.insert(string(&request, "account")?.to_owned());
-        if request["usage"].is_null() && request["refused"].is_null() {
-            without.push(json!({"request_id":request["request_id"],"account":request["account"],"route":request["route"],"status":request["status"]}));
-        }
-        if !all_jobs.contains(string(&request, "job_id")?) {
-            unknown.push(request["request_id"].clone());
+        if request["usage_missing"] == 1 {
+            let mut entry = json!({"request_id":request["request_id"],"account":request["account"],"route":request["route"],"status":request["status"]});
+            if request["refused"].is_null() {
+                without.push(entry);
+            } else {
+                entry["refused"] = request["refused"].clone();
+                refused.push(entry);
+            }
         }
     }
+    let unknown = rows(conn, "SELECT requests.request_id FROM requests LEFT JOIN jobs ON jobs.id=requests.job_id WHERE requests.time>=?1 AND requests.time<?2 AND jobs.id IS NULL ORDER BY requests.request_id", params![start, end])?
+        .into_iter().map(|request| request["request_id"].clone()).collect::<Vec<_>>();
     let metered = rows(conn, "SELECT DISTINCT account FROM budgets", [])?
         .into_iter()
         .map(|v| string(&v, "account").map(str::to_owned))
@@ -105,16 +115,18 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
     let unmetered = accounts.difference(&metered).cloned().collect::<Vec<_>>();
     let mut quotas = BTreeMap::<String, Quota>::new();
     let mut violations = vec![];
-    for event in rows(conn, "SELECT * FROM events ORDER BY seq", [])? {
-        let event_day = date(string(&event, "time")?, "event.time")?.date_naive();
-        if event_day > day {
-            continue;
-        }
-        let p = &event["payload"];
-        let id = string(&event, "subject_id")?;
-        match string(&event, "kind")? {
+    let mut statement = conn.prepare("SELECT time,subject_id,kind,payload FROM events WHERE kind IN ('budget.reading','budget.warning','budget.exhausted','decision.answered','model.request') ORDER BY seq")?;
+    let mut events = statement.query([])?;
+    while let Some(event) = events.next()? {
+        let time: String = event.get(0)?;
+        let event_day = date(&time, "event.time")?.date_naive();
+        let id: String = event.get(1)?;
+        let kind: String = event.get(2)?;
+        let payload: Value = serde_json::from_str(&event.get::<_, String>(3)?)?;
+        let p = &payload;
+        match kind.as_str() {
             "budget.reading" => {
-                let q = quotas.entry(id.into()).or_default();
+                let q = quotas.entry(id.clone()).or_default();
                 q.account = string(p, "account")?.into();
                 q.state = string(p, "state")?.into();
                 if q.state == "open" {
@@ -123,12 +135,12 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
                 }
             }
             "budget.warning" => {
-                let q = quotas.entry(id.into()).or_default();
+                let q = quotas.entry(id.clone()).or_default();
                 q.warned = true;
                 q.state = "warning".into();
             }
             "budget.exhausted" => {
-                let q = quotas.entry(id.into()).or_default();
+                let q = quotas.entry(id.clone()).or_default();
                 if event_day == day && !q.warned {
                     violations.push(json!({"budget_id":id,"problem":"budget exhausted without a preceding warning since its last return to open"}));
                 }
@@ -167,6 +179,6 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
         && errors.is_empty();
     Ok(
         json!({"day":day_text,"passed":passed,"jobs":{"in_core":core.len(),"in_warden":warden.len(),"missing_from_core":missing,"extra_in_core":extra},
-        "requests":{"total":total,"without_usage":without,"unknown_job":unknown},"accounts_without_quota_meter":unmetered,"quota":{"violations":violations},"warden_errors":errors}),
+        "requests":{"total":total,"without_usage":without,"refused":refused,"unknown_job":unknown},"accounts_without_quota_meter":unmetered,"quota":{"violations":violations},"warden_errors":errors}),
     )
 }

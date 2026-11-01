@@ -66,9 +66,7 @@ pub(crate) fn apply(conn: &Connection, account: &str, reading: &Value, time: &st
     let allowed = state != "open" && old.as_ref().is_some_and(|v| v["over_limit_allowed"] == 1);
     let mut normalized = reading.clone();
     normalized["read_at"] = json!(read_at);
-    let window =
-        json!({"window_minutes":reading["window_minutes"],"resets_at":reading["resets_at"]});
-    conn.execute("INSERT INTO budgets(id,owner,account,name,unit,\"limit\",window,spent,meter,state,warn_at,over_limit_allowed,read_at,updated) VALUES (?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12) ON CONFLICT(id) DO UPDATE SET unit=excluded.unit,\"limit\"=excluded.\"limit\",window=excluded.window,spent=excluded.spent,meter=excluded.meter,state=excluded.state,over_limit_allowed=excluded.over_limit_allowed,read_at=excluded.read_at,updated=excluded.updated", params![id,account,name,string(reading,"unit")?,limit,window.to_string(),spent,normalized.to_string(),state,warn_at,allowed,read_at])?;
+    conn.execute("INSERT INTO budgets(id,account,name,unit,\"limit\",spent,meter,state,warn_at,over_limit_allowed,read_at,updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11) ON CONFLICT(id) DO UPDATE SET unit=excluded.unit,\"limit\"=excluded.\"limit\",spent=excluded.spent,meter=excluded.meter,state=excluded.state,over_limit_allowed=excluded.over_limit_allowed,read_at=excluded.read_at,updated=excluded.updated", params![id,account,name,string(reading,"unit")?,limit,spent,normalized.to_string(),state,warn_at,allowed,read_at])?;
     let payload = json!({"budget_id":id,"account":account,"reading":normalized,"spent":spent,"limit":limit,"state":state});
     append(conn, "budget", &id, "budget.reading", &payload)?;
     if old_state == "open" && state != "open" {
@@ -118,9 +116,17 @@ pub(crate) fn apply(conn: &Connection, account: &str, reading: &Value, time: &st
     Ok(())
 }
 fn open_decision(conn: &Connection, budget_id: &str, level: &str, event: EventId) -> Result<()> {
+    let kind = format!("budget.{level}");
+    let already_open: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM decisions WHERE budget_id=?1 AND state='open' AND raised_by=?2)",
+        params![budget_id, kind],
+        |row| row.get(0),
+    )?;
+    if already_open {
+        return Ok(());
+    }
     let b = one(conn, "budgets", budget_id)?
         .ok_or_else(|| Error::new("store_error", "budget disappeared"))?;
-    let kind = format!("budget.{level}");
     let n: i64 = conn.query_row(
         "SELECT count(*)+1 FROM decisions WHERE budget_id=?1 AND raised_by=?2",
         params![budget_id, kind],

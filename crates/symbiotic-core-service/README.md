@@ -12,7 +12,11 @@ The state folder has mode 0700. The store uses a 60 s busy timeout, WAL, `synchr
 
 The bare SQLite operations are inserts and updates in one transaction per write, indexed record lookups and ordered event reads. The service layer adds field validation, state rules and JSON responses. It keeps no extra cache.
 
-The tables are `events`, `jobs`, `job_decisions`, `decisions`, `budgets` and `requests`. They are required by the core service record contract. The event payload carries the data needed to rebuild each record. The four read indexes cover event subjects, request jobs, account request times and job creation times. Job cost is derived from requests; there is no stored cost or charged column.
+The tables are `events`, `jobs`, `job_decisions`, `decisions`, `budgets` and `requests`. They are required by the core service record contract. The event payload carries the data needed to rebuild each record.
+
+The seven read indexes cover `events(subject_kind, subject_id)`, `requests(job_id)`, `requests(account, time)`, `jobs(created)`, `budgets(account)`, `decisions(budget_id, state)` and `requests(time)`. Each index adds one B-tree entry per row and maintenance on indexed writes. The account and decision indexes avoid unrelated rows on every request; the time indexes select the report day in SQLite.
+
+Job cost is derived from requests; there is no stored cost or charged column. Budgets store their account once; window fields stay inside the stored reading (`meter`), without separate `owner` or `window` columns.
 
 ## Naming convention
 
@@ -90,8 +94,8 @@ Fields:
 - `account`, `route`, `model` (strings, required).
 - `status` (integer, required): the HTTP status returned to the caller.
 - `refused` (string, optional): present only for a local refusal with no upstream call. Step 1 value: `quota_exhausted`, with `status` 402 and `usage` null.
-- `time` (string, required): when the response ended or the refusal happened.
-- `usage` (object or null, required): null when the provider returned no usage (error, cut stream, refusal). Reconcile lists every such request by id.
+- `time` (string, required): when the response ended or the refusal happened. The request row normalizes it to UTC with millisecond precision and `Z` for text range queries. The `model.request` event preserves the args exactly as sent.
+- `usage` (object or null, required): null when the provider returned no usage (error, cut stream, refusal). Reconcile lists null usage without `refused` in the failing `requests.without_usage` list. It lists null usage with `refused` in `requests.refused`, which never fails the report.
   - `normalized`: any of `input_tokens`, `cached_input_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens`, as non-negative integers. A field the provider does not give is absent, never 0.
     `input_tokens` counts all input, cached and cache-write included; `cached_input_tokens` and `cache_write_tokens` are parts of it. `output_tokens` includes `reasoning_tokens`. The gateway converts each provider's fields into this meaning (Anthropic's `input_tokens` excludes cache reads, so the gateway adds them).
   - `provider`: the provider's usage object as it arrived, every field kept. The core stores it unread.
@@ -184,7 +188,7 @@ Core decisions have revision 1 and one authority question with option answers an
 
 Warning options are `continue_to_limit` (recommended), `pause_new_jobs` and `move_to_other_route`; each is reversible. An answer changes only the decision record. Exhaustion options are `allow_over_limit` and `keep_refusing` (recommended). `allow_over_limit` sets the budget allowance only while it remains exhausted. On Codex it permits spending credits, a protected asset. A reset clears this allowance and withdraws open decisions with `decision.withdrawn`; answered decisions retain their answer history. Decision states are exactly `open`, `answered`, `withdrawn`.
 
-A reading needs a limit and either used or remaining to create a budget. A jump directly to 100 % emits the warning and opens its decision before the exhaustion event and decision. A fall from exhausted to between 90 % and 100 % returns to warning without a new decision. Equal read times apply in arrival order; older readings do not change budget state.
+A reading needs a limit and either used or remaining to create a budget. A jump directly to 100 % emits the warning and opens its decision before the exhaustion event and decision. A fall from exhausted to between 90 % and 100 % returns to warning without a new decision. Returning to exhaustion reuses any still-open exhaustion decision; each budget has at most one open decision of each kind. Equal read times apply in arrival order; older readings do not change budget state.
 
 ### `events.since`
 
@@ -199,14 +203,16 @@ Args: `{day: "YYYY-MM-DD", warden_state: "directory"}`. The day is a UTC date.
 Response example:
 
 ```json
-{"day":"2026-11-02","passed":false,"jobs":{"in_core":3,"in_warden":4,"missing_from_core":["missing-job"],"extra_in_core":[]},"requests":{"total":120,"without_usage":[{"request_id":"request-1","account":"account","route":"route","status":500}],"unknown_job":["request-2"]},"accounts_without_quota_meter":["kimi-1"],"quota":{"violations":[{"budget_id":"account/weekly","request_id":"request-3","problem":"request sent while exhausted without an answered allow_over_limit decision"}]},"warden_errors":[]}
+{"day":"2026-11-02","passed":false,"jobs":{"in_core":3,"in_warden":4,"missing_from_core":["missing-job"],"extra_in_core":[]},"requests":{"total":120,"without_usage":[{"request_id":"request-1","account":"account","route":"route","status":500}],"refused":[{"request_id":"request-4","account":"account","route":"route","status":402,"refused":"quota_exhausted"}],"unknown_job":["request-2"]},"accounts_without_quota_meter":["kimi-1"],"quota":{"violations":[{"budget_id":"account/weekly","request_id":"request-3","problem":"request sent while exhausted without an answered allow_over_limit decision"}]},"warden_errors":[]}
 ```
+
+The core selects jobs and requests with inclusive UTC midnight and exclusive next-midnight bounds. It checks missing jobs with a `LEFT JOIN` and reads only whether request usage is null.
 
 The three checks are:
 
 - Compare the day's core jobs (`created` UTC date) with Warden jobs. Walk the Warden directory recursively without following symlinks. Every regular `sandbox.json` supplies string `job_directory` and `retirement_receipt`; its modification date selects the day. Missing or extra jobs fail.
-- Inspect the day's requests (`time` UTC date). Null usage without `refused` and job ids absent from core fail. Accounts with requests but no budget appear in `accounts_without_quota_meter` and do not fail.
-- Replay events in sequence through the end of the day. A sent request while any account budget is exhausted without an answered `allow_over_limit` in force fails. A return to `open` clears that permission. Exhaustion without a warning since the last return to open also fails.
+- Inspect the day's requests (`time` UTC date). Null usage without `refused` and job ids absent from core fail. Null usage with `refused` appears in `requests.refused` with request id, account, route, status and refusal reason, without failing. Accounts with requests but no budget appear in `accounts_without_quota_meter` and do not fail.
+- Replay all relevant events in `seq` order without an arrival-time cutoff, streaming rows from SQLite. Judge each `model.request` whose payload response `time` falls on the report day against the budget state at that replay position, including outbox deliveries on later days. A sent request while any account budget is exhausted without an answered `allow_over_limit` in force fails. A return to `open` clears that permission. An exhaustion event arriving on the report day without a warning since the last return to open also fails.
 
 The Warden job id uses the first 10 bytes of the directory's file name, replacing bytes outside ASCII alphanumeric, `.`, `_`, `-` with `_`. Append `-` and the first 32 lowercase hex characters of SHA-256 over directory bytes, a zero byte and retirement receipt bytes. Directory and file errors, invalid JSON and missing fields appear in `warden_errors` with path and reason. Every such error fails reconciliation. `passed` requires all three checks and no Warden errors.
 
@@ -227,3 +233,37 @@ symbiotic-core --state /state reconcile --day 2026-11-02 --warden-state /warden-
 `--state DIR` precedes the subcommand. Otherwise `SYMBIOTIC_CORE_STATE` supplies the directory. Missing state or invalid usage exits 2. Call subcommands take one JSON argument or `-` to read stdin. Success prints the `ok` value on one stdout line and exits 0. A service error prints its error object on stderr and exits 1. An unreachable socket exits 2. Reconcile prints pretty JSON; it exits 0 for `passed`, 1 for failed checks and 2 for an error.
 
 The server removes a stale socket only after a connection is refused. It authenticates the peer uid before reading a line. All calls use one writer connection behind a mutex on `spawn_blocking`. A separate connection runs backups. Backup failures go to stderr and retry at the next hour; they do not stop serving. Retention removes only regular files with the exact dated backup name pattern.
+
+## Threat model
+
+The socket admits only peers with the server's effective uid. The server checks the owner before reading any line. Callers are the same user's gateway and Warden. The state folder, socket, store and backups give group and others no access. No untrusted input reaches the protocol under this owning-user trust model.
+
+Coverage-guided fuzzing (House Rules test-discipline, "code that parses untrusted input or exposes a network protocol") is not set up because no untrusted input reaches this protocol. The seeded malformed-input test checks that `dispatch` never panics. If the socket is ever exposed beyond the owning user, for example HTTP in step 4, a fuzz target becomes required.
+
+## Guarantees and their tests
+
+Each bullet names the failure prevented and the test function in its linked file.
+
+- Events reject updates and deletes, preventing rewritten history: [tests/store.rs](tests/store.rs), `version_one_job_survives_migration_and_events_remain_append_only`.
+- Records and events commit together, preventing partial requests or budget changes after a failed write: [tests/requests.rs](tests/requests.rs), `invalid_derived_reading_rolls_back_request_and_prior_readings`.
+- Idempotent `job.create` prevents duplicate jobs and rejects changed create bodies: [tests/jobs.rs](tests/jobs.rs), `create_is_idempotent_after_transitions_and_conflicts_on_changed_body`.
+- Idempotent `request.record` prevents duplicate charges and rejects changed request bodies: [tests/requests.rs](tests/requests.rs), `request_retry_uses_original_sequence_and_rejects_changed_body`.
+- A job naming an unanswered decision starts `waiting` and cannot run, preventing unauthorized work: [tests/jobs.rs](tests/jobs.rs), `unanswered_decision_blocks_running_until_answered`.
+- The 90 % and 100 % thresholds raise their decisions, preventing missed budget choices: [tests/budgets.rs](tests/budgets.rs), `thresholds_open_one_decision_each_and_reset_withdraws_open_decisions`.
+- A direct jump to 100 % raises warning before exhaustion, preventing an exhaustion without warning: [tests/budgets.rs](tests/budgets.rs), `jump_to_limit_opens_warning_before_exhaustion_and_reset_withdraws_both_open_decisions`.
+- Reset withdraws open decisions and clears the allowance, preventing stale permission in a new window: [tests/budgets.rs](tests/budgets.rs), `thresholds_open_one_decision_each_and_reset_withdraws_open_decisions`.
+- An older reading never moves a budget, preventing an outbox from rolling it back: [tests/budgets.rs](tests/budgets.rs), `old_reading_changes_nothing_and_reading_without_limit_is_not_a_budget`.
+- Repeated exhaustion reuses an open exhaustion decision, preventing duplicate questions: [tests/budgets.rs](tests/budgets.rs), `exhaustion_after_warning_reuses_unanswered_exhaustion_decision`.
+- Budget records rebuild from the last reading event; sequence checks prevent record/event divergence, duplicate open decisions and jobs proceeding with unanswered decisions: [tests/sequences.rs](tests/sequences.rs), `generated_operations_preserve_budget_event_and_job_invariants` (32 fixed seeds, 80 operations each; `SEQUENCE_SEED` replays one seed).
+- Migration from version 1 preserves jobs and append-only history, preventing data loss during upgrade: [tests/store.rs](tests/store.rs), `version_one_job_survives_migration_and_events_remain_append_only`.
+- Owner-only socket permissions prevent group and other access: [tests/cli.rs](tests/cli.rs), `standalone_cli_serves_calls_reconciles_and_creates_private_socket_and_backup`. Rejection of a different peer uid has no automated test.
+- Reconcile compares core and Warden jobs, preventing missing or extra jobs from passing: [tests/reconcile.rs](tests/reconcile.rs), `missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed`; `matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest` checks agreement and the Warden id.
+- Reconcile flags null usage without refusal and unknown job ids, preventing unaudited requests from passing: [tests/reconcile.rs](tests/reconcile.rs), `missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed`.
+- Reconcile lists refusals and unmetered accounts without failing, preventing expected refusals or absent meters from being mistaken for missing usage: [tests/reconcile.rs](tests/reconcile.rs), `account_without_budget_is_reported_without_failure_and_local_refusal_is_not_missing_usage`.
+- Reconcile judges requests against exhausted budgets and replays allowance/reset, preventing unauthorized spending from passing: [tests/reconcile.rs](tests/reconcile.rs), `allowance_is_replayed_and_reset_clears_it`.
+- Reconcile judges late deliveries on their response day, preventing an outbox delay from bypassing checks: [tests/reconcile.rs](tests/reconcile.rs), `yesterday_response_delivered_after_exhaustion_today_fails_yesterday_report`.
+- Reconcile flags exhaustion without warning on its arrival day, preventing incomplete threshold history from passing: [tests/reconcile.rs](tests/reconcile.rs), `exhaustion_without_warning_is_a_quota_violation`.
+- UTC day bounds prevent adjacent-day jobs and requests from entering a report: [tests/reconcile.rs](tests/reconcile.rs), `utc_day_bounds_include_start_and_exclude_next_day_for_jobs_and_requests`. Stored UTC milliseconds preserve text ordering without changing event args: [tests/requests.rs](tests/requests.rs), `request_time_is_stored_as_utc_milliseconds_while_event_preserves_original_args`.
+- Reconcile exposes invalid manifests and ignores symlinks, preventing silent Warden input failures or following linked directories: [tests/reconcile.rs](tests/reconcile.rs), `malformed_manifests_fail_visibly_and_symlinks_are_not_followed`.
+- Malformed protocol lines return one JSON result without a panic, preventing a malformed caller request from crashing dispatch: [tests/protocol.rs](tests/protocol.rs), `seeded_malformed_lines_never_panic_and_return_exactly_one_json_result` (2 000 seeded mutations across every call).
+- Hourly backup scheduling, retention of 48 matching backups and backup file permissions have no automated test. The CLI test checks creation of the startup backup only.

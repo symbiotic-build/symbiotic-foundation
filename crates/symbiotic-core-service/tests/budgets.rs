@@ -169,3 +169,17 @@ fn negative_remaining_is_preserved_and_marks_budget_exhausted() {
     assert_eq!(b["state"], "exhausted");
     assert_eq!(b["reading"]["remaining"], -5.0);
 }
+
+#[test]
+fn exhaustion_after_warning_reuses_unanswered_exhaustion_decision() {
+    let (_dir, mut store) = store();
+    ok(&mut store, "request.record", record("full", Some(100.0)));
+    let original = budget(&mut store)["open_decision_ids"].clone();
+    ok(&mut store, "request.record", record("warning", Some(95.0)));
+    ok(
+        &mut store,
+        "request.record",
+        record("full-again", Some(100.0)),
+    );
+    assert_eq!(budget(&mut store)["open_decision_ids"], original);
+}

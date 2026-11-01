@@ -18,8 +18,8 @@ CREATE TABLE decisions (
  answered_by TEXT, answered_at TEXT, budget_id TEXT, raised_by TEXT
 );
 CREATE TABLE budgets (
- id TEXT PRIMARY KEY, owner TEXT NOT NULL, account TEXT NOT NULL, name TEXT NOT NULL,
- unit TEXT NOT NULL, "limit" REAL NOT NULL, window TEXT NOT NULL, spent REAL NOT NULL,
+ id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL,
+ unit TEXT NOT NULL, "limit" REAL NOT NULL, spent REAL NOT NULL,
  meter TEXT NOT NULL, state TEXT NOT NULL, warn_at REAL NOT NULL DEFAULT 0.9,
  over_limit_allowed INTEGER NOT NULL DEFAULT 0, read_at TEXT NOT NULL, updated TEXT NOT NULL
 );

@@ -41,7 +41,7 @@ fn matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest() {
     let result = report(&mut store, warden.path());
     assert_eq!(
         result,
-        json!({"day":chrono::Utc::now().format("%Y-%m-%d").to_string(),"passed":true,"jobs":{"in_core":1,"in_warden":1,"missing_from_core":[],"extra_in_core":[]},"requests":{"total":0,"without_usage":[],"unknown_job":[]},"accounts_without_quota_meter":[],"quota":{"violations":[]},"warden_errors":[]})
+        json!({"day":chrono::Utc::now().format("%Y-%m-%d").to_string(),"passed":true,"jobs":{"in_core":1,"in_warden":1,"missing_from_core":[],"extra_in_core":[]},"requests":{"total":0,"without_usage":[],"refused":[],"unknown_job":[]},"accounts_without_quota_meter":[],"quota":{"violations":[]},"warden_errors":[]})
     );
 }
 #[test]
@@ -78,7 +78,6 @@ fn missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed() {
 fn account_without_budget_is_reported_without_failure_and_local_refusal_is_not_missing_usage() {
     let (_dir, mut store) = store();
     let warden = tempfile::tempdir().unwrap();
-    create(&mut store, "job");
     // There must be a matching manifest for every core job.
     manifest(warden.path());
     create(&mut store, ID);
@@ -91,6 +90,11 @@ fn account_without_budget_is_reported_without_failure_and_local_refusal_is_not_m
     let result = report(&mut store, warden.path());
     assert_eq!(result["accounts_without_quota_meter"], json!(["account"]));
     assert_eq!(result["requests"]["without_usage"], json!([]));
+    assert_eq!(
+        result["requests"]["refused"],
+        json!([{"request_id":"refused","account":"account","route":"route","status":402,"refused":"quota_exhausted"}])
+    );
+    assert_eq!(result["passed"], true);
     assert_eq!(result["quota"]["violations"], json!([]));
     // A separate empty core file proves the unmetered account never changes passed.
     let (_other, mut clean) = common::store();
@@ -179,5 +183,75 @@ fn exhaustion_without_warning_is_a_quota_violation() {
     assert_eq!(
         result["quota"]["violations"],
         json!([{"budget_id":"account/weekly","problem":"budget exhausted without a preceding warning since its last return to open"}])
+    );
+}
+
+#[test]
+fn yesterday_response_delivered_after_exhaustion_today_fails_yesterday_report() {
+    let (_dir, mut store) = store();
+    let warden = tempfile::tempdir().unwrap();
+    ok(&mut store, "request.record", record("full", Some(100.0)));
+    let yesterday = chrono::Utc::now().date_naive().pred_opt().unwrap();
+    let mut late = record("late", None);
+    late["time"] = json!(format!("{yesterday}T23:59:59.999Z"));
+    ok(&mut store, "request.record", late);
+    let result = ok(
+        &mut store,
+        "reconcile",
+        json!({"day":yesterday.to_string(),"warden_state":warden.path()}),
+    );
+    assert_eq!(result["requests"]["total"], 1);
+    assert_eq!(
+        result["quota"]["violations"],
+        json!([{"budget_id":"account/weekly","request_id":"late","problem":"request sent while exhausted without an answered allow_over_limit decision"}])
+    );
+    assert_eq!(result["passed"], false);
+    assert_eq!(
+        report(&mut store, warden.path())["quota"]["violations"],
+        json!([])
+    );
+}
+
+#[test]
+fn utc_day_bounds_include_start_and_exclude_next_day_for_jobs_and_requests() {
+    let (dir, mut store) = store();
+    let warden = tempfile::tempdir().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("core.sqlite")).unwrap();
+    for (id, created) in [
+        ("before", "2026-11-01T23:59:59.999Z"),
+        ("start", "2026-11-02T00:00:00.000Z"),
+        ("end", "2026-11-02T23:59:59.999Z"),
+        ("next", "2026-11-03T00:00:00.000Z"),
+    ] {
+        create(&mut store, id);
+        conn.execute(
+            "UPDATE jobs SET created=?1 WHERE id=?2",
+            rusqlite::params![created, id],
+        )
+        .unwrap();
+    }
+    for (id, time, job) in [
+        ("before", "2026-11-02T00:59:59.999+01:00", "absent"),
+        ("start", "2026-11-02T01:00:00+01:00", "start"),
+        ("end", "2026-11-03T00:59:59.999999+01:00", "absent"),
+        ("next", "2026-11-03T00:00:00Z", "absent"),
+    ] {
+        let mut args = record(id, None);
+        args["time"] = json!(time);
+        args["job_id"] = json!(job);
+        ok(&mut store, "request.record", args);
+    }
+    let result = ok(
+        &mut store,
+        "reconcile",
+        json!({"day":"2026-11-02","warden_state":warden.path()}),
+    );
+    assert_eq!(
+        result["jobs"],
+        json!({"in_core":2,"in_warden":0,"missing_from_core":[],"extra_in_core":["end","start"]})
+    );
+    assert_eq!(
+        result["requests"],
+        json!({"total":2,"without_usage":[],"refused":[],"unknown_job":["end"]})
     );
 }

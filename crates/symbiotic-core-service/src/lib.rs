@@ -236,7 +236,6 @@ pub(crate) fn rows(
                         "envelope",
                         "answer",
                         "answered_by",
-                        "window",
                         "meter",
                         "usage",
                         "payload",
