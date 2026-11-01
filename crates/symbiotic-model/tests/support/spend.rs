@@ -1,9 +1,6 @@
 // Reuse the production SQLite implementation without linking SQLite into model contracts.
 // The embedded implementation also exports credential-only transaction APIs.
 #[allow(dead_code)]
-#[path = "../../../symbiotic-ai-runtime/src/passthrough_spend.rs"]
-mod passthrough_spend;
-#[allow(dead_code)]
 #[path = "../../../symbiotic-ai-runtime/src/spend.rs"]
 mod sqlite;
 use std::sync::Arc;

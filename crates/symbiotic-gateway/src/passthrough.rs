@@ -18,10 +18,8 @@ use crate::{
     secrets::{LoginFamily, SecretSource},
     stream::{ItemJoin, StreamDialect},
 };
+pub use balance::DecimalAmount;
 use chrono::{DateTime, Utc};
-pub use symbiotic_ai_runtime::{
-    DecimalAmount, PassthroughPrice, PeakWindow, SpendLimit, TokenRates,
-};
 #[path = "passthrough_balance.rs"]
 mod balance;
 use crate::GatewayError;
@@ -154,12 +152,6 @@ pub struct PassthroughRoute {
     /// Optional route names used only by the switch action, in order.
     #[serde(default)]
     pub fallback_routes: Vec<String>,
-    /// Optional exact USD token prices, frozen at send time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price: Option<PassthroughPrice>,
-    /// Optional rolling account money budget; requires price.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spend_limit: Option<SpendLimit>,
     /// Optional provider balance polling and low-balance warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceConfig>,
@@ -234,7 +226,8 @@ fn header_list_valid(headers: &[String], response: bool) -> bool {
 
 pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
     let pass = &config.passthrough;
-    if !pass.socket_path.is_absolute()
+    if !config.core_socket_path.is_absolute()
+        || !pass.socket_path.is_absolute()
         || pass.max_connections == 0
         || pass.max_connections > Semaphore::MAX_PERMITS
         || pass.routes.is_empty()
@@ -268,7 +261,6 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
     }
     let mut names = HashSet::new();
     let mut paths = HashSet::new();
-    let mut spend_limits = HashMap::new();
     let mut policies = HashMap::new();
     for route in &pass.routes {
         if route.name.is_empty()
@@ -303,18 +295,10 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
         {
             return Err(GatewayError::InvalidRequest);
         }
-        if route.price.as_ref().is_some_and(|p| !p.valid())
-            || route
-                .spend_limit
-                .as_ref()
-                .is_some_and(|l| !l.valid() || route.price.is_none())
-            || ((route.price.is_some() || route.spend_limit.is_some())
-                && (route.stream != StreamDialect::OpenaiChatCompletions
-                    || route.method != PassthroughMethod::Post))
-            || route
-                .balance
-                .as_ref()
-                .is_some_and(|b| !b.valid(&route.destination))
+        if route
+            .balance
+            .as_ref()
+            .is_some_and(|b| !b.valid(&route.destination))
         {
             return Err(GatewayError::InvalidRequest);
         }
@@ -342,13 +326,6 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| GatewayError::InvalidRequest)?;
-        if route.method != PassthroughMethod::Get
-            && spend_limits
-                .insert(scope.clone(), route.spend_limit.clone())
-                .is_some_and(|existing| existing != route.spend_limit)
-        {
-            return Err(GatewayError::InvalidRequest);
-        }
         let policy = (
             route.max_in_flight,
             route.requests_per_minute,
@@ -380,6 +357,7 @@ struct Route {
 }
 pub(crate) struct Passthrough {
     routes: Vec<Route>,
+    records: Arc<crate::records::Records>,
     changed: Arc<Notify>,
     retry_policies: HashMap<String, RetryPolicy>,
     pub(crate) retry_hook: Option<RetryHook>,
@@ -478,6 +456,7 @@ impl Passthrough {
             });
         }
         Ok(Self {
+            records: crate::records::Records::open(config, clock.clone())?,
             routes,
             changed,
             retry_policies: pass.retry_policies.clone(),
@@ -579,6 +558,8 @@ async fn serve_until(
             });
         }
     }
+    let records = pass.records.clone();
+    balances.spawn(async move { records.run().await });
     tokio::pin!(shutdown);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     loop {
@@ -589,6 +570,7 @@ async fn serve_until(
                 pass.publish_health(config, "stopping").await?;
                 handlers.abort_all();
                 while handlers.join_next().await.is_some() {}
+                pass.records.outbox.flush().await?;
                 return shutdown_result;
             }
             _ = heartbeat.tick() => { pass.publish_health(config, "running").await?; }
@@ -770,11 +752,15 @@ async fn connection_request(
         .and_then(|value| std::str::from_utf8(value).ok());
     if let Some(id) = id {
         wait.span.record("request_id", id);
+        wait.request_id = id.to_owned();
     }
     let Some(route) = route else {
         return refuse(process, socket, 404, "route_not_found", wait).await;
     };
     wait.route = Some(route.config.name.clone());
+    wait.account = route.config.account.clone();
+    wait.record_route = route.config.name.clone();
+    wait.records = Some(pass.records.clone());
     if request.length > route.config.max_request_bytes {
         return refuse(process, socket, 413, "request_too_large", wait).await;
     }
@@ -786,6 +772,10 @@ async fn connection_request(
         .await
         .map_err(|_| GatewayError::Transport)?
         .map_err(|_| GatewayError::Transport)?;
+    wait.model = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_owned))
+        .unwrap_or_default();
     let (mut read, mut write) = socket.into_split();
     // One request per connection. EOF or extra caller bytes cancel the entire work.
     let cancelled = async {
@@ -797,6 +787,7 @@ async fn connection_request(
         () = cancelled => Ok(()),
         result = pass.forward(route, &request, body, &mut write, id, &mut wait) => result,
     };
+    let _ = write.shutdown().await;
     if let Err(error) = &result {
         // These errors carry only static diagnostics, never provider data.
         wait.outcome = error.to_string();

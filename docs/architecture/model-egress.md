@@ -1081,61 +1081,37 @@ Chat Completions uses the same retry engine before the first downstream byte.
 After that byte, a failure stays visible and no policy or hook may retry or switch. Fallback routes must use the same method and dialect.
 The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
 A final usage chunk supplies prompt, completion, cached and reasoning token counts.
-Non-streaming JSON uses its `usage` object. Successful terminal responses settle
-complete numeric input/output usage in the canonical ledger.
-Failed sends, incomplete bodies, transport failures, cancellation and missing
-successful usage retain `Unknown` because provider work may have been charged.
-Provider identity text and answer bytes are excluded.
-The ledger adds one existing receipt row per dispatched Chat Completions POST attempt and uses its
-native reserve/finish transactions. It uses the existing ledger; money settings add the receipt columns and account/time index described below. Independent generated
-attempt invocations prevent unknown receipts from blocking subsequent passthrough sends.
-Settlement precedes the final HTTP chunk; a ledger failure leaves HTTP incomplete.
+Non-streaming JSON uses its `usage` object. Each matched caller request produces
+one core request record with normalized usage and the unchanged provider usage
+object. Incomplete responses have null usage. Retries share one record.
+The gateway stores completed records in its SQLite outbox after the response ends.
+The [gateway record contract](../../crates/symbiotic-gateway/README.md#request-records-and-the-quota-gate)
+defines delivery and quota refusal.
 
 For model listings, configure the existing `method: "get"`, exact `path` (for example
 `/v1/models`), destination URL and account credential. Keep the account's `stream`
 value. GET accepts JSON only and uses the same scrubber and account admission.
-No new configuration key or spend receipt is needed for listings.
-Responses receipts and usage trailers remain tracked by
-[#165](https://github.com/symbiotic-build/symbiotic-foundation/issues/165).
+Listings also produce one request record with null usage.
 
-### Passthrough prices, spend limits, and provider balance
+### Request records, quota limits, and provider balance
 
-Route configuration uses lower snake case fields and enum values. Rust public
-types use UpperCamelCase. Closed diagnostic codes use lower snake case, subject
-first. All money settings are exact decimal strings; binary floats are refused.
-The gateway configuration has no version field. These optional settings do not infer a model's price.
+The gateway requires an absolute `core_socket_path`. It serves calls while the
+core is offline and delivers its durable outbox when the core returns.
+Only Codex percent readings with a 10 080-minute window receive a header-derived
+limit of 100. The newest local reading or core budget closes the account gate
+when exhausted, unless the core permits credits. Passed reset times open it.
+Refusals return HTTP 402 `quota_exhausted` and receive their own request record.
+See the [gateway record contract](../../crates/symbiotic-gateway/README.md#request-records-and-the-quota-gate)
+for source ordering, refresh and retry rules.
 
-- `price` requires Chat Completions POST accounting. `price.rates` supplies USD per
-  million `input_cache_miss`, `input_cache_hit`, and `output` tokens. Optional
-  `reasoning` defaults to `output`.
-- `price.peak` supplies nonoverlapping UTC windows with ISO `weekdays` (Monday=1,
-  Sunday=7), `start` and `end` in HH:MM, and their own `rates`. Start is inclusive;
-  end is exclusive and can be 24:00. Split overnight windows into two days.
-- `spend_limit` supplies `usd`, positive `window_seconds`, and positive
-  `max_request_usd`. Chat Completions POST routes sharing the account must have
-  the same limit, including omission. A limit requires a configured price.
-  Only GET listing routes are exempt from limit agreement and omit `spend_limit`
-  and `price`. A money-limited account cannot share Responses POST routes.
-  Invalid policies refuse startup with the existing `InvalidRequest` configuration error.
-- `balance` supplies `provider: "deepseek"`, positive `interval_seconds`,
-  positive `debounce_seconds` (default 1), and
-  `low_balance: {currency: "USD" | "CNY", amount: "..."}`.
-  `balance.low_balance.currency` must match the currency held by the provider account.
-  A response without that currency reports `invalid_response` and never emits a
-  low-balance warning.
-
-The [runtime money contract](ai-runtime.md#passthrough-money-accounting) defines
-rounding, conservative unknown holds, and cost queries. A route without `price`
-records unknown cost and publishes `cost: "price not configured"`; configured
-prices publish `cost: "priced"`. An exhausted local budget returns HTTP 402 with
-`spend_budget_exhausted`, zero upstream attempts, and that outcome in the
-`request completed` event. The local response carries no upstream headers.
-The spend limit is guaranteed only when `max_request_usd` bounds every
-request's real cost. A settled cost above `max_request_usd` overshoots the
-reserved budget by the difference. Partial input/output usage leaves
-receipts `Unknown` on priced and unpriced routes. They retain any configured
-maximum-cost hold and allow reconciliation. Complete usage with a distinct reasoning rate but no
-reasoning count settles with unknown cost.
+`balance` supplies `provider: "deepseek"`, positive `interval_seconds`, positive
+`debounce_seconds` (default 1), and
+`low_balance: {currency: "USD" | "CNY", amount: "..."}`.
+`balance.low_balance.currency` selects the account currency.
+A response without that currency reports `invalid_response`.
+Optional `allowance` is a nonnegative decimal string in that currency.
+The latest successful poll contributes `deepseek.balance` with `remaining`,
+`read_at` and, when configured, the allowance as `limit`.
 
 DeepSeek balance monitoring uses the route's own secret and HTTPS client for
 `GET https://api.deepseek.com/user/balance`. Configuration requires that the model
@@ -1173,43 +1149,23 @@ under a retry override. Completion records one attempt and this distinct code.
 Other 402 responses retain the existing Final classification and fixed body.
 Every 402 also signals the optional balance poller.
 
-#### DeepSeek Flash example
+#### DeepSeek balance example
 
 This fragment extends a Chat Completions POST route targeting
-`https://api.deepseek.com/chat/completions`. The caller selects `deepseek-flash`
-in its unchanged request body. Prices below were verified on 2026-11-01 against
-[DeepSeek's pricing page](https://api-docs.deepseek.com/quick_start/pricing).
-The limit and warning threshold are example deployment choices, not provider prices.
+`https://api.deepseek.com/chat/completions`. The allowance and warning threshold
+are deployment choices in the selected currency.
 
 ```json
 {
-  "price": {
-    "rates": {"input_cache_hit": "0.003", "input_cache_miss": "0.15", "output": "0.6"},
-    "peak": [
-      {"weekdays": [1, 2, 3, 4, 5], "start": "01:00", "end": "04:00",
-       "rates": {"input_cache_hit": "0.006", "input_cache_miss": "0.3", "output": "1.2"}},
-      {"weekdays": [1, 2, 3, 4, 5], "start": "06:00", "end": "10:00",
-       "rates": {"input_cache_hit": "0.006", "input_cache_miss": "0.3", "output": "1.2"}}
-    ]
-  },
-  "spend_limit": {"usd": "20", "window_seconds": 86400, "max_request_usd": "1"},
   "balance": {"provider": "deepseek", "interval_seconds": 60, "debounce_seconds": 1,
-              "low_balance": {"currency": "USD", "amount": "5"}}
+              "allowance": "20", "low_balance": {"currency": "USD", "amount": "5"}}
 }
 ```
 
-Reasoning uses the output rate. A request sent on Monday at 02:00 UTC with
-1 000 input tokens, 800 cache hits, and 300 output tokens costs 424 800 nano-USD
-($0.0004248), even if 100 output tokens are reasoning. Off-peak it costs
-212 400 nano-USD. The schedule deliberately does not model Chinese holidays:
-holidays use their weekday's scheduled rate, overstating the documented holiday
-discount rather than understating cost. Separate search/fetch fees are outside
-this token-price calculation.
-
-Verification: `passthrough_money_*` in
+Verification: `request_records_*` checks record delivery, usage, quota refusal,
+restart recovery and allowance readings. The balance tests in
 [`passthrough_tests.rs`](../../crates/symbiotic-gateway/src/passthrough_tests.rs)
-cover priced/unpriced receipts, socket-level pre-send refusal, concurrent and
-unknown holds, low-balance warning re-arming, and Final 402 balance refresh.
+check warning re-arming and final HTTP 402 balance refresh.
 
 For a MiMo host, this example is one entry in `passthrough.routes`. The host
 provisions the key file with owner-only access and raw key bytes without a trailing
@@ -1308,16 +1264,16 @@ notifications also trigger publication when account cooldowns change.
 Each replacement is synced and has mode 0640; the provisioned directory supplies its group. The file contains
 only `version`, `state`, `updated_at` and per-route `name`, `login`, `expires_at`
 and `cooldown_until`, plus `retried_events`, `waiting`, `rate_limits`,
-`rate_limits_seen_at` and `new_session_hold_until`, plus `cost` and optional `balance` described below. Login states are `ok`,
+`rate_limits_seen_at` and `new_session_hold_until`, plus optional `balance`. Login states are `ok`,
 `expiring` within 300 s for Grok or two days for Codex and Kimi,
 `renewal_failed`, `login_required`, or `static`. SIGTERM and SIGINT publish
 `state: "stopping"` before closing the socket. Readers reject missing or malformed
 files, timestamps older than 30 s, stopping processes and unusable login states.
 There is no socket health endpoint.
 
-Only Chat Completions POST creates passthrough spend receipts; Responses POST and
-GET listings create none. Passthrough adds no usage trailers. Typed-route
-admission, accounting and recovery retain their existing protocol.
+Every matched Responses, Chat Completions or GET request creates one request
+record. Passthrough adds no usage trailers. Typed-route admission, accounting
+and recovery retain their existing protocol.
 Provider fixtures use a test-only mapping to loopback HTTP; production routes
 always require HTTPS. Tests cover real Unix sockets and executable shutdown in
 [`passthrough.rs`](../../crates/symbiotic-gateway/tests/passthrough.rs),

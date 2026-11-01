@@ -430,6 +430,10 @@ impl ResponsesAdapter {
     pub fn event_usage(event: &ItemEvent) -> Result<UsageTrace, ItemStreamError> {
         Self::usage(&event.record().value)
     }
+    /// Decode the usage of a non-streaming Responses response with the same reader.
+    pub(crate) fn json_usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
+        Self::usage(&serde_json::json!({"response": value}))
+    }
     fn usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
         let mut usage = decode_usage(
             &value["response"]["usage"],

@@ -236,76 +236,12 @@ hot path. Until the Foundation job queue implements its purge flag and settlemen
 without an answer (queue PR 3), the host drains in-flight calls for the affected
 input before declaring erasure complete.
 
-## Passthrough money accounting
+## Gateway accounting
 
-Chat Completions POST sends use the canonical ledger's existing reservation and
-settlement transactions. `AccountAdmission::reserve_passthrough_priced` records
-`sent_at_ms` (UTC Unix milliseconds), the optional caller `caller_request_id`, and
-the token rates selected at send time. Settlement uses those frozen rates even
-if the stream crosses a peak boundary or the process configuration changes.
-`SpendReceipt::cost_nano_usd` is absent until both price and complete input/output
-usage are known, except that `Released` receipts have zero cost.
-Failed sends, incomplete bodies, transport failures, cancellation and missing
-successful usage retain `Unknown` because provider work may have been charged.
-An unpriced receipt remains unpriced after reconciliation.
-Provider bodies and credentials never enter these fields.
-
-One stored money unit is one billionth of USD (nano-USD). Configuration accepts
-nonnegative decimal strings with at most nine fractional digits, bounded by
-SQLite's signed 64-bit maximum. Each request sums token count times rate using
-saturating integer arithmetic, divides by one million, and rounds up once.
-The result saturates at `i64::MAX` nano-USD. Output includes reasoning tokens;
-separately priced reasoning replaces that part of the output charge.
-Missing cache splits charge all input at the miss price. One reported split
-component derives the other from total input. Incomplete input/output usage
-leaves the receipt `Unknown` on priced and unpriced routes. With a configured
-spend limit, the receipt keeps its maximum-cost hold. It remains reconcilable
-until complete usage arrives.
-When output is positive, a distinct reasoning rate also requires a reasoning
-count; otherwise complete usage settles with unknown cost.
-
-`spend_limit` supplies a rolling account budget. Reservation takes SQLite's
-IMMEDIATE write lock before it reads any costs. It admits a send only when
-settled costs plus `max_request_usd` for every unresolved cost, including the
-new send, fit `usd`. The window includes sends newer than
-`sent_at_ms - window_seconds * 1000`; the lower bound is exclusive.
-Released receipts do not count. A settled receipt whose cost remains unknown
-also holds the maximum. Unknown sends survive restart and retain that hold
-until settlement, release, or window expiry.
-Each unknown attempt holds `max_request_usd` until it leaves the window or is
-reconciled through `Runtime::reconcile_spend`, so a burst of provider refusals
-(for example 402s while the balance is empty) can fill the limit until those holds age out.
-`max_request_usd` must be a
-conservative bound chosen for the route's requests; it does not rewrite or
-limit caller output-token settings. The budget is guaranteed only when
-`max_request_usd` bounds every request's real cost. A settled cost above
-`max_request_usd` overshoots the reserved budget by the difference.
-Admission refusal returns `BudgetExhausted(SpendBudgetExhausted)` before transport.
-
-`Runtime::spend_cost(account, start, end, invocation, request_id_prefix)` reads
-canonical receipts over the half-open UTC send-time window `[start, end)`.
-Use `account_scope(identity, sharing)` for the account argument. Optional invocation
-matches exactly; optional request ID matches a literal prefix, including `%`
-and `_` without wildcard interpretation. The result contains
-`settled_nano_usd`, `unknown_usage_count`, and `unpriced_count`. The two counts
-are independent: partial usage leaves priced and unpriced receipts `Unknown`.
-An unpriced receipt with partial usage contributes to both counts. Settled
-priced receipts with unknown cost also contribute to `unknown_usage_count`. Released
-receipts are excluded. Totals saturate at `u64::MAX`.
-
-Schema 18 adds four nullable receipt columns: `sent_at_ms`, `caller_request_id`,
-`price`, and `cost_nano_usd`. The frozen `price` JSON stores only token rates.
-One native `(account, sent_at_ms)` index bounds rolling budget reads and reports
-to the requested account/window. The bare SQLite cost
-is one index range scan and receipt updates in the existing transaction. There
-is no new ledger, summary table, or accounting cache. Older schemas, including
-version 17, are refused without migration. Deploying version 18 requires
-rebuilding the queue database.
-
-Verification: the `passthrough_money_*` tests in
-[`spend_tests.rs`](../../crates/symbiotic-ai-runtime/src/spend_tests.rs)
-cover cost arithmetic, UTC peak selection, reports, concurrent holds, expiry,
-and refusal of the previous queue schema.
+The gateway uses runtime account admission, pacing and cooldowns.
+It records model requests through the core in provider units.
+The runtime's typed path retains its existing receipt accounting and recovery.
+See the [gateway record contract](../../crates/symbiotic-gateway/README.md#request-records-and-the-quota-gate).
 
 ## Calls in flight
 

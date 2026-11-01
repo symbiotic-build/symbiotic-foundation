@@ -11,7 +11,7 @@ use std::{
 use symbiotic_gateway::{Gateway, GatewayConfig};
 
 fn config(dir: &std::path::Path) -> GatewayConfig {
-    serde_json::from_value(json!({"state_dir":dir.join("state"),"max_secret_bytes":4096,"max_header_bytes":8388608,"io_timeout_seconds":2,"passthrough":{"socket_path":dir.join("pass.sock"),"health_path":dir.join("health.json"),"max_connections":8,"routes":[{"name":"responses","tenant":"tenant","account":"account","account_sharing_key":null,"method":"post","path":"/v1/responses","destination":"https://provider.invalid/answer","secret":{"backend":"owner_only_file","path":dir.join("key")},"stream":"openai_responses","forward_headers":["content-type"],"return_headers":["x-codex-turn-state"],"max_request_bytes":4096,"max_response_bytes":4096,"max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}})).unwrap()
+    serde_json::from_value(json!({"state_dir":dir.join("state"),"core_socket_path":dir.join("core.sock"),"max_secret_bytes":4096,"max_header_bytes":8388608,"io_timeout_seconds":2,"passthrough":{"socket_path":dir.join("pass.sock"),"health_path":dir.join("health.json"),"max_connections":8,"routes":[{"name":"responses","tenant":"tenant","account":"account","account_sharing_key":null,"method":"post","path":"/v1/responses","destination":"https://provider.invalid/answer","secret":{"backend":"owner_only_file","path":dir.join("key")},"stream":"openai_responses","forward_headers":["content-type"],"return_headers":["x-codex-turn-state"],"max_request_bytes":4096,"max_response_bytes":4096,"max_in_flight":2,"requests_per_minute":null,"idle_timeout_seconds":1}]}})).unwrap()
 }
 #[test]
 fn passthrough_contract_validation_refuses_ambiguous_routes_destinations_and_limits_without_io() {
