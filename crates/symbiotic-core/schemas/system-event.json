@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SystemEvent",
+  "description": "One typed fact a system emitted.",
+  "type": "object",
+  "properties": {
+    "campaignId": {
+      "description": "Without a campaign the event still records but triggers no campaign policy.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CampaignId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DetailValue"
+      }
+    },
+    "evidenceRefs": {
+      "description": "Paths or URLs of the primary records.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "id": {
+      "$ref": "#/$defs/EventId"
+    },
+    "kind": {
+      "$ref": "#/$defs/EventKind"
+    },
+    "observedAt": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "runId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "$ref": "#/$defs/EventSeverity"
+    },
+    "source": {
+      "$ref": "#/$defs/EventSource"
+    },
+    "subject": {
+      "description": "What the event is about: family, stage, provider, repository, pull request.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "observedAt",
+    "source",
+    "kind",
+    "severity",
+    "subject",
+    "detail",
+    "evidenceRefs"
+  ],
+  "$defs": {
+    "CampaignId": {
+      "description": "Stable campaign identifier.",
+      "type": "string"
+    },
+    "DetailValue": {
+      "description": "A detail value: a number or an enumeration token, never free text.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "$ref": "#/$defs/EnumToken"
+        }
+      ]
+    },
+    "EnumToken": {
+      "description": "An enumeration value, never free text.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+    },
+    "EventId": {
+      "description": "Source-assigned event identifier; a repeated id is the same event.",
+      "type": "string"
+    },
+    "EventKind": {
+      "description": "Dotted event kind, subject first: `provider.refused`, `job.failed`.",
+      "type": "string"
+    },
+    "EventSeverity": {
+      "description": "How urgently an event needs attention.",
+      "type": "string",
+      "enum": [
+        "info",
+        "attention",
+        "blocking",
+        "critical"
+      ]
+    },
+    "EventSource": {
+      "description": "The system that emitted an event.",
+      "type": "object",
+      "properties": {
+        "instanceId": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "The kind of system, for example `warden` or `foundation-proxy`.",
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "instanceId"
+      ]
+    },
+    "Timestamp": {
+      "description": "ISO 8601 UTC timestamp as the source wrote it, for example\n`2026-10-31T20:56:19Z`. Contract types carry it unparsed, so it has no\nordering: string order is not time order when precision differs.",
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Incident",
+  "description": "One recorded failure.",
+  "type": "object",
+  "properties": {
+    "class": {
+      "$ref": "#/$defs/IncidentClass"
+    },
+    "detected": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "detectedBy": {
+      "type": "string"
+    },
+    "escape": {
+      "description": "Why the failure went unseen until `detected`.",
+      "type": "string"
+    },
+    "fix": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "guard": {
+      "description": "The check or tool that makes this class impossible or visible at once.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "guardTest": {
+      "description": "The replay test that proves the guard.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "$ref": "#/$defs/IncidentId"
+    },
+    "refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "started": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "status": {
+      "$ref": "#/$defs/IncidentStatus"
+    },
+    "title": {
+      "type": "string"
+    },
+    "what": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "class",
+    "title",
+    "what",
+    "started",
+    "detected",
+    "detectedBy",
+    "escape",
+    "refs",
+    "status"
+  ],
+  "$defs": {
+    "IncidentClass": {
+      "description": "Failure classes.",
+      "type": "string",
+      "enum": [
+        "preflight",
+        "observability",
+        "stall",
+        "plan_drift",
+        "report_drift",
+        "code_defect",
+        "host_capacity",
+        "provider_account"
+      ]
+    },
+    "IncidentId": {
+      "description": "Stable incident identifier, for example `inc-20261031-20`.",
+      "type": "string"
+    },
+    "IncidentStatus": {
+      "description": "Incident life cycle.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "open"
+          ]
+        },
+        {
+          "description": "The fix landed; the guard or its test is missing.",
+          "type": "string",
+          "const": "fixed"
+        },
+        {
+          "description": "The guard and its test landed.",
+          "type": "string",
+          "const": "closed"
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "ISO 8601 UTC timestamp as the source wrote it, for example\n`2026-10-31T20:56:19Z`. Contract types carry it unparsed, so it has no\nordering: string order is not time order when precision differs.",
+      "type": "string"
+    }
+  }
+}

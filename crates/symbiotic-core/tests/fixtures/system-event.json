@@ -1,0 +1,14 @@
+{
+  "id": "foundation-proxy:2026-10-31T20:56:19Z:deepseek:402",
+  "observedAt": "2026-10-31T20:56:19Z",
+  "source": { "kind": "foundation-proxy", "instanceId": "primary" },
+  "kind": "provider.refused",
+  "severity": "critical",
+  "campaignId": "warden-593-tuning-matrix",
+  "subject": { "provider": "deepseek" },
+  "detail": { "status": 402, "reason": "insufficient_balance" },
+  "evidenceRefs": [
+    "https://github.com/symbiotic-build/symbiotic-foundation/issues/195",
+    "https://github.com/symbiotic-build/warden/issues/662"
+  ]
+}

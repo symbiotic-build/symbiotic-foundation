@@ -1,0 +1,56 @@
+{
+  "id": "warden-593-tuning-matrix",
+  "goal": "Run the Warden tuning matrix of warden#593.",
+  "instructions": [
+    {
+      "id": "alpha-first",
+      "quote": "alpha first"
+    }
+  ],
+  "constraints": [
+    {
+      "id": "alpha-first",
+      "instructionId": "alpha-first",
+      "rule": {
+        "kind": "ordering",
+        "first": [
+          "alpha"
+        ],
+        "then": []
+      }
+    }
+  ],
+  "decisions": [],
+  "policies": [
+    {
+      "name": "provider_out",
+      "trigger": {
+        "eventKind": "provider.refused",
+        "subject": {},
+        "detail": {
+          "status": 402
+        }
+      },
+      "threshold": {
+        "kind": "count",
+        "count": 1,
+        "consecutive": false,
+        "groupBy": [
+          "provider"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "stop"
+        },
+        {
+          "kind": "ask",
+          "questionKind": "authority"
+        },
+        {
+          "kind": "divert"
+        }
+      ]
+    }
+  ]
+}

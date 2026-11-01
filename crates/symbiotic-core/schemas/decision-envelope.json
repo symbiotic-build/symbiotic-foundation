@@ -1,0 +1,673 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DecisionEnvelope",
+  "description": "A group of questions that resolve together, delivered as one page.",
+  "type": "object",
+  "properties": {
+    "audience": {
+      "description": "The people who may answer.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ActorRef"
+      }
+    },
+    "campaignId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CampaignId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "companyId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "createdAt": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "decisionBy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "id": {
+      "$ref": "#/$defs/DecisionId"
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DecisionQuestion"
+      }
+    },
+    "revision": {
+      "description": "Raised on every content change; an answer names the revision it answers,\nso an answer to a stale revision is refused.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "sourceEvents": {
+      "description": "The events that caused this decision.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EventId"
+      }
+    },
+    "state": {
+      "$ref": "#/$defs/DecisionState"
+    },
+    "unblockKey": {
+      "description": "What the answered group unblocks; absent for decisions a policy raised.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UnblockKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "wakes": {
+      "description": "The sessions woken with the answer.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ActorRef"
+      }
+    },
+    "workItemId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "revision",
+    "questions",
+    "sourceEvents",
+    "audience",
+    "wakes",
+    "createdAt",
+    "state"
+  ],
+  "$defs": {
+    "ActorKind": {
+      "description": "Kinds of actor.",
+      "type": "string",
+      "enum": [
+        "human",
+        "agent",
+        "service"
+      ]
+    },
+    "ActorRef": {
+      "description": "A person, agent session or service.",
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ActorKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "displayName"
+      ]
+    },
+    "Answer": {
+      "description": "An answer. `more_context` reopens the question with the named parts added.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "option"
+            },
+            "optionId": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "optionId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "text"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "number"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "more_context"
+            },
+            "missing": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MissingContext"
+              }
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "missing"
+          ]
+        }
+      ]
+    },
+    "AnswerFormat": {
+      "description": "The shape of a regular answer; `more_context` is always allowed besides.",
+      "type": "string",
+      "enum": [
+        "option",
+        "text",
+        "number"
+      ]
+    },
+    "AnswerRecord": {
+      "description": "An answer bound to the revision it answers.",
+      "type": "object",
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/Answer"
+        },
+        "answeredAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "answeredBy": {
+          "$ref": "#/$defs/ActorRef"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "answer",
+        "answeredBy",
+        "answeredAt"
+      ]
+    },
+    "CampaignId": {
+      "description": "Stable campaign identifier.",
+      "type": "string"
+    },
+    "ContextLabel": {
+      "description": "Claim labels allowed in question context.",
+      "type": "string",
+      "enum": [
+        "fact",
+        "assessment"
+      ]
+    },
+    "ContextSentence": {
+      "description": "One context sentence with its claim label.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "$ref": "#/$defs/ContextLabel"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "text"
+      ]
+    },
+    "DecisionId": {
+      "description": "Stable decision identifier.",
+      "type": "string"
+    },
+    "DecisionOption": {
+      "description": "One option: what changes and its side effect.",
+      "type": "object",
+      "properties": {
+        "consequence": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "reversible": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "consequence",
+        "reversible"
+      ]
+    },
+    "DecisionQuestion": {
+      "description": "One numbered question of a decision.",
+      "type": "object",
+      "properties": {
+        "afterAnswer": {
+          "description": "What happens after the answer, when the reader cannot infer it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnswerRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "answerFormat": {
+          "$ref": "#/$defs/AnswerFormat"
+        },
+        "confidence": {
+          "description": "Confidence in the recommendation, from 0 to 1.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "context": {
+          "description": "Context sentences, each opened by its claim label.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextSentence"
+          }
+        },
+        "costOfDelay": {
+          "type": "string"
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "description": "Stable within the decision.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/QuestionKind"
+        },
+        "options": {
+          "description": "Empty unless the answer format is `option`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DecisionOption"
+          }
+        },
+        "prompt": {
+          "description": "The question heading: names the decision and ends with a question mark.",
+          "type": "string"
+        },
+        "recommendedOptionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolutionTrail": {
+          "description": "Escalation tiers tried before the question reached a person.",
+          "$ref": "#/$defs/ResolutionTrail"
+        },
+        "safeDefault": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeDefault"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "severity": {
+          "$ref": "#/$defs/QuestionSeverity"
+        },
+        "topic": {
+          "description": "The topic heading the question is listed under.",
+          "type": "string"
+        },
+        "whyNow": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "topic",
+        "kind",
+        "prompt",
+        "context",
+        "whyNow",
+        "evidenceRefs",
+        "answerFormat",
+        "options",
+        "severity",
+        "costOfDelay",
+        "resolutionTrail"
+      ]
+    },
+    "DecisionState": {
+      "description": "Life cycle of a decision.",
+      "type": "string",
+      "enum": [
+        "draft",
+        "open",
+        "answered",
+        "expired",
+        "superseded"
+      ]
+    },
+    "EscalationTier": {
+      "description": "Escalation ladder tiers, cheapest first.",
+      "type": "string",
+      "enum": [
+        "recall",
+        "peer",
+        "council",
+        "operator"
+      ]
+    },
+    "EventId": {
+      "description": "Source-assigned event identifier; a repeated id is the same event.",
+      "type": "string"
+    },
+    "MissingContext": {
+      "description": "The part a `more_context` answer asks for.",
+      "type": "string",
+      "enum": [
+        "evidence",
+        "alternatives",
+        "cost",
+        "example",
+        "consequences"
+      ]
+    },
+    "QuestionKind": {
+      "description": "Why a question needs a person.",
+      "type": "string",
+      "enum": [
+        "authority",
+        "ambiguity",
+        "preference",
+        "contradiction",
+        "blocker"
+      ]
+    },
+    "QuestionSeverity": {
+      "description": "How much a wrong or late answer costs; `critical` always waits for a person.",
+      "type": "string",
+      "enum": [
+        "trivial",
+        "informational",
+        "decision",
+        "critical"
+      ]
+    },
+    "ResolutionTrail": {
+      "description": "The escalation tiers tried, in order.",
+      "type": "object",
+      "properties": {
+        "attempts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TierAttempt"
+          }
+        },
+        "escalationReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attempts"
+      ]
+    },
+    "SafeDefault": {
+      "description": "The option taken without an answer. It may only pause, defer or take a\npre-granted reversible action.",
+      "type": "object",
+      "properties": {
+        "executeAfter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "optionId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "optionId"
+      ]
+    },
+    "TierAttempt": {
+      "description": "One tier tried and its outcome.",
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outcome": {
+          "$ref": "#/$defs/TierOutcome"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "$ref": "#/$defs/EscalationTier"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "outcome",
+        "evidenceRefs"
+      ]
+    },
+    "TierOutcome": {
+      "description": "What one tier did with the question.",
+      "oneOf": [
+        {
+          "description": "The tier answered above its threshold.",
+          "type": "string",
+          "const": "resolved"
+        },
+        {
+          "description": "The tier answered below its threshold, or not at all.",
+          "type": "string",
+          "const": "escalated"
+        },
+        {
+          "description": "The tier was not allowed for this question.",
+          "type": "string",
+          "const": "skipped"
+        }
+      ]
+    },
+    "Timestamp": {
+      "description": "ISO 8601 UTC timestamp as the source wrote it, for example\n`2026-10-31T20:56:19Z`. Contract types carry it unparsed, so it has no\nordering: string order is not time order when precision differs.",
+      "type": "string"
+    },
+    "UnblockKey": {
+      "description": "What an answered group unblocks, and which backend runs it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "exploratory"
+            },
+            "topic": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "topic"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "branchHint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "attached_repo"
+            },
+            "repoId": {
+              "type": "string"
+            },
+            "requiresApproval": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "repoId",
+            "branchHint",
+            "requiresApproval"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "research_only"
+            },
+            "question": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "question"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "children": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/UnblockKey"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "composite"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "children"
+          ]
+        }
+      ]
+    }
+  }
+}

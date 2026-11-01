@@ -38,5 +38,7 @@ jobs:
       # Keep workspace dev features out of the executable's provider-cost regression.
       - name: Test (credential executable production features)
         run: cargo test --locked -p symbiotic-credential-process --test egress executable_preserves_numeric_provider_cost_after_restart -- --exact
+      - name: Test (symbiotic-core contract schemas)
+        run: cargo test -p symbiotic-core --features schema --locked --test schemas
       - name: Test (symbiotic-model without default features)
         run: cargo test -p symbiotic-model --no-default-features --locked
