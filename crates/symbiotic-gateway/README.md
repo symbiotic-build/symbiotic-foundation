@@ -63,10 +63,13 @@ the core is the sum of its attempts' records, so a retried or continued answer i
 counted once per upstream call.
 
 Records contain the attempt's account and route, served model (falling back to
-the requested model), upstream HTTP status and end time in UTC. A network failure
-or disconnect records 502. Local records use the local response status.
+the requested model), upstream HTTP status and end time in UTC. An attempt cut off
+after its status arrived keeps that status; an attempt that failed before any
+status records 502. Local records use the local response status.
 An account is `shared:<key>` when its route has `account_sharing_key`; otherwise
-it is `<tenant>/<account>`. Records, gates, `budget.get` arguments and the core's
+it is `<tenant>/<account>`. Inside each part, `%` becomes `%25` and `/` becomes
+`%2F`, so `org/team` + `prod` (`org%2Fteam/prod`) and `org` + `team/prod`
+(`org/team%2Fprod`) stay distinct. Records, gates, `budget.get` arguments and the core's
 `budgets[].account` all use this string. Independent tenants keep separate gates;
 routes with the same sharing key share a gate.
 

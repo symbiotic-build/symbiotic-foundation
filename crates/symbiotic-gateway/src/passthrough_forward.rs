@@ -987,10 +987,7 @@ impl Passthrough {
                                     )
                                     .await;
                             }
-                            Err(_) => {
-                                wait.record_status = Some(502);
-                                Failure::network("network", Some(&response_headers))
-                            }
+                            Err(_) => Failure::network("network", Some(&response_headers)),
                         }
                     }
                 }
@@ -1186,7 +1183,6 @@ impl Passthrough {
             let next = match response.chunk().await {
                 Ok(c) => c,
                 Err(_) => {
-                    wait.record_status = Some(502);
                     return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
                         Failure::network("upstream_disconnect", Some(response.headers()))
                     })));
@@ -1260,7 +1256,6 @@ impl Passthrough {
                     chunk(write, &json).await?;
                     return Ok(AnswerOutcome::Complete);
                 }
-                wait.record_status = Some(502);
                 return Ok(AnswerOutcome::Failure(failure.unwrap_or_else(|| {
                     Failure::network("upstream_disconnect", Some(response.headers()))
                 })));

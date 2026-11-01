@@ -161,10 +161,14 @@ pub struct PassthroughRoute {
 }
 
 impl PassthroughRoute {
+    /// The account name for records, the quota gate and the core's budgets.
+    /// `%` and `/` inside a component are percent-encoded, so `org/team` + `prod`
+    /// and `org` + `team/prod` stay distinct, and a shared key never contains a bare `/`.
     pub(crate) fn record_account(&self) -> String {
+        let part = |s: &str| s.replace('%', "%25").replace('/', "%2F");
         match &self.account_sharing_key {
-            Some(key) => format!("shared:{}", key.0),
-            None => format!("{}/{}", self.tenant, self.account),
+            Some(key) => format!("shared:{}", part(&key.0)),
+            None => format!("{}/{}", part(&self.tenant), part(&self.account)),
         }
     }
     fn identity(&self) -> BindingIdentity {

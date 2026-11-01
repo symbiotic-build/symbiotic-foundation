@@ -796,6 +796,52 @@ async fn request_records_429_meter_preserves_retry_after() {
 }
 
 #[tokio::test]
+async fn request_records_separator_identities_gate_separately() {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, |c| {
+        c.passthrough.routes[0].tenant = "org/team".into();
+        c.passthrough.routes[0].account = "prod".into();
+        let mut other = c.passthrough.routes[0].clone();
+        other.name = "other".into();
+        other.path = "/other".into();
+        other.tenant = "org".into();
+        other.account = "team/prod".into();
+        c.passthrough.routes.push(other);
+    })
+    .await;
+    let caller = harness.connect("/v1/responses", b"{}", "").await;
+    provider
+        .next()
+        .await
+        .reply
+        .send(responses_reply(
+            100,
+            (Utc::now() + chrono::Duration::days(1)).timestamp(),
+        ))
+        .ok()
+        .unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    // The other account is not exhausted, so its request still goes upstream.
+    let caller = harness.connect("/other", b"{}", "").await;
+    provider
+        .next()
+        .await
+        .reply
+        .send(Reply::json())
+        .ok()
+        .unwrap();
+    assert_eq!(decoded(&read(caller).await).0, 200);
+    let records = request_records(&harness).await;
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r["account"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("org%2Fteam/prod"), json!("org/team%2Fprod")]
+    );
+}
+
+#[tokio::test]
 async fn request_records_tenant_accounts_gate_separately_and_sharing_keys_gate_together() {
     for shared in [false, true] {
         let mut provider = Fixture::start().await;
@@ -1161,7 +1207,8 @@ async fn request_records_chat_usage_received_before_disconnect_is_retained() {
     ));
     let records = request_records(&harness).await;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["status"], 502);
+    // The provider sent 200 before the stream was cut; the record keeps that status.
+    assert_eq!(records[0]["status"], 200);
     assert_eq!(
         records[0]["usage"],
         json!({"normalized":{"input_tokens":7,"output_tokens":3},"provider":{"prompt_tokens":7,"completion_tokens":3}})
