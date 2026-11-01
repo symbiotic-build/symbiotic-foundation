@@ -14,7 +14,6 @@ serde.workspace = true
 serde_json.workspace = true
 # Request types and the Responses stream parser; no queue runtime in the sandbox.
 symbiotic-model = { path = "../symbiotic-model", default-features = false }
-thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 uuid.workspace = true
 

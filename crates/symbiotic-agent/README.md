@@ -29,13 +29,29 @@ Environment: `SYMBIOTIC_AGENT_MODEL_TOKEN`, when set, is sent as
 `Authorization: Bearer <value>` on every model request. Unset sends no authorization
 header; an empty value refuses the start. The value is never logged or printed.
 
+## Naming conventions
+
+Command flags use lower kebab case with `--`. JSON fields, tool names, notes
+kinds and `stop` values use lower snake case. Environment variables use upper
+snake case with the `SYMBIOTIC_AGENT_` prefix. External Responses names, such as
+`instructions`, `tool_choice` and `session-id`, keep the provider's spelling.
+
+## Trust boundary
+
+Model output is untrusted, including tool names, argument text and reports.
+The runtime accepts only the six tool names listed below. It strictly decodes
+arguments and refuses unknown fields. File tools check paths under `--root`,
+including symbolic link targets; note references receive syntax checks.
+The runtime checks each report against `report_schema` before accepting `finish`.
+The task file, policy file and `--root` are trusted inputs from the launcher.
+
 ## Task file
 
 ```json
 {
   "instructions": "role text and the output contract text",
   "task": {"unit": {"key": "unit-a"}},
-  "report_schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+  "report_schema": {"type": "object", "properties": {"unit": {"type": "string"}}, "required": ["unit"], "additionalProperties": false}
 }
 ```
 
@@ -136,7 +152,7 @@ Paths are relative, slash-separated, and may not contain `..` or leave `--root`,
 
   ````text
   ```json
-  {"unit":"unit-a", ...}
+  {"unit":"unit-a"}
   ```
   ````
 
@@ -177,5 +193,6 @@ Paths are relative, slash-separated, and may not contain `..` or leave `--root`,
 Use `cargo check --release --locked -p symbiotic-agent --all-targets` to compile.
 Run the fake-server integration tests with
 `cargo test --release --locked -p symbiotic-agent --test runtime`.
-Run schema and cap unit tests with
-`cargo test --release --locked -p symbiotic-agent --bins`.
+The command tests cover report validation, file tools and output caps.
+Run the Responses request wire-format unit test with
+`cargo test --release --locked -p symbiotic-agent --lib request_tools_use_strict_schemas_except_finish`.

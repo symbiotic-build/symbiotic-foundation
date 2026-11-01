@@ -175,6 +175,12 @@ impl Fixture {
             .unwrap()
     }
 
+    fn report_schema(&self, schema: Value) {
+        let mut task: Value = serde_json::from_slice(&fs::read(&self.task).unwrap()).unwrap();
+        task["report_schema"] = schema;
+        fs::write(&self.task, task.to_string()).unwrap();
+    }
+
     fn command(&self, model_url: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_symbiotic-agent"));
         command
@@ -209,6 +215,19 @@ impl Fixture {
 fn tail(request: &Request) -> &str {
     request.body["input"][1]["content"][0]["text"]
         .as_str()
+        .unwrap()
+}
+
+// These cases issue one successful call, so the remaining tail is its complete result.
+fn result_text(request: &Request) -> &str {
+    tail(request)
+        .split_once("\nResult step")
+        .unwrap()
+        .1
+        .split_once('\n')
+        .unwrap()
+        .1
+        .strip_suffix('\n')
         .unwrap()
 }
 
@@ -421,13 +440,26 @@ async fn read_line_output_and_per_step_caps_are_visible() {
     let text = tail(&requests[1]);
     assert!(text.contains("[cut: read_max_lines 2; requested through line 3]"));
     assert!(!text.contains("3| third"));
-    assert!(text.contains(" of 288 characters]"));
+    let capped = format!(
+        "long.txt: lines 1-2 of 3\n1| {}[cut: 122 of 288 characters]",
+        "界".repeat(94)
+    );
+    let result = text
+        .split("\nResult step 1 tool \"read\" arguments ")
+        .nth(2)
+        .unwrap()
+        .split_once('\n')
+        .unwrap()
+        .1
+        .split("\n\nError step")
+        .next()
+        .unwrap();
+    assert_eq!(result, capped);
+    assert!(result.chars().count() <= 150);
     assert!(text.contains("error: reads_per_step exceeded"));
     let logs = fixture.logs();
-    assert!(
-        logs[0]["calls"][1]["result_chars"].as_u64().unwrap()
-            > logs[0]["calls"][1]["shown_chars"].as_u64().unwrap()
-    );
+    assert_eq!(logs[0]["calls"][1]["result_chars"], 288);
+    assert_eq!(logs[0]["calls"][1]["shown_chars"], capped.chars().count());
     assert_eq!(logs[0]["calls"][2]["error"], "reads_per_step exceeded");
 }
 
@@ -491,19 +523,36 @@ async fn model_failure_stops_after_one_request_and_logs_the_failed_step() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_paths_return_errors_without_outside_file_contents() {
-    let fixture = Fixture::new(json!({}));
+    let fixture = Fixture::new(json!({"reads_per_step":64}));
     let outside = fixture._dir.path().join("outside.txt");
     fs::write(&outside, "OUTSIDE_CONTENT").unwrap();
     std::os::unix::fs::symlink(&outside, fixture.root.join("link")).unwrap();
-    let server = Server::start(vec![
-        reply(vec![
-            call("read", json!({"path":"../outside.txt","start":1,"end":1})),
-            call("read", json!({"path":outside,"start":1,"end":1})),
-            call("read", json!({"path":"link","start":1,"end":1})),
-        ]),
-        reply(vec![finish()]),
-    ])
-    .await;
+    let mut calls = Vec::new();
+    for path in [
+        "",
+        ".",
+        "..",
+        "../outside.txt",
+        "/outside",
+        "a//b",
+        "a/./b",
+        "a/../b",
+        "a/",
+        "a\\b",
+        "a\0b",
+        "missing",
+        "link",
+        outside.to_str().unwrap(),
+    ] {
+        calls.push(call("read", json!({"path":path,"start":1,"end":1})));
+        calls.push(call(
+            "search",
+            // The pattern matches the outside text without containing it, since the tail
+            // echoes every call's arguments.
+            json!({"pattern":"OUTSIDE.CONTENT","path":path,"max_hits":null}),
+        ));
+    }
+    let server = Server::start(vec![reply(calls), reply(vec![finish()])]).await;
     exit(&fixture.run(&server).await, 0);
     let logs = fixture.logs();
     assert_eq!(
@@ -513,7 +562,7 @@ async fn unsafe_paths_return_errors_without_outside_file_contents() {
             .iter()
             .map(|c| c["outcome"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["error"; 3]
+        vec!["error"; 28]
     );
     let requests = server.requests();
     assert!(!tail(&requests[1]).contains("OUTSIDE_CONTENT"));
@@ -525,7 +574,6 @@ async fn invalid_startup_inputs_send_no_request() {
     for case in [
         "unknown_policy",
         "unsupported_schema",
-        "required_missing_property",
         "missing_task",
         "duplicate_flag",
         "zero_limit",
@@ -539,7 +587,6 @@ async fn invalid_startup_inputs_send_no_request() {
         match case {
             "unknown_policy" => config["unexpected"] = json!(1),
             "unsupported_schema" => task["report_schema"]["pattern"] = json!("x"),
-            "required_missing_property" => task["report_schema"]["required"] = json!(["missing"]),
             "missing_task" => {
                 task.as_object_mut().unwrap().remove("task");
             }
@@ -674,4 +721,309 @@ fn command_line_requires_exact_flags_and_version_prints_one_line() {
         exit(&output, 1);
         assert!(String::from_utf8_lossy(&output.stderr).contains(reason));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn report_constraints_return_json_paths_and_accept_valid_reports() {
+    for (schema, good, bad, expected_path) in [
+        (
+            json!({"type":"string","minLength":2}),
+            json!("界a"),
+            json!("界"),
+            "/",
+        ),
+        (
+            json!({"type":["integer","null"]}),
+            json!(null),
+            json!(1.5),
+            "/",
+        ),
+        (json!({"type":"number"}), json!(1.5), json!(true), "/"),
+        (json!({"type":"boolean"}), json!(true), json!(1), "/"),
+        (json!({"type":"null"}), json!(null), json!(false), "/"),
+        (
+            json!({"type":"array","minItems":1,"maxItems":2,"items":{"enum":[1,2]}}),
+            json!([1, 2]),
+            json!([3]),
+            "/0",
+        ),
+        (json!({"minItems":1}), json!([1]), json!([]), "/"),
+        (json!({"maxItems":1}), json!([1]), json!([1, 2]), "/"),
+        (
+            json!({"type":"object","properties":{"a/b~c":{"type":"string"}},"required":["a/b~c"],"additionalProperties":false}),
+            json!({"a/b~c":"ok"}),
+            json!({}),
+            "/a~1b~0c",
+        ),
+        (
+            json!({"properties":{},"additionalProperties":false}),
+            json!({}),
+            json!({"extra":1}),
+            "/extra",
+        ),
+        (
+            json!({"enum":[9007199254740992_u64]}),
+            json!(9007199254740992_u64),
+            json!(9007199254740993_u64),
+            "/",
+        ),
+        (
+            json!({"type":"integer","enum":[1]}),
+            json!(1.0),
+            json!(2),
+            "/",
+        ),
+    ] {
+        let fixture = Fixture::new(json!({}));
+        fixture.report_schema(schema.clone());
+        let server = Server::start(vec![
+            reply(vec![call("finish", json!({"report":bad}))]),
+            reply(vec![call("finish", json!({"report":good}))]),
+        ])
+        .await;
+        let output = fixture.run(&server).await;
+        exit(&output, 0);
+        assert_eq!(output.stdout, format!("```json\n{good}\n```\n").as_bytes());
+        let logs = fixture.logs();
+        assert_eq!(logs[0]["calls"][0]["outcome"], "error", "{schema} {bad}");
+        assert!(
+            logs[0]["calls"][0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("invalid report {expected_path}:")),
+            "{schema} {bad}"
+        );
+        assert_eq!(logs[1]["stop"], "finished");
+    }
+}
+
+#[test]
+fn unsupported_or_malformed_report_schemas_refuse_start() {
+    for schema in [
+        json!({"pattern":"x"}),
+        json!({"properties":{"nested":{"format":"uri"}}}),
+        json!({"items":{"type":"unknown"}}),
+        json!({"type":["string","unknown"]}),
+        json!({"type":[]}),
+        json!({"additionalProperties":{}}),
+        json!({"required":[1]}),
+        json!({"minLength":-1}),
+        json!({"minItems":"1"}),
+        json!({"maxItems":1.5}),
+        json!({"enum":[]}),
+        json!({"description":1}),
+        json!({"items":true}),
+        json!({"properties":[]}),
+    ] {
+        let fixture = Fixture::new(json!({}));
+        fixture.report_schema(schema.clone());
+        let output = fixture
+            .command("http://127.0.0.1:9/v1/responses")
+            .output()
+            .unwrap();
+        exit(&output, 1);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .starts_with("symbiotic-agent: refused to start:"),
+            "{schema}"
+        );
+        assert_eq!(fs::read_dir(&fixture.out).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_without_properties_starts_and_checks_presence_only() {
+    for schema in [
+        json!({"type":"object","required":["unit"]}),
+        json!({"type":"object","properties":{},"required":["unit"]}),
+    ] {
+        let fixture = Fixture::new(json!({}));
+        fixture.report_schema(schema);
+        let server = Server::start(vec![
+            reply(vec![call("finish", json!({"report":{}}))]),
+            reply(vec![call("finish", json!({"report":{"unit":42}}))]),
+        ])
+        .await;
+        let output = fixture.run(&server).await;
+        exit(&output, 0);
+        assert_eq!(output.stdout, b"```json\n{\"unit\":42}\n```\n");
+        assert_eq!(
+            fixture.logs()[0]["calls"][0]["error"],
+            "invalid report /unit: required property is missing"
+        );
+        assert!(
+            tail(&server.requests()[1])
+                .contains("error: invalid report /unit: required property is missing")
+        );
+        assert_eq!(fixture.logs()[1]["stop"], "finished");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_null_path_returns_sorted_root_entries() {
+    let fixture = Fixture::new(json!({}));
+    fs::create_dir(fixture.root.join("a")).unwrap();
+    fs::write(fixture.root.join("z.txt"), "last").unwrap();
+    fs::write(fixture.root.join("b.txt"), "middle").unwrap();
+    let server = Server::start(vec![
+        reply(vec![call("list", json!({"path":null}))]),
+        reply(vec![finish()]),
+    ])
+    .await;
+    exit(&fixture.run(&server).await, 0);
+    assert_eq!(
+        result_text(&server.requests()[1]),
+        "a/\nb.txt\nfile.txt\nz.txt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_skips_non_utf8_and_special_files_and_reads_past_binary_prefix() {
+    let fixture = Fixture::new(json!({}));
+    fs::write(fixture.root.join("a-invalid.txt"), b"needle\xff").unwrap();
+    let mut late_invalid = vec![b'a'; 8192];
+    late_invalid.extend_from_slice(b"needle\xff");
+    fs::write(fixture.root.join("a-late-invalid.txt"), late_invalid).unwrap();
+    let mut binary = vec![b'a'; 8191];
+    binary.extend_from_slice(b"\0needle");
+    fs::write(fixture.root.join("b-binary"), binary).unwrap();
+    #[cfg(unix)]
+    {
+        assert!(
+            Command::new("mkfifo")
+                .arg(fixture.root.join("b-fifo"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink("missing", fixture.root.join("d-dangling")).unwrap();
+    }
+    fs::write(
+        fixture.root.join("z-text.txt"),
+        format!("{}\nneedle text\n", "a".repeat(8192)),
+    )
+    .unwrap();
+    let server = Server::start(vec![
+        reply(vec![call(
+            "search",
+            json!({"pattern":"needle","path":null,"max_hits":null}),
+        )]),
+        reply(vec![finish()]),
+    ])
+    .await;
+    exit(&fixture.run(&server).await, 0);
+    assert_eq!(
+        result_text(&server.requests()[1]),
+        "z-text.txt:2: needle text"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_skips_unreadable_files_and_directories_and_returns_text_hits() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(json!({}));
+    let file = fixture.root.join("a-unreadable.txt");
+    let directory = fixture.root.join("b-unreadable");
+    fs::write(&file, "needle unreadable").unwrap();
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("hidden.txt"), "needle hidden").unwrap();
+    fs::write(fixture.root.join("z-text.txt"), "needle text\n").unwrap();
+    let file_permissions = fs::metadata(&file).unwrap().permissions();
+    let directory_permissions = fs::metadata(&directory).unwrap().permissions();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o0)).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o0)).unwrap();
+    let server = Server::start(vec![
+        reply(vec![call(
+            "search",
+            json!({"pattern":"needle","path":null,"max_hits":null}),
+        )]),
+        reply(vec![finish()]),
+    ])
+    .await;
+    let output = fixture.run(&server).await;
+    fs::set_permissions(&file, file_permissions).unwrap();
+    fs::set_permissions(&directory, directory_permissions).unwrap();
+    exit(&output, 0);
+    assert_eq!(
+        result_text(&server.requests()[1]),
+        "z-text.txt:1: needle text"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_streams_requested_lines_and_counts_the_remaining_lines() {
+    for (bytes, start, expected) in [
+        (
+            &b"one\ntwo\nthree\n"[..],
+            2,
+            "file.txt: lines 2-3 of 3\n2| two\n3| three\n",
+        ),
+        (
+            &b"one\r\ntwo\r\nthree\r"[..],
+            1,
+            "file.txt: lines 1-2 of 3\n1| one\n2| two\n[cut: read_max_lines 2; requested through line 3]\n",
+        ),
+        (
+            &b"\n\nlast"[..],
+            1,
+            "file.txt: lines 1-2 of 3\n1| \n2| \n[cut: read_max_lines 2; requested through line 3]\n",
+        ),
+    ] {
+        let fixture = Fixture::new(json!({"read_max_lines":2}));
+        fs::write(fixture.root.join("file.txt"), bytes).unwrap();
+        let server = Server::start(vec![
+            reply(vec![call(
+                "read",
+                json!({"path":"file.txt","start":start,"end":100}),
+            )]),
+            reply(vec![finish()]),
+        ])
+        .await;
+        exit(&fixture.run(&server).await, 0);
+        assert_eq!(result_text(&server.requests()[1]), expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_cap_counts_unicode_and_keeps_the_marker_for_tiny_limits() {
+    for (limit, expected) in [
+        (
+            60,
+            format!(
+                "file.txt: lines 1-1 of 1\n1| {}[cut: 33 of 229 characters]",
+                "界".repeat(5)
+            ),
+        ),
+        (1, "[cut: 0 of 229 characters]".into()),
+    ] {
+        let fixture = Fixture::new(json!({"tool_output_max_chars":limit}));
+        fs::write(fixture.root.join("file.txt"), "界".repeat(200)).unwrap();
+        let server = Server::start(vec![
+            reply(vec![call(
+                "read",
+                json!({"path":"file.txt","start":1,"end":1}),
+            )]),
+            reply(vec![finish()]),
+        ])
+        .await;
+        exit(&fixture.run(&server).await, 0);
+        let requests = server.requests();
+        let result = result_text(&requests[1]);
+        assert_eq!(result, expected);
+        assert_eq!(
+            fixture.logs()[0]["calls"][0]["shown_chars"],
+            expected.chars().count()
+        );
+    }
+    let fixture = Fixture::new(json!({"tool_output_max_chars":2}));
+    fs::write(fixture.root.join("界a"), "").unwrap();
+    fs::remove_file(fixture.root.join("file.txt")).unwrap();
+    let server = Server::start(vec![
+        reply(vec![call("list", json!({"path":null}))]),
+        reply(vec![finish()]),
+    ])
+    .await;
+    exit(&fixture.run(&server).await, 0);
+    assert_eq!(result_text(&server.requests()[1]), "界a");
 }

@@ -248,34 +248,34 @@ impl Job {
         if log.r#final && call.name != "finish" {
             return Err("only finish is allowed on the last step".into());
         }
-        match call.name.as_str() {
-            "read" | "search" | "list" => {
-                *reads += 1;
-                if *reads > self.policy.reads_per_step {
-                    return Err("reads_per_step exceeded".into());
-                }
-                self.tools.run(&call.name, &call.arguments, &self.policy)
+        if matches!(call.name.as_str(), "read" | "search" | "list") {
+            *reads += 1;
+            if *reads > self.policy.reads_per_step {
+                return Err("reads_per_step exceeded".into());
             }
-            "note" => {
-                let note: Note = tools::arguments(&call.arguments)?;
-                let id = notes.add(note, log.step)?;
+        }
+        match execute_call(
+            &call.name,
+            &call.arguments,
+            &self.tools,
+            &self.policy,
+            &self.task.report_schema,
+            notes,
+            log.step,
+        )? {
+            ExecutedCall::Output(text) => Ok(text),
+            ExecutedCall::NoteAdded(id) => {
                 log.notes_added.push(id);
                 Ok(format!("note {id} added"))
             }
-            "note_drop" => {
-                let args: DropNote = tools::arguments(&call.arguments)?;
-                notes.drop(args.id)?;
-                log.notes_dropped.push(args.id);
-                Ok(format!("note {} dropped", args.id))
+            ExecutedCall::NoteDropped(id) => {
+                log.notes_dropped.push(id);
+                Ok(format!("note {id} dropped"))
             }
-            "finish" => {
-                let args: Finish = tools::arguments(&call.arguments)?;
-                validate_report(&self.task.report_schema, &args.report)
-                    .map_err(|e| format!("invalid report {e}"))?;
-                *report = Some(args.report);
+            ExecutedCall::Finished(value) => {
+                *report = Some(value);
                 Ok("finished".into())
             }
-            _ => Err(format!("unknown tool: {}", call.name)),
         }
     }
 
@@ -294,4 +294,42 @@ fn write_log(file: &mut File, log: &StepLog) -> std::io::Result<()> {
     bytes.push(b'\n');
     file.write_all(&bytes)?;
     file.flush()
+}
+
+// Shared by the job and fuzz entry point: decode and check the same model-controlled call.
+pub(crate) enum ExecutedCall {
+    Output(String),
+    NoteAdded(u64),
+    NoteDropped(u64),
+    Finished(Value),
+}
+
+pub(crate) fn execute_call(
+    name: &str,
+    arguments: &str,
+    tools: &Tools,
+    policy: &Policy,
+    report_schema: &Value,
+    notes: &mut Notes,
+    step: usize,
+) -> Result<ExecutedCall, String> {
+    match name {
+        "read" | "search" | "list" => tools.run(name, arguments, policy).map(ExecutedCall::Output),
+        "note" => {
+            let note: Note = tools::arguments(arguments)?;
+            notes.add(note, step).map(ExecutedCall::NoteAdded)
+        }
+        "note_drop" => {
+            let args: DropNote = tools::arguments(arguments)?;
+            notes.drop(args.id)?;
+            Ok(ExecutedCall::NoteDropped(args.id))
+        }
+        "finish" => {
+            let args: Finish = tools::arguments(arguments)?;
+            validate_report(report_schema, &args.report)
+                .map_err(|e| format!("invalid report {e}"))?;
+            Ok(ExecutedCall::Finished(args.report))
+        }
+        _ => Err(format!("unknown tool: {name}")),
+    }
 }

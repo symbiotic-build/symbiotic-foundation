@@ -7,6 +7,9 @@ A crash becomes a regression test in the crate that owns the parser.
 - `responses_stream`: provider bytes through `symbiotic_model::item_stream::ResponsesAdapter`
   and `symbiotic_model::responses::FunctionCall::from_item`.
 
+- `agent_call`: model-controlled tool argument decoding and report validation through
+  `symbiotic_agent::fuzz_call`, using temporary files and in-memory notes.
+
 Run one target for a bounded time, seeded with the recorded Codex answer:
 
 ```sh

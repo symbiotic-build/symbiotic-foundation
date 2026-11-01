@@ -1546,7 +1546,6 @@ dependencies = [
  "serde_json",
  "symbiotic-model",
  "tempfile",
- "thiserror",
  "tokio",
  "uuid",
 ]

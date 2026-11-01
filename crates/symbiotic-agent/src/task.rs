@@ -59,14 +59,7 @@ fn schema_at(schema: &Value, at: &str) -> Result<(), String> {
             "required" => {
                 let names = value.as_array().ok_or_else(invalid)?;
                 for name in names {
-                    let name = name.as_str().ok_or_else(invalid)?;
-                    if schema
-                        .get("properties")
-                        .and_then(Value::as_object)
-                        .is_none_or(|p| !p.contains_key(name))
-                    {
-                        return Err(failure(&here, "required name is missing from properties"));
-                    }
+                    name.as_str().ok_or_else(invalid)?;
                 }
             }
             "additionalProperties" if value.is_boolean() => {}
@@ -207,95 +200,5 @@ fn integer_float_equal(integer: &serde_json::Number, float: Option<f64>) -> bool
         float >= i64::MIN as f64 && float < i64::MAX as f64 && float as i64 == number
     } else {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn report_schema_checks_every_supported_constraint_and_json_path() {
-        for (schema, good, bad, expected_path) in [
-            (
-                json!({"type":"string","minLength":2}),
-                json!("界a"),
-                json!("界"),
-                "/",
-            ),
-            (
-                json!({"type":["integer","null"]}),
-                json!(null),
-                json!(1.5),
-                "/",
-            ),
-            (json!({"type":"number"}), json!(1.5), json!(true), "/"),
-            (json!({"type":"boolean"}), json!(true), json!(1), "/"),
-            (json!({"type":"null"}), json!(null), json!(false), "/"),
-            (
-                json!({"type":"array","minItems":1,"maxItems":2,"items":{"enum":[1,2]}}),
-                json!([1, 2]),
-                json!([3]),
-                "/0",
-            ),
-            (json!({"minItems":1}), json!([1]), json!([]), "/"),
-            (json!({"maxItems":1}), json!([1]), json!([1, 2]), "/"),
-            (
-                json!({"type":"object","properties":{"a/b~c":{"type":"string"}},"required":["a/b~c"],"additionalProperties":false}),
-                json!({"a/b~c":"ok"}),
-                json!({}),
-                "/a~1b~0c",
-            ),
-            (
-                json!({"properties":{},"additionalProperties":false}),
-                json!({}),
-                json!({"extra":1}),
-                "/extra",
-            ),
-            (
-                json!({"enum":[9007199254740992_u64]}),
-                json!(9007199254740992_u64),
-                json!(9007199254740993_u64),
-                "/",
-            ),
-            (
-                json!({"type":"integer","enum":[1]}),
-                json!(1.0),
-                json!(2),
-                "/",
-            ),
-        ] {
-            check_schema(&schema).unwrap();
-            validate_report(&schema, &good).unwrap();
-            assert!(
-                validate_report(&schema, &bad)
-                    .unwrap_err()
-                    .starts_with(&format!("{expected_path}:")),
-                "{schema} {bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn unsupported_or_malformed_schema_is_refused_at_any_depth() {
-        for schema in [
-            json!({"pattern":"x"}),
-            json!({"properties":{"nested":{"format":"uri"}}}),
-            json!({"items":{"type":"unknown"}}),
-            json!({"type":["string","unknown"]}),
-            json!({"type":[]}),
-            json!({"additionalProperties":{}}),
-            json!({"required":["missing"],"properties":{}}),
-            json!({"minLength":-1}),
-            json!({"minItems":"1"}),
-            json!({"maxItems":1.5}),
-            json!({"enum":[]}),
-            json!({"description":1}),
-            json!({"items":true}),
-            json!({"properties":[]}),
-        ] {
-            assert!(check_schema(&schema).is_err(), "{schema}");
-        }
     }
 }

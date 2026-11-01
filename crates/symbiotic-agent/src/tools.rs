@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::ErrorKind,
+    io::{BufRead, BufReader, ErrorKind, Read as _},
     path::{Path, PathBuf},
 };
 
@@ -87,24 +87,27 @@ impl Tools {
         if args.start < 1 || args.start > args.end {
             return Err("read requires 1 <= start <= end".into());
         }
-        let text = fs::read_to_string(self.resolve(&args.path)?)
-            .map_err(|e| format!("{}: {e}", args.path))?;
-        let lines: Vec<_> = text.lines().collect();
-        let end = args.end.min(lines.len());
+        let file =
+            fs::File::open(self.resolve(&args.path)?).map_err(|e| format!("{}: {e}", args.path))?;
+        let requested_end = args.end.min(args.start.saturating_add(max_lines - 1));
+        let mut selected = String::new();
+        let mut line_count = 0;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|e| format!("{}: {e}", args.path))?;
+            line_count += 1;
+            if (args.start..=requested_end).contains(&line_count) {
+                selected.push_str(&format!("{line_count}| {line}\n"));
+            }
+        }
+        let end = args.end.min(line_count);
         if args.start > end {
             return Err("read start is beyond the last line".into());
         }
-        let shown_end = end.min(args.start.saturating_add(max_lines - 1));
+        let shown_end = requested_end.min(line_count);
         let mut result = format!(
-            "{}: lines {}-{} of {}\n",
-            args.path,
-            args.start,
-            shown_end,
-            lines.len()
+            "{}: lines {}-{} of {}\n{selected}",
+            args.path, args.start, shown_end, line_count
         );
-        for number in args.start..=shown_end {
-            result.push_str(&format!("{number}| {}\n", lines[number - 1]));
-        }
         if shown_end < end {
             result.push_str(&format!(
                 "[cut: read_max_lines {max_lines}; requested through line {end}]\n"
@@ -231,14 +234,20 @@ impl Tools {
             }
             ancestors.remove(&canonical);
         } else if metadata.is_file() {
-            let bytes = match fs::read(path) {
-                Ok(bytes) => bytes,
+            let mut file = match fs::File::open(path) {
+                Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(()),
                 Err(error) => return Err(error.to_string()),
             };
-            if bytes[..bytes.len().min(8192)].contains(&0) {
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take(8192)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.contains(&0) {
                 return Ok(());
             }
+            file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 return Ok(());
             };
@@ -351,105 +360,6 @@ pub(crate) fn cap(text: &str, limit: usize) -> Capped {
 mod tests {
     use super::*;
 
-    fn policy() -> Policy {
-        serde_json::from_value(json!({"model":"test","reasoning_effort":null,"max_output_tokens":null,"max_steps":2,"read_max_lines":2,"reads_per_step":8,"tool_output_max_chars":1000,"search_max_hits":10,"outline":null})).unwrap()
-    }
-
-    #[test]
-    fn list_with_null_path_returns_sorted_root_entries() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("z.txt"), "last").unwrap();
-        fs::create_dir(root.path().join("a")).unwrap();
-        fs::write(root.path().join("b.txt"), "middle").unwrap();
-        let tools = Tools::new(root.path()).unwrap();
-        assert_eq!(
-            tools.run("list", r#"{"path":null}"#, &policy()).unwrap(),
-            "a/\nb.txt\nz.txt"
-        );
-    }
-
-    #[test]
-    fn search_skips_non_utf8_and_special_files_and_returns_text_hits() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("a-invalid.txt"), b"needle\xff").unwrap();
-        #[cfg(unix)]
-        {
-            assert!(
-                std::process::Command::new("mkfifo")
-                    .arg(root.path().join("b-fifo"))
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            std::os::unix::fs::symlink("missing", root.path().join("d-dangling")).unwrap();
-        }
-        fs::write(root.path().join("z-text.txt"), "needle text\n").unwrap();
-        let tools = Tools::new(root.path()).unwrap();
-        assert_eq!(
-            tools
-                .run(
-                    "search",
-                    r#"{"pattern":"needle","path":null,"max_hits":null}"#,
-                    &policy()
-                )
-                .unwrap(),
-            "z-text.txt:1: needle text"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn search_skips_unreadable_files_and_directories_and_returns_text_hits() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        let file = root.path().join("a-unreadable.txt");
-        let directory = root.path().join("b-unreadable");
-        fs::write(&file, "needle unreadable").unwrap();
-        fs::create_dir(&directory).unwrap();
-        fs::write(directory.join("hidden.txt"), "needle hidden").unwrap();
-        fs::write(root.path().join("z-text.txt"), "needle text\n").unwrap();
-        let file_permissions = fs::metadata(&file).unwrap().permissions();
-        let directory_permissions = fs::metadata(&directory).unwrap().permissions();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o0)).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o0)).unwrap();
-        let tools = Tools::new(root.path()).unwrap();
-        let result = tools.run(
-            "search",
-            r#"{"pattern":"needle","path":null,"max_hits":null}"#,
-            &policy(),
-        );
-        fs::set_permissions(&file, file_permissions).unwrap();
-        fs::set_permissions(&directory, directory_permissions).unwrap();
-        assert_eq!(result.unwrap(), "z-text.txt:1: needle text");
-    }
-
-    #[test]
-    fn search_refuses_missing_or_outside_starting_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("root");
-        fs::create_dir(&root).unwrap();
-        fs::write(directory.path().join("outside"), "needle outside").unwrap();
-        let tools = Tools::new(&root).unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(directory.path().join("outside"), root.join("link"))
-                .unwrap();
-        }
-        for path in ["missing", "../outside", "link"] {
-            assert!(
-                tools
-                    .run(
-                        "search",
-                        &json!({"pattern":"needle","path":path,"max_hits":null}).to_string(),
-                        &policy()
-                    )
-                    .is_err(),
-                "{path}"
-            );
-        }
-    }
-
     #[test]
     fn request_tools_use_strict_schemas_except_finish() {
         use symbiotic_model::responses::{ResponsesRequest, ToolChoice};
@@ -491,96 +401,5 @@ mod tests {
             };
             assert_eq!(json!(flags), expected);
         }
-    }
-
-    #[test]
-    fn cut_marker_counts_unicode_scalars_and_preserves_whole_characters() {
-        let text = "界".repeat(200);
-        let result = cap(&text, 60);
-        assert_eq!(result.total, 200);
-        let payload = result.text.split("[cut:").next().unwrap().chars().count();
-        assert!(payload > 0 && payload < 60);
-        assert_eq!(
-            result.text,
-            format!("{}[cut: {payload} of 200 characters]", "界".repeat(payload))
-        );
-        assert_eq!(result.shown, result.text.chars().count());
-        assert!(result.shown <= 60);
-        assert_eq!(cap("界a", 2).text, "界a");
-        assert_eq!(cap(&text, 1).text, "[cut: 0 of 200 characters]");
-    }
-}
-
-#[cfg(test)]
-mod path_tests {
-    use super::*;
-
-    #[test]
-    fn file_tools_refuse_unsafe_components_and_symlinks_but_read_safe_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("root");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("file"), "one\ntwo\nthree\n").unwrap();
-        fs::write(directory.path().join("outside"), "outside contents").unwrap();
-        let tools = Tools::new(&root).unwrap();
-        let policy: Policy = serde_json::from_value(json!({"model":"test","reasoning_effort":null,"max_output_tokens":null,"max_steps":2,"read_max_lines":2,"reads_per_step":8,"tool_output_max_chars":1000,"search_max_hits":10,"outline":null})).unwrap();
-        for path in [
-            "",
-            ".",
-            "..",
-            "../outside",
-            "/outside",
-            "a//b",
-            "a/./b",
-            "a/../b",
-            "a/",
-            "a\\b",
-            "a\0b",
-        ] {
-            assert!(
-                tools
-                    .run(
-                        "read",
-                        &json!({"path":path,"start":1,"end":1}).to_string(),
-                        &policy
-                    )
-                    .is_err(),
-                "{path:?}"
-            );
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(directory.path().join("outside"), root.join("link"))
-                .unwrap();
-            assert!(
-                tools
-                    .run(
-                        "read",
-                        &json!({"path":"link","start":1,"end":1}).to_string(),
-                        &policy
-                    )
-                    .is_err()
-            );
-        }
-        assert_eq!(
-            tools
-                .run(
-                    "read",
-                    &json!({"path":"file","start":2,"end":100}).to_string(),
-                    &policy
-                )
-                .unwrap(),
-            "file: lines 2-3 of 3\n2| two\n3| three\n"
-        );
-        assert_eq!(
-            tools
-                .run(
-                    "read",
-                    &json!({"path":"file","start":1,"end":100}).to_string(),
-                    &policy
-                )
-                .unwrap(),
-            "file: lines 1-2 of 3\n1| one\n2| two\n[cut: read_max_lines 2; requested through line 3]\n"
-        );
     }
 }
