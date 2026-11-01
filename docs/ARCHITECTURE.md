@@ -105,6 +105,8 @@ Owns provider-neutral model contracts:
 - rerank;
 - classification (typed Noul / Choice / Score questions answered with
   probabilities; see [classification](architecture/classification.md));
+- OpenAI Responses requests with function tools, and the function calls in
+  their answers (`responses`), for the agent runtime;
 - future vision/media/agent-task capabilities;
 - provider identity and capability descriptions;
 - auth mode descriptions;
