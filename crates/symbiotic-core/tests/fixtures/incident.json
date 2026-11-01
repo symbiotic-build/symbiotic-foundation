@@ -1,0 +1,12 @@
+{
+  "id": "inc-20261031-20",
+  "class": "report_drift",
+  "title": "Wrong claims in reports (gix before swap, #631 cause, proxy tokens)",
+  "what": "three corrections",
+  "started": "2026-10-31T18:00Z",
+  "detected": "2026-11-01T01:27Z",
+  "detectedBy": "deploy session and operator",
+  "escape": "claims not checked against their source before sending",
+  "refs": [],
+  "status": "open"
+}

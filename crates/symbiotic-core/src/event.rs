@@ -81,15 +81,8 @@ pub enum DetailValue {
 /// An enumeration value: 1 to 64 ASCII letters, digits, `_`, `.`, `:` or `-`.
 /// The restriction keeps sentences out of event detail.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
-pub struct EnumToken(
-    #[cfg_attr(
-        feature = "schema",
-        schemars(regex(pattern = r"^[A-Za-z0-9_.:-]{1,64}$"))
-    )]
-    String,
-);
+pub struct EnumToken(String);
 
 impl EnumToken {
     /// Longest accepted token, in bytes.
@@ -98,6 +91,22 @@ impl EnumToken {
     /// The token text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+// Written by hand: schemars drops field attributes behind `try_from`.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for EnumToken {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "EnumToken".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "An enumeration value, never free text.",
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+        })
     }
 }
 

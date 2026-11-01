@@ -57,7 +57,8 @@ pub struct Constraint {
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum ConstraintRule {
     /// Every step in `first` finishes before any step in `then` starts; an
@@ -131,7 +132,8 @@ pub struct TriggerPattern {
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum Threshold {
     /// `count` matches, counted per distinct value of the `group_by` subject keys.
@@ -154,7 +156,8 @@ pub enum Threshold {
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum PolicyAction {
     Record,

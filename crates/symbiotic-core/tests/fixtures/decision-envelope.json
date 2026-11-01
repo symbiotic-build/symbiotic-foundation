@@ -1,0 +1,43 @@
+{
+  "id": "warden-593-tuning-matrix:hardware-key",
+  "revision": 1,
+  "campaignId": "warden-593-tuning-matrix",
+  "questions": [
+    {
+      "id": "1",
+      "topic": "Provider accounts",
+      "kind": "blocker",
+      "prompt": "Re-authenticate the gpt-daybreak account with its hardware key?",
+      "context": [
+        { "label": "fact", "text": "The account's hardware-key gate refused a third of zip's gpt-daybreak auditor jobs." },
+        { "label": "fact", "text": "The refusals began in replays on 2026-10-30 and were found on 2026-10-31 at 23:55 UTC." },
+        { "label": "assessment", "text": "Every later gpt-daybreak auditor job meets the same gate until the account is re-authenticated." }
+      ],
+      "afterAnswer": "The audit lane reruns the refused jobs after the re-authentication.",
+      "whyNow": "The matrix keeps scheduling gpt-daybreak auditor jobs.",
+      "evidenceRefs": ["incident:inc-20261030-01"],
+      "answerFormat": "option",
+      "options": [
+        { "id": "reauthenticate", "label": "Re-authenticate the account now", "consequence": "The refused jobs rerun and zip keeps its gpt-daybreak auditor cells.", "reversible": true },
+        { "id": "leave-out", "label": "Leave gpt-daybreak out of zip's auditor jobs", "consequence": "The matrix has no gpt-daybreak auditor cells for zip.", "reversible": true }
+      ],
+      "recommendedOptionId": "reauthenticate",
+      "confidence": 0.9,
+      "severity": "critical",
+      "costOfDelay": "Each scheduled gpt-daybreak auditor job is refused.",
+      "resolutionTrail": {
+        "attempts": [
+          { "tier": "recall", "outcome": "skipped", "evidenceRefs": [] },
+          { "tier": "peer", "outcome": "skipped", "evidenceRefs": [] },
+          { "tier": "council", "outcome": "skipped", "evidenceRefs": [] }
+        ],
+        "escalationReason": "Account and credential steps always reach the operator."
+      }
+    }
+  ],
+  "sourceEvents": [],
+  "audience": [{ "id": "operator", "kind": "human", "displayName": "Operator" }],
+  "wakes": [{ "id": "audit-lane", "kind": "agent", "displayName": "Audit lane" }],
+  "createdAt": "2026-10-31T23:55:00Z",
+  "state": "open"
+}

@@ -73,7 +73,7 @@ pub struct DecisionQuestion {
     pub recommended_option_id: Option<String>,
     /// Confidence in the recommendation, from 0 to 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f32>,
+    pub confidence: Option<f64>,
     pub severity: QuestionSeverity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safe_default: Option<SafeDefault>,
@@ -186,7 +186,8 @@ pub struct AnswerRecord {
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum Answer {
     Option {
@@ -235,7 +236,7 @@ pub struct TierAttempt {
     pub tier: EscalationTier,
     pub outcome: TierOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<f32>,
+    pub confidence: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub evidence_refs: Vec<String>,
@@ -271,7 +272,8 @@ pub enum TierOutcome {
 #[serde(
     tag = "kind",
     rename_all = "snake_case",
-    rename_all_fields = "camelCase"
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
 )]
 pub enum UnblockKey {
     Exploratory {

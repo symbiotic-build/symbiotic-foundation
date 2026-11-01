@@ -24,7 +24,7 @@ pub struct Signal {
     /// Zero-based turn index within the session.
     pub turn: u32,
     /// Classifier confidence, from 0 to 1.
-    pub confidence: f32,
+    pub confidence: f64,
 }
 
 /// What a message carries.
