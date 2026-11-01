@@ -468,16 +468,24 @@ fn decode_usage(
             v.as_u64().map(Some).ok_or(ItemStreamError::InvalidEvent)
         }
     };
+    let chat_completions = input == "prompt_tokens";
     let input = number(&u[input])?;
-    let cached = number(&u[input_details]["cached_tokens"])?;
-    if cached.zip(input).is_some_and(|(c, i)| c > i) {
-        return Err(ItemStreamError::InvalidEvent);
-    }
+    let nested_hit = number(&u[input_details]["cached_tokens"])?;
+    let (hit, miss) = if chat_completions {
+        (
+            number(&u["prompt_cache_hit_tokens"])?,
+            number(&u["prompt_cache_miss_tokens"])?,
+        )
+    } else {
+        (None, None)
+    };
+    let (cached, cache_miss) = crate::normalize_prompt_cache_counts(input, hit, miss, nested_hit)
+        .map_err(|_| ItemStreamError::InvalidEvent)?;
     Ok(UsageTrace {
         input_tokens: input,
         output_tokens: number(&u[output])?,
         cache_hit_tokens: cached,
-        cache_miss_tokens: input.zip(cached).map(|(i, c)| i - c),
+        cache_miss_tokens: cache_miss,
         reasoning_tokens: number(&u[output_details]["reasoning_tokens"])?,
         ..Default::default()
     })
@@ -633,6 +641,79 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+    #[test]
+    fn chat_completions_deepseek_cache_usage_is_validated_in_json_and_streams() {
+        for (usage, expected) in [
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":2,"prompt_cache_miss_tokens":5}),
+                Some((Some(2), Some(5))),
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":2}),
+                Some((Some(2), Some(5))),
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_miss_tokens":5}),
+                Some((Some(2), Some(5))),
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_miss_tokens":"5"}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_cache_hit_tokens":2,"prompt_cache_miss_tokens":5}),
+                Some((Some(2), Some(5))),
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_tokens_details":{"cached_tokens":3},"prompt_cache_hit_tokens":99,"prompt_cache_miss_tokens":99}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":8}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":2,"prompt_cache_miss_tokens":4}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":2,"prompt_cache_miss_tokens":-1}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":"2"}),
+                None,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":u64::MAX,"prompt_cache_hit_tokens":u64::MAX,"prompt_cache_miss_tokens":1}),
+                None,
+            ),
+        ] {
+            let value = serde_json::json!({"choices":[], "usage":usage});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let wire = format!("data: {value}\n\n");
+            let streamed = ChatCompletionsAdapter::default()
+                .feed(wire.as_bytes(), 4096)
+                .map(|mut events| events.remove(0));
+            for result in [ChatCompletionsAdapter::json(&bytes), streamed] {
+                if let Some(expected) = expected {
+                    let ItemEvent::Usage { usage, .. } = result.unwrap() else {
+                        panic!("usage event")
+                    };
+                    assert_eq!(
+                        (usage.cache_hit_tokens, usage.cache_miss_tokens),
+                        expected,
+                        "{value}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(ItemStreamError::InvalidEvent)),
+                        "{value}"
+                    );
+                }
+            }
         }
     }
     #[test]

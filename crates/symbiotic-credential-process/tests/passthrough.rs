@@ -435,3 +435,52 @@ fn chat_completions_and_get_model_listing_routes_validate_without_io() {
     assert!(settings.validate_routes().is_err());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn startup_refuses_version_17_queue_with_rebuild_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let settings = config(dir.path());
+    write(&dir.path().join("admission"), &[b'a'; 32]);
+    fs::create_dir(&settings.state_dir).unwrap();
+    fs::set_permissions(&settings.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = settings
+        .state_dir
+        .join(symbiotic_ai_runtime::QUEUE_DATABASE);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.pragma_update(None, "user_version", 17).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let config_path = dir.path().join("config.json");
+    write(&config_path, &serde_json::to_vec(&settings).unwrap());
+    let error = match CredentialProcess::open(settings) {
+        Ok(_) => panic!("accepted version 17 queue"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "unsupported_queue_schema: unsupported queue schema; rebuild the queue database"
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        17
+    );
+    let binary =
+        std::env::var_os("CARGO_BIN_EXE_symbiotic-credential-process").unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("symbiotic-credential-process")
+                .into_os_string()
+        });
+    let output = Command::new(binary).arg(config_path).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "unsupported_queue_schema: unsupported queue schema; rebuild the queue database\n"
+    );
+}

@@ -59,7 +59,11 @@ mod execution;
 mod maintained;
 pub use execution::{ExecutionAttemptStatus, ExecutionError, ExecutionResult};
 pub mod jobs;
+mod passthrough_spend;
 pub mod spend;
+pub use passthrough_spend::{
+    DecimalAmount, PassthroughPrice, PeakWindow, SpendCost, SpendLimit, TokenRates,
+};
 #[cfg(test)]
 mod spend_tests;
 pub use model::{
@@ -426,6 +430,36 @@ impl Runtime {
         reference: &SpendReceiptRef,
     ) -> Result<Option<SpendReceipt>, ModelError> {
         self.inner.spend.receipt(reference)
+    }
+
+    /// Sum canonical passthrough costs by account, send time [start, end), and optional filters.
+    /// Request identifiers match literal prefixes, including SQL wildcard characters.
+    pub fn spend_cost(
+        &self,
+        account: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        invocation: Option<&str>,
+        request_id_prefix: Option<&str>,
+    ) -> Result<SpendCost, ModelError> {
+        let ceil_millis = |bound: chrono::DateTime<chrono::Utc>| {
+            bound.timestamp_millis().saturating_add(i64::from(
+                !bound.timestamp_subsec_nanos().is_multiple_of(1_000_000),
+            ))
+        };
+        self.inner
+            .job_ledger
+            .as_ref()
+            .ok_or(ModelError::Queue(
+                model::DiagnosticCode::SpendLedgerUnavailable,
+            ))?
+            .cost(
+                account,
+                ceil_millis(start),
+                ceil_millis(end),
+                invocation,
+                request_id_prefix,
+            )
     }
 
     /// Foundation-owned reconciliation; callers must establish external charge evidence.
@@ -1035,6 +1069,17 @@ impl AccountAdmission {
         &self,
         binding: &BindingIdentity,
     ) -> Result<SpendReceiptRef, ModelError> {
+        self.reserve_passthrough_priced(binding, None, None, None)
+    }
+
+    /// Atomically reserve money at send time with the frozen price and caller correlation id.
+    pub fn reserve_passthrough_priced(
+        &self,
+        binding: &BindingIdentity,
+        price: Option<&PassthroughPrice>,
+        limit: Option<&SpendLimit>,
+        request_id: Option<&str>,
+    ) -> Result<SpendReceiptRef, ModelError> {
         let reference = SpendReceiptRef::new(format!("passthrough:{}", QueueItemId::new().0))?;
         let reservation = SpendReservation {
             reference: reference.clone(),
@@ -1043,7 +1088,15 @@ impl AccountAdmission {
             binding: model::configuration_revision(binding)?.0,
             request_limit: None,
         };
-        if !self.runtime.inner.spend.reserve(&reservation)? {
+        let ledger = self
+            .runtime
+            .inner
+            .job_ledger
+            .as_ref()
+            .ok_or(ModelError::Queue(
+                model::DiagnosticCode::SpendLedgerUnavailable,
+            ))?;
+        if !ledger.reserve_passthrough(&reservation, request_id, price, limit)? {
             return Err(ModelError::Queue(
                 symbiotic_core::DiagnosticCode::SpendLedgerUnavailable,
             ));
@@ -1051,8 +1104,8 @@ impl AccountAdmission {
         Ok(reference)
     }
 
-    /// Settle reported numeric usage without storing provider text or response bytes.
-    /// Missing usage leaves the reservation unknown, including after a process restart.
+    /// Settle complete numeric input/output usage without storing provider text or bytes.
+    /// Partial usage leaves the reservation unknown and reconcilable on every route.
     pub fn finish_passthrough(
         &self,
         reference: &SpendReceiptRef,
@@ -1066,7 +1119,10 @@ impl AccountAdmission {
             reasoning_tokens: usage.reasoning_tokens,
             ..Default::default()
         };
-        if !model::has_measured_usage(&usage) {
+        if usage.output_tokens.is_none()
+            || (usage.input_tokens.is_none()
+                && (usage.cache_hit_tokens.is_none() || usage.cache_miss_tokens.is_none()))
+        {
             return Ok(());
         }
         self.runtime
@@ -1220,7 +1276,7 @@ fn open_persistent_queue(
         }
     }
     let queue = SqliteQueue::open(&path)
-        .map_err(|_err| ModelError::Queue(symbiotic_core::DiagnosticCode::QueueFailure))?
+        .map_err(|err| ModelError::Queue(err.code()))?
         .with_clock(config.clock.clone());
     let sweep = Sweep::new(
         queue.clone(),

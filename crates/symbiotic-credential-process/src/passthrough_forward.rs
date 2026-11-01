@@ -613,6 +613,15 @@ impl Passthrough {
                 .map_err(|_| EgressError::InvalidRequest)?;
             // execute() starts reqwest's timers; defer it until the grant actually sends.
             let transport = async { route.client.execute(transport_request).await };
+            let accounted = route.config.stream == StreamDialect::OpenaiChatCompletions
+                && route.config.method == PassthroughMethod::Post;
+            let receipt_id = match id {
+                Some(id) if accounted => {
+                    let secrets = route.secrets().await;
+                    safe_value(id.as_bytes(), &secrets, 64).then_some(id)
+                }
+                _ => None,
+            };
             let mut was_new = false;
             let mut receipt = None;
             let queue_waited_ms = wait.total.as_millis() as u64;
@@ -632,14 +641,13 @@ impl Passthrough {
                         {
                             Ok(None)
                         } else {
-                            if route.config.stream == StreamDialect::OpenaiChatCompletions
-                                && route.config.method == PassthroughMethod::Post
-                            {
-                                receipt = Some(
-                                    route
-                                        .account
-                                        .reserve_passthrough(&route.config.identity())?,
-                                );
+                            if accounted {
+                                receipt = Some(route.account.reserve_passthrough_priced(
+                                    &route.config.identity(),
+                                    route.config.price.as_ref(),
+                                    route.config.spend_limit.as_ref(),
+                                    receipt_id,
+                                )?);
                             }
                             was_new = new;
                             // Counted and logged inside the check, which runs just before the
@@ -657,8 +665,16 @@ impl Passthrough {
                     },
                     transport,
                 )
-                .await
-                .map_err(|_| EgressError::StateUnavailable)?;
+                .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(error) if error.code() == model::DiagnosticCode::SpendBudgetExhausted => {
+                    return self
+                        .local_error(write, started, 402, "spend_budget_exhausted", wait, None)
+                        .await;
+                }
+                Err(_) => return Err(EgressError::StateUnavailable),
+            };
             let Some(sent) = sent else {
                 slot = None;
                 continue;
@@ -682,6 +698,9 @@ impl Passthrough {
                 Ok(mut response) => {
                     self.observed_headers(route, response.headers()).await?;
                     let status = response.status().as_u16();
+                    if status == 402 {
+                        route.balance_refresh.notify_one();
+                    }
                     let response_headers = response.headers().clone();
                     if (200..300).contains(&status) {
                         if let Some(key) = &key {
@@ -783,13 +802,24 @@ impl Passthrough {
                                     .await;
                             }
                         }
-                        match error_body(&mut response, route.config.max_response_bytes).await {
+                        let body = error_body(&mut response, route.config.max_response_bytes).await;
+                        match body {
                             Ok(bytes) => {
                                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)
                                     .unwrap_or(serde_json::Value::Null);
                                 let message = failure_message(&value, &route.secrets().await)?;
-                                let (code, mut class) =
+                                let (mut code, mut class) =
                                     ResponsesAdapter::http_failure(status, &bytes);
+                                if status == 402
+                                    && message.as_deref().is_some_and(|m| {
+                                        m.to_ascii_lowercase().contains("insufficient balance")
+                                    })
+                                {
+                                    code = model::DiagnosticCode::ProviderBalanceExhausted
+                                        .code()
+                                        .into();
+                                    class = ErrorClass::Final;
+                                }
                                 // Kimi Code reports account limits only in the message;
                                 // transient 429s must keep the adapter's retry classification.
                                 if status == 429
@@ -848,9 +878,25 @@ impl Passthrough {
             if let Some(named) = named {
                 policy.extend(named.clone());
             }
-            let decision = self
-                .retry_decision(route, &failure, &log, &policy, started, fallback.len() != 0)
-                .await?;
+            let decision = if failure.code == model::DiagnosticCode::ProviderBalanceExhausted.code()
+            {
+                log.warn(
+                    &failure.code,
+                    ErrorClass::Final,
+                    started,
+                    "fail",
+                    None,
+                    failure.message.as_deref(),
+                );
+                RetryDecision {
+                    action: RetryAction::Fail,
+                    max_attempts: None,
+                    backoff: Default::default(),
+                }
+            } else {
+                self.retry_decision(route, &failure, &log, &policy, started, fallback.len() != 0)
+                    .await?
+            };
             // Keep the single probe until its outcome has recorded the shared hold.
             drop(session);
             let complete = join
@@ -896,9 +942,16 @@ impl Passthrough {
                             "x-symbiotic-queue-waited-ms".into(),
                             wait.total.as_millis().to_string(),
                         ));
-                        wait.outcome = "upstream_status".into();
+                        let code = if failure.code
+                            == model::DiagnosticCode::ProviderBalanceExhausted.code()
+                        {
+                            model::DiagnosticCode::ProviderBalanceExhausted.code()
+                        } else {
+                            "upstream_status"
+                        };
+                        wait.outcome = code.into();
                         wait.status = Some(failure.status);
-                        return fixed(write, failure.status, "upstream_status", &h).await;
+                        return fixed(write, failure.status, code, &h).await;
                     }
                     return self
                         .local_error(

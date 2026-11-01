@@ -104,4 +104,7 @@ one page, and a `max_page_bytes` lowered after a result was stored
 Diagnostics and expiry maintenance use content-free projections; expiry deletes
 copies directly. Encoded lengths and
 all indexes are rebuildable from canonical rows. The unreleased SQLite schema
-version is 16; older layouts are refused without migration.
+version is 18. Version 18 adds `sent_at_ms`, `caller_request_id`, `price`, and
+`cost_nano_usd` to spend receipts, plus the `spend_account_time` index on
+`(account, sent_at_ms)`. Older layouts are refused without migration.
+Deploying version 18 requires rebuilding the queue database.

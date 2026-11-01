@@ -19,6 +19,12 @@ use crate::{
     stream::{ItemJoin, StreamDialect},
 };
 use chrono::{DateTime, Utc};
+pub use symbiotic_ai_runtime::{
+    DecimalAmount, PassthroughPrice, PeakWindow, SpendLimit, TokenRates,
+};
+#[path = "passthrough_balance.rs"]
+mod balance;
+pub use balance::{BalanceConfig, BalanceProvider, Currency, LowBalance};
 use forward::RequestLog;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -148,6 +154,15 @@ pub struct PassthroughRoute {
     /// Optional route names used only by the switch action, in order.
     #[serde(default)]
     pub fallback_routes: Vec<String>,
+    /// Optional exact USD token prices, frozen at send time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PassthroughPrice>,
+    /// Optional rolling account money budget; requires price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_limit: Option<SpendLimit>,
+    /// Optional provider balance polling and low-balance warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceConfig>,
     /// Optional new-session admission policy.
     #[serde(default)]
     pub new_session: Option<NewSessionConfig>,
@@ -259,6 +274,7 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
     }
     let mut names: HashSet<&str> = config.routes.iter().map(|r| r.route.as_str()).collect();
     let mut paths = HashSet::new();
+    let mut spend_limits = HashMap::new();
     // Same account policy comparison as typed routes, without opening state or secrets.
     let mut policies = HashMap::new();
     for route in &config.routes {
@@ -267,6 +283,7 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| EgressError::InvalidRequest)?;
+        spend_limits.insert(scope.clone(), None);
         policies.insert(
             scope,
             (
@@ -310,6 +327,21 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
         {
             return Err(EgressError::InvalidRequest);
         }
+        if route.price.as_ref().is_some_and(|p| !p.valid())
+            || route
+                .spend_limit
+                .as_ref()
+                .is_some_and(|l| !l.valid() || route.price.is_none())
+            || ((route.price.is_some() || route.spend_limit.is_some())
+                && (route.stream != StreamDialect::OpenaiChatCompletions
+                    || route.method != PassthroughMethod::Post))
+            || route
+                .balance
+                .as_ref()
+                .is_some_and(|b| !b.valid(&route.destination))
+        {
+            return Err(EgressError::InvalidRequest);
+        }
         route
             .policy()
             .validate()
@@ -334,6 +366,13 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| EgressError::InvalidRequest)?;
+        if route.method != PassthroughMethod::Get
+            && spend_limits
+                .insert(scope.clone(), route.spend_limit.clone())
+                .is_some_and(|existing| existing != route.spend_limit)
+        {
+            return Err(EgressError::InvalidRequest);
+        }
         let policy = (
             route.max_in_flight,
             route.requests_per_minute,
@@ -362,6 +401,7 @@ struct Route {
     retries: AccountRetries,
     seen: Mutex<SeenSessions>,
     health: Arc<Mutex<RouteActivity>>,
+    balance_refresh: Notify,
 }
 pub(crate) struct Passthrough {
     routes: Vec<Route>,
@@ -462,6 +502,7 @@ impl Passthrough {
                 retries,
                 seen: Default::default(),
                 health: Default::default(),
+                balance_refresh: Notify::new(),
             });
         }
         Ok(Some(Self {
@@ -567,6 +608,21 @@ async fn serve_until(
     pass.publish_health(config, "running").await?;
     let connections = Arc::new(Semaphore::new(config.max_connections));
     let mut handlers = tokio::task::JoinSet::new();
+    // Pollers are owned by this server and cancelled when it shuts down or fails.
+    let mut balances = tokio::task::JoinSet::new();
+    for (index, route) in pass.routes.iter().enumerate() {
+        if route.config.balance.is_some() {
+            let owner = process.clone();
+            balances.spawn(async move {
+                let pass = owner
+                    .inner
+                    .passthrough
+                    .as_ref()
+                    .ok_or(EgressError::StateUnavailable)?;
+                pass.balance_loop(&pass.routes[index]).await
+            });
+        }
+    }
     tokio::pin!(shutdown);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     loop {
@@ -584,6 +640,9 @@ async fn serve_until(
             result = cooldown_changes.changed() => {
                 result.map_err(|_| EgressError::StateUnavailable)?;
                 pass.publish_health(config, "running").await?;
+            }
+            Some(result) = balances.join_next(), if !balances.is_empty() => {
+                result.map_err(|_| EgressError::StateUnavailable)??;
             }
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
                 if result.is_err() { return Err(EgressError::StateUnavailable); }

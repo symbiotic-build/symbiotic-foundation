@@ -73,7 +73,7 @@ impl SqliteQueue {
     }
 
     /// Initialize the current queue/job format on a caller-owned ledger connection.
-    /// Unknown formats are refused; pre-release state has no migrations.
+    /// Older versions, including 17, are refused; rebuild the queue database.
     pub fn initialize_connection(conn: &mut Connection) -> Result<(), QueueError> {
         configure(conn)
     }
@@ -789,8 +789,8 @@ fn cooldown_active(
     .map(|active| active.unwrap_or(false))
 }
 
-/// Atomic current operational format: queue and spend tables, with no migrations.
-pub const QUEUE_SCHEMA_VERSION: u32 = 17;
+/// Atomic operational format. Older layouts require rebuilding the queue database.
+pub const QUEUE_SCHEMA_VERSION: u32 = 18;
 
 fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     conn.busy_timeout(std::time::Duration::from_millis(60_000))
@@ -807,7 +807,6 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
     let schema_version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage_error)?;
-    // Under the no-migrations rule, initialization atomically stamps the current queue schema and other versions or unversioned queue layouts are refused.
     if schema_version == i64::from(QUEUE_SCHEMA_VERSION) {
         return Ok(());
     }
@@ -832,8 +831,10 @@ fn configure(conn: &mut Connection) -> Result<(), QueueError> {
             usage text, output text, handoff_input text, dispatch_owner text,
             pre_dispatch_released integer not null default 0,
             attempt_limit integer, attempts_used integer not null default 0,
-            recovery text, recovery_expires_at text
+            recovery text, recovery_expires_at text,
+            sent_at_ms integer, caller_request_id text, price text, cost_nano_usd integer
         );
+        create index spend_account_time on spend_receipts(account, sent_at_ms);
         create unique index spend_active_invocation on spend_receipts(account, invocation)
             where state = 'unknown';
         create index spend_invocation_lookup on spend_receipts(account, invocation);

@@ -435,7 +435,12 @@ impl CredentialProcess {
             state_dir: Some(config.state_dir.clone()),
             ..RuntimeConfig::default()
         })
-        .map_err(|_| EgressError::StateUnavailable)?;
+        .map_err(|error| match error {
+            symbiotic_ai_runtime::model::ModelError::Queue(
+                symbiotic_core::DiagnosticCode::UnsupportedQueueSchema,
+            ) => EgressError::UnsupportedQueueSchema,
+            _ => EgressError::StateUnavailable,
+        })?;
         for route in &config.routes {
             provider::validate_binding(&runtime, route)?;
         }
