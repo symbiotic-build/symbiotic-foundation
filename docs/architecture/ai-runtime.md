@@ -245,9 +245,8 @@ the token rates selected at send time. Settlement uses those frozen rates even
 if the stream crosses a peak boundary or the process configuration changes.
 `SpendReceipt::cost_nano_usd` is absent until both price and complete input/output
 usage are known, except that `Released` receipts have zero cost.
-Complete 4xx refusals release at zero cost (401 without reading its body); 5xx,
-incomplete bodies, transport failures, cancellation and missing successful usage
-retain `Unknown` because provider work may have been charged.
+Failed sends, incomplete bodies, transport failures, cancellation and missing
+successful usage retain `Unknown` because provider work may have been charged.
 An unpriced receipt remains unpriced after reconciliation.
 Provider bodies and credentials never enter these fields.
 
@@ -272,13 +271,15 @@ new send, fit `usd`. The window includes sends newer than
 `sent_at_ms - window_seconds * 1000`; the lower bound is exclusive.
 Released receipts do not count. A settled receipt whose cost remains unknown
 also holds the maximum. Unknown sends survive restart and retain that hold
-until settlement, release, or window expiry. `max_request_usd` must be a
+until settlement, release, or window expiry.
+Each unknown attempt holds `max_request_usd` until it leaves the window or is
+reconciled through `Runtime::reconcile_spend`, so a burst of provider refusals
+(for example 402s while the balance is empty) can fill the limit until those holds age out.
+`max_request_usd` must be a
 conservative bound chosen for the route's requests; it does not rewrite or
 limit caller output-token settings. The budget is guaranteed only when
 `max_request_usd` bounds every request's real cost. A settled cost above
-`max_request_usd` overshoots the reserved budget by the difference. Settlement
-emits one `passthrough cost exceeded max_request_usd` warning with numeric
-`cost_nano_usd` and `max_request_nano_usd` fields so the operator can raise the hold.
+`max_request_usd` overshoots the reserved budget by the difference.
 Admission refusal returns `BudgetExhausted(SpendBudgetExhausted)` before transport.
 
 `Runtime::spend_cost(account, start, end, invocation, request_id_prefix)` reads
@@ -293,8 +294,7 @@ priced receipts with unknown cost also contribute to `unknown_usage_count`. Rele
 receipts are excluded. Totals saturate at `u64::MAX`.
 
 Schema 18 adds four nullable receipt columns: `sent_at_ms`, `caller_request_id`,
-`price`, and `cost_nano_usd`. The frozen `price` JSON includes the per-request
-`max_request_nano_usd` hold when configured, so settlement warnings survive restart.
+`price`, and `cost_nano_usd`. The frozen `price` JSON stores only token rates.
 One native `(account, sent_at_ms)` index bounds rolling budget reads and reports
 to the requested account/window. The bare SQLite cost
 is one index range scan and receipt updates in the existing transaction. There

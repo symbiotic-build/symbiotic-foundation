@@ -703,9 +703,8 @@ immediately before each send. A successful terminal response settles only report
 numeric usage. The final SSE `usage` object maps `prompt_tokens`, `completion_tokens`,
 `prompt_tokens_details.cached_tokens` and `completion_tokens_details.reasoning_tokens`
 to the existing usage fields. Non-streaming JSON uses the same mapping.
-Complete 4xx refusals release at zero cost (401 without reading its body); 5xx,
-incomplete bodies, transport failures, cancellation and missing successful usage
-retain `Unknown` because provider work may have been charged.
+Failed sends, incomplete bodies, transport failures, cancellation and missing
+successful usage retain `Unknown` because provider work may have been charged.
 Provider text and answer bytes are never stored. Each send has an independent
 generated invocation, so an unknown attempt does not prevent the next send. Settlement precedes the final HTTP chunk;
 a ledger failure leaves the response visibly incomplete. No new table, index or queue

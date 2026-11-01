@@ -1084,9 +1084,8 @@ The SSE `[DONE]` sentinel completes a response; EOF before it is a disconnect.
 A final usage chunk supplies prompt, completion, cached and reasoning token counts.
 Non-streaming JSON uses its `usage` object. Successful terminal responses settle
 complete numeric input/output usage in the canonical ledger.
-Complete 4xx refusals release at zero cost (401 without reading its body); 5xx,
-incomplete bodies, transport failures, cancellation and missing successful usage
-retain `Unknown` because provider work may have been charged.
+Failed sends, incomplete bodies, transport failures, cancellation and missing
+successful usage retain `Unknown` because provider work may have been charged.
 Provider identity text and answer bytes are excluded.
 The ledger adds one existing receipt row per dispatched Chat Completions POST attempt and uses its
 native reserve/finish transactions. It uses the existing ledger; money settings add the receipt columns and account/time index described below. Independent generated
@@ -1116,8 +1115,8 @@ Configuration version stays 4. These optional settings do not infer a model's pr
 - `spend_limit` supplies `usd`, positive `window_seconds`, and positive
   `max_request_usd`. Chat Completions POST routes sharing the account must have
   the same limit, including omission. A limit requires a configured price.
-  Other routes omit `spend_limit` and `price` and are exempt from limit agreement
-  because they do not account money.
+  Only GET listing routes are exempt from limit agreement and omit `spend_limit`
+  and `price`. A money-limited account cannot share Responses POST or typed routes.
   Invalid policies refuse startup with the existing `InvalidRequest` configuration error.
 - `balance` supplies `provider: "deepseek"`, positive `interval_seconds`,
   positive `debounce_seconds` (default 1), and
@@ -1134,8 +1133,7 @@ prices publish `cost: "priced"`. An exhausted local budget returns HTTP 402 with
 `request completed` event. The local response carries no upstream headers.
 The spend limit is guaranteed only when `max_request_usd` bounds every
 request's real cost. A settled cost above `max_request_usd` overshoots the
-reserved budget by the difference. Settlement warns with numeric cost and hold
-fields so the operator can raise the hold. Partial input/output usage leaves
+reserved budget by the difference. Partial input/output usage leaves
 receipts `Unknown` on priced and unpriced routes. They retain any configured
 maximum-cost hold and allow reconciliation. Complete usage with a distinct reasoning rate but no
 reasoning count settles with unknown cost.

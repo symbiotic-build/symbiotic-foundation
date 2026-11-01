@@ -1104,21 +1104,6 @@ impl AccountAdmission {
         Ok(reference)
     }
 
-    /// Release a 4xx provider refusal with no output and known zero usage.
-    pub fn release_passthrough(&self, reference: &SpendReceiptRef) -> Result<(), ModelError> {
-        self.runtime.inner.spend.finish(
-            reference,
-            SpendState::Released,
-            Some(symbiotic_trace::UsageTrace {
-                input_tokens: Some(0),
-                output_tokens: Some(0),
-                ..Default::default()
-            }),
-            None,
-            None,
-        )
-    }
-
     /// Settle complete numeric input/output usage without storing provider text or bytes.
     /// Partial usage leaves the reservation unknown and reconcilable on every route.
     pub fn finish_passthrough(

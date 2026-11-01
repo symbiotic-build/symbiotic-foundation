@@ -283,6 +283,7 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| EgressError::InvalidRequest)?;
+        spend_limits.insert(scope.clone(), None);
         policies.insert(
             scope,
             (
@@ -365,8 +366,7 @@ pub(crate) fn validate(config: &ProcessConfig) -> Result<()> {
             route.account_sharing_key.as_ref(),
         )
         .map_err(|_| EgressError::InvalidRequest)?;
-        if route.stream == StreamDialect::OpenaiChatCompletions
-            && route.method == PassthroughMethod::Post
+        if route.method != PassthroughMethod::Get
             && spend_limits
                 .insert(scope.clone(), route.spend_limit.clone())
                 .is_some_and(|existing| existing != route.spend_limit)

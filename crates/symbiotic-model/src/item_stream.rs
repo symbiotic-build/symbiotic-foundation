@@ -470,25 +470,22 @@ fn decode_usage(
     };
     let chat_completions = input == "prompt_tokens";
     let input = number(&u[input])?;
-    let mut cached = number(&u[input_details]["cached_tokens"])?;
-    let mut cache_miss = None;
-    if cached.is_none() && chat_completions {
-        cached = number(&u["prompt_cache_hit_tokens"])?;
-        cache_miss = number(&u["prompt_cache_miss_tokens"])?;
-        if let (Some(hit), Some(miss)) = (cached, cache_miss)
-            && (hit.checked_add(miss).is_none() || hit.checked_add(miss) != input)
-        {
-            return Err(ItemStreamError::InvalidEvent);
-        }
-    }
-    if cached.zip(input).is_some_and(|(c, i)| c > i) {
-        return Err(ItemStreamError::InvalidEvent);
-    }
+    let nested_hit = number(&u[input_details]["cached_tokens"])?;
+    let (hit, miss) = if chat_completions {
+        (
+            number(&u["prompt_cache_hit_tokens"])?,
+            number(&u["prompt_cache_miss_tokens"])?,
+        )
+    } else {
+        (None, None)
+    };
+    let (cached, cache_miss) = crate::normalize_prompt_cache_counts(input, hit, miss, nested_hit)
+        .map_err(|_| ItemStreamError::InvalidEvent)?;
     Ok(UsageTrace {
         input_tokens: input,
         output_tokens: number(&u[output])?,
         cache_hit_tokens: cached,
-        cache_miss_tokens: cache_miss.or_else(|| input.zip(cached).map(|(i, c)| i - c)),
+        cache_miss_tokens: cache_miss,
         reasoning_tokens: number(&u[output_details]["reasoning_tokens"])?,
         ..Default::default()
     })
@@ -659,7 +656,7 @@ mod tests {
             ),
             (
                 serde_json::json!({"prompt_tokens":7,"prompt_cache_miss_tokens":5}),
-                Some((None, Some(5))),
+                Some((Some(2), Some(5))),
             ),
             (
                 serde_json::json!({"prompt_tokens":7,"prompt_cache_miss_tokens":"5"}),
@@ -667,11 +664,11 @@ mod tests {
             ),
             (
                 serde_json::json!({"prompt_cache_hit_tokens":2,"prompt_cache_miss_tokens":5}),
-                None,
+                Some((Some(2), Some(5))),
             ),
             (
                 serde_json::json!({"prompt_tokens":7,"prompt_tokens_details":{"cached_tokens":3},"prompt_cache_hit_tokens":99,"prompt_cache_miss_tokens":99}),
-                Some((Some(3), Some(4))),
+                None,
             ),
             (
                 serde_json::json!({"prompt_tokens":7,"prompt_cache_hit_tokens":8}),

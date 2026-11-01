@@ -613,8 +613,15 @@ impl Passthrough {
                 .map_err(|_| EgressError::InvalidRequest)?;
             // execute() starts reqwest's timers; defer it until the grant actually sends.
             let transport = async { route.client.execute(transport_request).await };
-            let secrets = route.secrets().await;
-            let receipt_id = id.filter(|id| safe_value(id.as_bytes(), &secrets, 64));
+            let accounted = route.config.stream == StreamDialect::OpenaiChatCompletions
+                && route.config.method == PassthroughMethod::Post;
+            let receipt_id = match id {
+                Some(id) if accounted => {
+                    let secrets = route.secrets().await;
+                    safe_value(id.as_bytes(), &secrets, 64).then_some(id)
+                }
+                _ => None,
+            };
             let mut was_new = false;
             let mut receipt = None;
             let queue_waited_ms = wait.total.as_millis() as u64;
@@ -634,9 +641,7 @@ impl Passthrough {
                         {
                             Ok(None)
                         } else {
-                            if route.config.stream == StreamDialect::OpenaiChatCompletions
-                                && route.config.method == PassthroughMethod::Post
-                            {
+                            if accounted {
                                 receipt = Some(route.account.reserve_passthrough_priced(
                                     &route.config.identity(),
                                     route.config.price.as_ref(),
@@ -746,14 +751,6 @@ impl Passthrough {
                             AnswerOutcome::Failure(f) => f,
                         }
                     } else {
-                        if status == 401
-                            && let Some(receipt) = &receipt
-                        {
-                            route
-                                .account
-                                .release_passthrough(receipt)
-                                .map_err(|_| EgressError::StateUnavailable)?;
-                        }
                         if status == 401 && matches!(route.credential, Credential::Static(_)) {
                             log.warn(
                                 "upstream_status",
@@ -806,16 +803,6 @@ impl Passthrough {
                             }
                         }
                         let body = error_body(&mut response, route.config.max_response_bytes).await;
-                        if body.is_ok()
-                            && (400..500).contains(&status)
-                            && status != 401
-                            && let Some(receipt) = &receipt
-                        {
-                            route
-                                .account
-                                .release_passthrough(receipt)
-                                .map_err(|_| EgressError::StateUnavailable)?;
-                        }
                         match body {
                             Ok(bytes) => {
                                 let value = serde_json::from_slice::<serde_json::Value>(&bytes)
