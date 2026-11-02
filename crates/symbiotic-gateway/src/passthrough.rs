@@ -1,6 +1,6 @@
 //! Same-UID undecoded HTTP forwarding through the runtime's account admission.
 //!
-//! Ordering: authenticate peer, parse and match, check credential, acquire FIFO slot,
+//! Ordering: authenticate peer, parse and match, check credential, acquire adaptive permit and FIFO slot,
 //! wait for shared cooldown, renew, pace, recheck cooldown, send. Hold the slot through
 //! every retry and the complete filtered response. Dropping a connection drops this
 //! entire future, including its admission waiter and upstream request.
@@ -97,6 +97,16 @@ impl PassthroughMethod {
     }
 }
 
+/// A route-local message match, used when the provider supplies no `error.code`; it comes before `error.type`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorMessageRule {
+    /// Case-insensitive substring of the provider error message; 1–256 bytes.
+    pub contains: String,
+    /// Classification code; 1–128 printable ASCII bytes.
+    pub code: String,
+}
+
 /// One exact endpoint with account-owned credentials and limits.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +156,9 @@ pub struct PassthroughRoute {
     /// Adapter code classification extensions.
     #[serde(default)]
     pub error_classes: HashMap<String, ErrorClass>,
+    /// Ordered message matches; at most 32, used after `error.code` and before `error.type`.
+    #[serde(default)]
+    pub error_messages: Vec<ErrorMessageRule>,
     /// Sparse overrides of the default class table.
     #[serde(default)]
     pub retry_policy: RetryPolicy,
@@ -290,6 +303,12 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
             || route.max_in_flight == 0
             || route.requests_per_minute == Some(0)
             || route.idle_timeout_seconds == 0
+            || route.error_messages.len() > 32
+            || route.error_messages.iter().any(|rule| {
+                rule.contains.is_empty()
+                    || rule.contains.len() > 256
+                    || !printable(rule.code.as_bytes(), 128)
+            })
             || !retry_policy::valid(&route.retry_policy)
             || route.fallback_routes.iter().any(|n| {
                 !pass
@@ -387,6 +406,8 @@ impl Passthrough {
         let mut routes = Vec::new();
         let mut retry_accounts: HashMap<String, Arc<std::sync::atomic::AtomicU32>> = HashMap::new();
         let mut session_accounts: HashMap<String, Arc<session::SessionAdmission>> = HashMap::new();
+        let mut concurrency_accounts: HashMap<String, Arc<session::AccountConcurrency>> =
+            HashMap::new();
         for config_route in &pass.routes {
             let account = runtime
                 .account_admission(
@@ -451,7 +472,13 @@ impl Passthrough {
                 _ => scope.clone(),
             };
             let retries = AccountRetries {
-                failures: retry_accounts.entry(scope).or_default().clone(),
+                failures: retry_accounts.entry(scope.clone()).or_default().clone(),
+                concurrency: concurrency_accounts
+                    .entry(scope)
+                    .or_insert_with(|| {
+                        Arc::new(session::AccountConcurrency::new(config_route.max_in_flight))
+                    })
+                    .clone(),
                 sessions: session_accounts.entry(session_key).or_default().clone(),
             };
             routes.push(Route {

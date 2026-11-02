@@ -1013,6 +1013,19 @@ transport poll, then releases while the response is pending. Typed sends use the
 same ordering. Waiting repeats the lookup after each deadline. The facade adds
 no stored copy.
 
+Gateway account concurrency starts at `max_in_flight` and retains that ceiling.
+A memory-only FIFO limiter shares the retry failure counter's account scope. Each
+request acquires its permit after any new-session hold or probe wait and before
+runtime account admission, and holds the permit and its runtime slot through pacing
+waits and retries until its response ends. Only when a new-session request must wait
+for a hold or the probe does it give back both together, and it takes them again
+afterwards. Throttle failures halve the effective limit, rounding down with a floor of
+one; existing holders retain permits, and permits they return pay off the decrease. Ten successful responses with
+no intervening throttle increase it by one, up to the ceiling. Throttles and increases
+reset the success counter. Changes log route, account and effective limit at info level.
+Adaptive permit waits use the existing `slot` log and health waiting entry without new
+health fields.
+
 Slot waits last until admission or caller disconnect. Each send takes the existing
 rate gate, rechecks credential/cooldown state and charges pacing. First sends,
 resends and continuation sends use that same path. Both `login_required` and
@@ -1020,9 +1033,18 @@ resends and continuation sends use that same path. Both `login_required` and
 fixed 401 without upstream headers. Login 401 renewal remains limited to one exchange.
 
 The Responses adapter classifies failures as `throttle`, `network`, `server` or
-`final`. One retry engine applies `retry_policy` overrides to defaults: unlimited
-same-route retries for throttle/network, three total attempts for server, and fail
-for final. HTTP Retry-After takes precedence over the shared core retry backoff on
+`final`. The gateway selects a string `error.code`, then the first
+case-insensitive `error_messages` substring match on `error.message`, then
+`error.type`. Message rules come before the type because Kimi Code sends its quota
+and risk-control 429s with the generic type `rate_limit_error`. Stream terminal errors use `response.error`; flat
+stream codes remain supported. The selected code uses route `error_classes` first,
+then built-in classes. The optional message list accepts at most 32 entries, each
+with non-empty `contains` of at most 256 UTF-8 bytes and `code` of 1–128 printable
+ASCII bytes. Provider-specific matching stays in route configuration.
+One retry engine applies `retry_policy` overrides to defaults: 10 total attempts for
+throttle, unlimited same-route retries for network, three total attempts for server,
+and fail for final. Attempts include the first send. An explicit rule with absent
+or null `max_attempts` can restore unlimited throttle retries. HTTP Retry-After takes precedence over the shared core retry backoff on
 consecutive account failures. Successful completion resets that count. Optional
 `fallback_routes` names are used only by `switch`; an empty list means fail.
 `PassthroughConfig.retry_policies` contains named overrides selected through the
@@ -1042,8 +1064,9 @@ route keeps a memory-only set of successful tuples, at most 100 000, oldest-firs
 and expired after 24 h. Missing every configured header disables session treatment.
 With no hold, new sessions flow freely under ordinary account limits. A retried
 new-session 429 sets a login-wide hold using Retry-After or shared backoff without
-setting account cooldown. New-session waiters release their slots; seen sessions
-continue. After the hold, one probe is allowed until a new-session 2xx opens the
+setting account cooldown. New-session waiters hold neither a runtime slot nor an
+adaptive permit, so seen sessions continue within the adaptive account limit during
+the hold. After the hold, one probe is allowed until a new-session 2xx opens the
 gate. Another 429 extends the hold. Health exposes the hold's Unix deadline.
 
 The provider-neutral `symbiotic-model::item_stream` enum carries complete opaque

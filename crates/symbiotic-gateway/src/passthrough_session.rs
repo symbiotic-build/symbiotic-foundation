@@ -1,4 +1,4 @@
-//! Bounded route-local session history and login-wide new-session hold.
+//! Account retry and concurrency state, route session history and login-wide new-session hold.
 use super::*;
 use std::collections::VecDeque;
 
@@ -43,9 +43,10 @@ impl SeenSessions {
         self.order.push_back((key, now));
     }
 }
-/// This state is shared by routes on the same login, never written to durable storage.
+/// Retry counts and concurrency share account scope; session admission shares the login.
 pub(super) struct AccountRetries {
     pub failures: Arc<std::sync::atomic::AtomicU32>,
+    pub concurrency: Arc<AccountConcurrency>,
     pub sessions: Arc<SessionAdmission>,
 }
 pub(super) struct SessionAdmission {
@@ -91,6 +92,100 @@ impl Route {
                 .map_err(|_| GatewayError::StateUnavailable)?
                 .contains(key)),
             None => Ok(false),
+        }
+    }
+}
+
+/// An account's adaptive cap. A FIFO semaphore keeps arrival order; existing holders
+/// survive decreases, and permits they return pay off the part not yet removed.
+pub(super) struct AccountConcurrency {
+    ceiling: usize,
+    permits: Arc<tokio::sync::Semaphore>,
+    state: Mutex<ConcurrencyState>,
+}
+struct ConcurrencyState {
+    limit: usize,
+    // Permits still to remove after a decrease found them held.
+    debt: usize,
+    successes: u8,
+}
+pub(super) struct ConcurrencyPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    owner: Arc<AccountConcurrency>,
+}
+impl AccountConcurrency {
+    pub(super) fn new(ceiling: usize) -> Self {
+        Self {
+            ceiling,
+            permits: Arc::new(tokio::sync::Semaphore::new(ceiling)),
+            state: Mutex::new(ConcurrencyState {
+                limit: ceiling,
+                debt: 0,
+                successes: 0,
+            }),
+        }
+    }
+    pub(super) async fn acquire(self: &Arc<Self>) -> Result<ConcurrencyPermit> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GatewayError::StateUnavailable)?;
+        Ok(ConcurrencyPermit {
+            permit: Some(permit),
+            owner: self.clone(),
+        })
+    }
+    pub(super) fn outcome(&self, throttle: bool, route: &PassthroughRoute) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GatewayError::StateUnavailable)?;
+        let previous = state.limit;
+        if throttle {
+            state.limit = (state.limit / 2).max(1);
+            state.successes = 0;
+            let remove = previous - state.limit;
+            let removed = self.permits.forget_permits(remove);
+            state.debt += remove - removed;
+        } else {
+            state.successes += 1;
+            if state.successes == 10 {
+                state.successes = 0;
+                if state.limit < self.ceiling {
+                    state.limit += 1;
+                    if state.debt > 0 {
+                        state.debt -= 1;
+                    } else {
+                        self.permits.add_permits(1);
+                    }
+                }
+            }
+        }
+        if state.limit != previous {
+            tracing::info!(
+                route = route.name,
+                account = route.account,
+                effective_limit = state.limit,
+                "account concurrency changed"
+            );
+        }
+        Ok(())
+    }
+}
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(permit) = self.permit.take()
+            && state.debt > 0
+        {
+            state.debt -= 1;
+            permit.forget();
         }
     }
 }

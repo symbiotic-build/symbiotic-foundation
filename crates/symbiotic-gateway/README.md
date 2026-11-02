@@ -35,6 +35,78 @@ retains `credential-process.lock` so a gateway and typed credential process cann
 open the same state directory concurrently. Provision the socket's parent as an
 owner-only directory. The gateway does not open a typed socket or model registry.
 
+## Error classification, retries and concurrency
+
+For HTTP error bodies and stream error events, the gateway selects a code in this order:
+
+1. Use the provider's string `error.code`.
+2. If no code exists, use the first matching `error_messages` entry's `code`.
+3. If neither exists, use its string `error.type`.
+
+Message rules come before `error.type` because Kimi Code sends its quota and
+risk-control 429s with the generic type `rate_limit_error`.
+
+Stream terminal events use the error under `response.error`; flat stream error codes
+remain supported. Message rules match `error.message` by case-insensitive substring.
+The selected code first uses the route's `error_classes` override, then the adapter's
+built-in classification. Without an extension match, the adapter keeps its usual
+fallback code and HTTP status classification. Provider differences belong in route
+configuration. For Kimi and MiMo quota and risk-control failures, add these route fields:
+
+```json
+"error_classes": {"exceeded_current_quota_error": "final", "provider_quota_exhausted": "final", "provider_risk_control": "final"},
+"error_messages": [
+  {"contains": "usage limit", "code": "provider_quota_exhausted"},
+  {"contains": "credit balance is insufficient", "code": "provider_quota_exhausted"},
+  {"contains": "extra usage balance has run out", "code": "provider_quota_exhausted"},
+  {"contains": "extra usage limit set for your account", "code": "provider_quota_exhausted"},
+  {"contains": "token plan has been exhausted", "code": "provider_quota_exhausted"},
+  {"contains": "concurrent request limit", "code": "provider_risk_control"}
+]
+```
+
+The Kimi entries cover the seven account-limit messages the passthrough
+recognized before this configuration existed; a Kimi route without them retries
+those 429s as throttles, up to the throttle attempt limit.
+
+`error_messages` is optional and defaults to an empty list. It accepts at most 32
+entries. Each `contains` must be non-empty and at most 256 UTF-8 bytes. Each `code`
+must contain 1–128 printable ASCII bytes. An explicit provider `error.code` takes
+precedence over message rules, even when its message matches.
+
+Default retries allow 10 total attempts for `throttle`, three for `server`, and
+unlimited attempts for `network`; `final` fails immediately. Attempts include the
+first send. A route's `retry_policy` overrides each class, including unlimited
+throttle retries through an explicit rule with absent or null `max_attempts`.
+Retry-After still takes precedence over account backoff. The attempt count is per
+caller request, the first send included. When attempts run out, the caller gets the
+same response as any `fail` decision:
+
+- an HTTP failure returns the provider's status with the fixed local body
+  `{"error":{"code":"upstream_status"}}`, for example 429 after ten throttles;
+- a failure inside a stream returns HTTP 200 with the provider's own failure events,
+  scrubbed of credentials and in their original order.
+
+A cooldown is recorded only for a `retry_same` decision, so the final throttle sets
+none. It still halves the account's adaptive concurrency limit.
+
+Each account scope shares one memory-only adaptive concurrency limit across its
+routes. It starts at `max_in_flight`, which remains its ceiling. Waiters get
+permits in arrival order. A request acquires its adaptive permit after any
+new-session hold or probe wait and before runtime account admission, and holds it,
+with its runtime slot, through pacing waits and retries until the response ends. A
+new-session request gives back its permit and its slot together only when it must
+wait for a hold or the probe, so a new-session refusal never blocks sessions
+already admitted, and no request waits for a permit while holding the slot another
+waiter needs. Permit waiting uses the existing `slot` wait log
+and health entry. A classified `throttle` halves the limit, rounding down with a
+floor of one, even when retry policy says fail. Existing holders keep their permits;
+the permits they return pay off the part of the decrease that could not take effect at once.
+After 10 successful responses with no intervening throttle, the limit increases by
+one up to its ceiling. The success counter resets on a throttle and after each
+increase. Each change logs the route, account and new effective limit at info level.
+The health file keeps its existing fields.
+
 ## Command line
 
 ```sh

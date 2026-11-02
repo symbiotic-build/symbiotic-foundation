@@ -61,10 +61,10 @@ pub(super) fn rule(policy: &RetryPolicy, class: ErrorClass) -> RetryRule {
         } else {
             RetryAction::RetrySame
         },
-        max_attempts: if class == ErrorClass::Server {
-            Some(3)
-        } else {
-            None
+        max_attempts: match class {
+            ErrorClass::Throttle => Some(10),
+            ErrorClass::Server => Some(3),
+            _ => None,
         },
         backoff: Default::default(),
     })
@@ -102,7 +102,7 @@ mod tests {
         };
         let mut policy = RetryPolicy::new();
         for (class, action, max) in [
-            (ErrorClass::Throttle, RetryAction::RetrySame, None),
+            (ErrorClass::Throttle, RetryAction::RetrySame, Some(10)),
             (ErrorClass::Network, RetryAction::RetrySame, None),
             (ErrorClass::Server, RetryAction::RetrySame, Some(3)),
             (ErrorClass::Final, RetryAction::Fail, None),
