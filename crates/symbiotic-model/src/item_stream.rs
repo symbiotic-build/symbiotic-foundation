@@ -246,7 +246,7 @@ impl ResponsesAdapter {
                 if !record.value["response"].is_object() {
                     return Err(ItemStreamError::InvalidEvent);
                 }
-                let usage = Self::usage(&record.value)?;
+                let usage = Self::usage(&record.value["response"])?;
                 ItemEvent::Usage {
                     record,
                     usage,
@@ -428,18 +428,22 @@ impl ResponsesAdapter {
     }
     /// Read a terminal attempt's usage without interpreting its error policy.
     pub fn event_usage(event: &ItemEvent) -> Result<UsageTrace, ItemStreamError> {
-        Self::usage(&event.record().value)
+        Self::usage(&event.record().value["response"])
+    }
+    /// Decode the usage of a non-streaming Responses response with the same reader.
+    pub fn json_usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
+        Self::usage(value)
     }
     fn usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
         let mut usage = decode_usage(
-            &value["response"]["usage"],
+            &value["usage"],
             "input_tokens",
             "output_tokens",
             "input_tokens_details",
             "output_tokens_details",
         )?;
-        usage.response_id = value["response"]["id"].as_str().map(str::to_owned);
-        usage.served_model = value["response"]["model"].as_str().map(str::to_owned);
+        usage.response_id = value["id"].as_str().map(str::to_owned);
+        usage.served_model = value["model"].as_str().map(str::to_owned);
         Ok(usage)
     }
 }
@@ -534,6 +538,16 @@ impl ChatCompletionsAdapter {
         let value = serde_json::from_slice(bytes).map_err(|_| ItemStreamError::InvalidEvent)?;
         Self::decode(value, bytes.to_vec(), true)
     }
+    /// Read reported usage independently of response success or error classification.
+    pub fn json_usage(value: &Value) -> Result<UsageTrace, ItemStreamError> {
+        decode_usage(
+            &value["usage"],
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+        )
+    }
     fn record(value: Value, wire: Vec<u8>) -> ItemRecord {
         ItemRecord {
             response_id: value["id"].as_str().map(str::to_owned),
@@ -578,13 +592,7 @@ impl ChatCompletionsAdapter {
         }) {
             return Err(ItemStreamError::InvalidEvent);
         }
-        let usage = decode_usage(
-            &value["usage"],
-            "prompt_tokens",
-            "completion_tokens",
-            "prompt_tokens_details",
-            "completion_tokens_details",
-        )?;
+        let usage = Self::json_usage(&value)?;
         let record = Self::record(value, wire);
         if completed || !record.value["usage"].is_null() {
             Ok(ItemEvent::Usage {

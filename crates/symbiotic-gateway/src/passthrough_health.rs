@@ -111,7 +111,6 @@ struct RouteHealth<'a> {
     rate_limits: HashMap<String, String>,
     rate_limits_seen_at: Option<i64>,
     new_session_hold_until: Option<i64>,
-    cost: &'static str,
     balance: Option<balance::BalanceHealth>,
 }
 impl Passthrough {
@@ -192,11 +191,6 @@ impl Passthrough {
                     .collect(),
                 rate_limits_seen_at: h.rate_limits_seen_at,
                 new_session_hold_until: hold,
-                cost: if route.config.price.is_some() {
-                    "priced"
-                } else {
-                    "price not configured"
-                },
                 balance: h.balance.value.clone(),
             });
         }
@@ -278,7 +272,7 @@ mod tests {
         value["updated_at"] = serde_json::json!(0);
         assert_eq!(
             value,
-            serde_json::json!({"version":1,"state":"running","updated_at":0,"routes":[{"name":"responses","login":"static","expires_at":null,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null,"cost":"price not configured","balance":null}]})
+            serde_json::json!({"version":1,"state":"running","updated_at":0,"routes":[{"name":"responses","login":"static","expires_at":null,"cooldown_until":null,"retried_events":{},"waiting":[],"rate_limits":{},"rate_limits_seen_at":null,"new_session_hold_until":null,"balance":null}]})
         );
         let metadata = fs::metadata(path).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o640);

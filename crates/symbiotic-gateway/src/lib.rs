@@ -5,6 +5,8 @@
 #![cfg(unix)]
 
 mod error;
+mod outbox;
+mod records;
 pub use error::GatewayError;
 mod process_security;
 pub use process_security::protect_process;
@@ -28,11 +30,13 @@ pub struct GatewayConfig {
     pub log: Option<String>,
     /// Owner-only runtime directory with the existing account admission database.
     pub state_dir: PathBuf,
+    /// Absolute Unix socket path of the core service; it may be offline.
+    pub core_socket_path: PathBuf,
     /// Finite upper bound on each secret.
     pub max_secret_bytes: usize,
     /// Maximum HTTP request header bytes.
     pub max_header_bytes: u32,
-    /// Time allowed for reading/writing caller socket data.
+    /// Time allowed for caller socket I/O and each core record delivery.
     pub io_timeout_seconds: u64,
     /// Required same-user HTTP server and routes.
     pub passthrough: PassthroughConfig,
@@ -46,8 +50,6 @@ impl GatewayConfig {
 
 struct Inner {
     config: GatewayConfig,
-    #[cfg(test)]
-    runtime: Runtime,
     passthrough: passthrough::Passthrough,
     _process_lock: ProcessLock,
 }
@@ -97,8 +99,6 @@ impl Gateway {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                #[cfg(test)]
-                runtime,
                 passthrough,
                 _process_lock: process_lock,
             }),

@@ -1,5 +1,4 @@
 //! SQLite accounting in Foundation's operational database, never a Memory store.
-use super::passthrough_spend::{PassthroughPrice, SpendCost, SpendLimit, TokenRates};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{path::Path, sync::Mutex};
 use symbiotic_core::DiagnosticCode;
@@ -144,97 +143,6 @@ impl SqliteSpendLedger {
             symbiotic_model::DEFAULT_RETENTION,
             std::sync::Arc::new(chrono::Utc::now),
         )
-    }
-
-    /// Reserve a passthrough send and its conservative hold in one immediate transaction.
-    pub fn reserve_passthrough(
-        &self,
-        r: &SpendReservation,
-        request_id: Option<&str>,
-        price: Option<&PassthroughPrice>,
-        limit: Option<&SpendLimit>,
-    ) -> Result<bool, ModelError> {
-        if price.is_some_and(|p| !p.valid()) || limit.is_some_and(|l| !l.valid() || price.is_none())
-        {
-            return Err(ModelError::InvalidRequest(
-                DiagnosticCode::InvalidConfiguration,
-            ));
-        }
-        let mut conn = self.0.lock().map_err(storage)?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(storage)?;
-        // Sample only after acquiring the SQLite writer lock, so a queued writer
-        // cannot freeze yesterday's window or the preceding peak rate.
-        let sent_at = self.now();
-        let sent_at_ms = sent_at.timestamp_millis();
-        let price = price.map(|p| p.rates_at(sent_at).clone());
-        if let Some(limit) = limit {
-            let start = sent_at_ms.saturating_sub((limit.window_seconds * 1000) as i64);
-            let mut stmt = tx.prepare("SELECT cost_nano_usd FROM spend_receipts WHERE account=?1 AND sent_at_ms>?2 AND state!='released'").map_err(storage)?;
-            let rows = stmt
-                .query_map(params![r.account, start], |row| {
-                    row.get::<_, Option<u64>>(0)
-                })
-                .map_err(storage)?;
-            let mut held = u128::from(limit.max_request_usd.nano_units());
-            for cost in rows {
-                held = held.saturating_add(u128::from(
-                    cost.map_err(storage)?
-                        .unwrap_or(limit.max_request_usd.nano_units()),
-                ));
-            }
-            if held > u128::from(limit.usd.nano_units()) {
-                return Err(ModelError::BudgetExhausted(
-                    DiagnosticCode::SpendBudgetExhausted,
-                ));
-            }
-        }
-        let accepted = Self::reserve_in(&tx, r)?;
-        if accepted {
-            tx.execute("UPDATE spend_receipts SET sent_at_ms=?2, caller_request_id=?3, price=?4 WHERE reference=?1", params![r.reference.as_str(), sent_at_ms, request_id, price.as_ref().map(serde_json::to_string).transpose().map_err(storage)?]).map_err(storage)?;
-        }
-        tx.commit().map_err(storage)?;
-        Ok(accepted)
-    }
-
-    /// Read exact cost totals from canonical receipts with a literal request-id prefix.
-    pub fn cost(
-        &self,
-        account: &str,
-        start_ms: i64,
-        end_ms: i64,
-        invocation: Option<&str>,
-        prefix: Option<&str>,
-    ) -> Result<SpendCost, ModelError> {
-        if start_ms > end_ms {
-            return Err(ModelError::InvalidRequest(
-                DiagnosticCode::InvalidConfiguration,
-            ));
-        }
-        let conn = self.0.lock().map_err(storage)?;
-        let mut stmt = conn.prepare("SELECT cost_nano_usd, state='unknown' OR (state='settled' AND price IS NOT NULL AND cost_nano_usd IS NULL), price IS NULL FROM spend_receipts WHERE account=?1 AND sent_at_ms>=?2 AND sent_at_ms<?3 AND state!='released' AND (?4 IS NULL OR invocation=?4) AND (?5 IS NULL OR substr(caller_request_id,1,length(?5))=?5)").map_err(storage)?;
-        let rows = stmt
-            .query_map(
-                params![account, start_ms, end_ms, invocation, prefix],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<u64>>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, bool>(2)?,
-                    ))
-                },
-            )
-            .map_err(storage)?;
-        let mut total = SpendCost::default();
-        for row in rows {
-            let (cost, unknown, unpriced) = row.map_err(storage)?;
-            total.settled_nano_usd = total.settled_nano_usd.saturating_add(cost.unwrap_or(0));
-            total.unknown_usage_count =
-                total.unknown_usage_count.saturating_add(u64::from(unknown));
-            total.unpriced_count = total.unpriced_count.saturating_add(u64::from(unpriced));
-        }
-        Ok(total)
     }
 
     /// Use the runtime's existing retention window for saved answers.
@@ -487,27 +395,6 @@ impl SqliteSpendLedger {
         let output = output
             .map(|_| serde_json::json!({"output_received": true}))
             .or_else(|| old.output.clone());
-        let price: Option<String> = conn
-            .query_row(
-                "SELECT price FROM spend_receipts WHERE reference=?1",
-                [reference.as_str()],
-                |r| r.get(0),
-            )
-            .map_err(storage)?;
-        let price: Option<TokenRates> = price
-            .map(|p| serde_json::from_str(&p))
-            .transpose()
-            .map_err(storage)?;
-        let cost = if state == SpendState::Released {
-            Some(0)
-        } else if state == SpendState::Settled {
-            price
-                .as_ref()
-                .zip(usage.as_ref())
-                .and_then(|(p, u)| p.cost_nano_usd(u))
-        } else {
-            None
-        };
         let usage = usage
             .map(|u| serde_json::to_string(&u))
             .transpose()
@@ -539,8 +426,8 @@ impl SqliteSpendLedger {
             }
         }
         conn.execute(
-            "UPDATE spend_receipts SET state=?2, usage=?3, output=?4, cost_nano_usd=?5 WHERE reference=?1",
-            params![reference.as_str(), state_name(state), usage, output, cost],
+            "UPDATE spend_receipts SET state=?2, usage=?3, output=?4 WHERE reference=?1",
+            params![reference.as_str(), state_name(state), usage, output],
         )
         .map_err(storage)?;
         Ok(())

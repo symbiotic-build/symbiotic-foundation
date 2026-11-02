@@ -1,5 +1,54 @@
 //! Route-owned provider balance reads. Only numeric observations reach health.
 use super::*;
+use serde::{Deserializer, Serializer, de};
+
+/// Nonnegative decimal amount with nine fractional places, bounded by SQLite i64.
+/// Configuration uses decimal strings; calculations never use binary floats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DecimalAmount(pub(crate) u64);
+impl DecimalAmount {
+    /// Parse an exact nonnegative decimal string with at most nine fractional digits.
+    pub fn parse(value: &str) -> Option<Self> {
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+        if whole.is_empty()
+            || !whole.bytes().all(|b| b.is_ascii_digit())
+            || fraction.len() > 9
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+            || (value.contains('.') && fraction.is_empty())
+        {
+            return None;
+        }
+        let whole: u64 = whole.parse().ok()?;
+        let part = if fraction.is_empty() {
+            0
+        } else {
+            fraction.parse::<u64>().ok()?
+        };
+        let units = whole
+            .checked_mul(1_000_000_000)?
+            .checked_add(part.checked_mul(10u64.pow(9 - fraction.len() as u32))?)?;
+        (units <= i64::MAX as u64).then_some(Self(units))
+    }
+    /// Value in billionths of the configured currency.
+    pub fn nano_units(self) -> u64 {
+        self.0
+    }
+}
+impl Serialize for DecimalAmount {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!(
+            "{}.{:09}",
+            self.0 / 1_000_000_000,
+            self.0 % 1_000_000_000
+        ))
+    }
+}
+impl<'de> Deserialize<'de> for DecimalAmount {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| de::Error::custom("invalid decimal amount"))
+    }
+}
 
 /// Supported provider balance protocol.
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -25,7 +74,7 @@ pub struct LowBalance {
     /// Warn below this exact amount.
     pub amount: DecimalAmount,
 }
-/// Optional per-route balance monitoring. It never gates requests.
+/// Optional per-route balance monitoring and an allowance reported to the core.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BalanceConfig {
@@ -38,6 +87,9 @@ pub struct BalanceConfig {
     pub debounce_seconds: u64,
     /// Selected currency and low-balance warning threshold.
     pub low_balance: LowBalance,
+    /// Optional total allowance in the selected currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<DecimalAmount>,
 }
 fn default_debounce() -> u64 {
     1
@@ -136,6 +188,21 @@ impl Passthrough {
                 {
                     tracing::warn!(route = route.config.name, currency = ?value.currency, total_nano_units = value.total_nano_units, is_available = value.is_available, "provider balance low");
                 }
+                let reading = crate::records::Reading {
+                    name: "deepseek.balance".into(),
+                    unit: format!("{:?}", value.currency),
+                    remaining: value.total_nano_units.map(|n| n as f64 / 1_000_000_000.0),
+                    limit: config
+                        .allowance
+                        .map(|n| n.nano_units() as f64 / 1_000_000_000.0),
+                    read_at: value.read_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+                    ..Default::default()
+                };
+                self.records.observe(
+                    &route.config.record_account(),
+                    std::slice::from_ref(&reading),
+                    self.now(),
+                );
                 health.balance.value = Some(value);
             }
             Err(code) => {
