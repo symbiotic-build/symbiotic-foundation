@@ -153,6 +153,14 @@ the response cache, traces, receipts and persistence: SQLite under
 links SQLite; contract crates do not. Typed tenant/provider/revision/account identity scopes results; account sharing is
 explicit. The canonical request-spend ledger shares the operational database with queue and attempt state. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
 
+### `symbiotic-agent`
+
+Runs one job as bounded steps inside a sandbox
+([crate README](../crates/symbiotic-agent/README.md)). It sends every model request
+to the URL supplied by the launcher, through the gateway path. It uses neither
+`symbiotic-ai-runtime` nor a provider adapter. `symbiotic-ai-runtime` remains the
+host call layer.
+
 ### `symbiotic-egress` and `symbiotic-credential-process`
 
 The versioned WP14 schema/client is `symbiotic-egress`; Memory consumes its
