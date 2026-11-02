@@ -13,6 +13,8 @@ APIs still require changes to meet that contract.
 
 ## Crate Boundaries
 
+- [`symbiotic-core-service`](../crates/symbiotic-core-service/README.md) owns the local job, request, budget and decision store with append-only events and reconciliation.
+
 ```mermaid
 flowchart TB
     Core["symbiotic-core\nids, labels, retry policy"]
@@ -105,6 +107,8 @@ Owns provider-neutral model contracts:
 - rerank;
 - classification (typed Noul / Choice / Score questions answered with
   probabilities; see [classification](architecture/classification.md));
+- OpenAI Responses requests with function tools, and the function calls in
+  their answers (`responses`), for the agent runtime;
 - future vision/media/agent-task capabilities;
 - provider identity and capability descriptions;
 - auth mode descriptions;
@@ -148,6 +152,14 @@ the response cache, traces, receipts and persistence: SQLite under
 `state_dir`; without one, dispatch returns `SpendLedgerUnavailable`. Alongside the SQLite backend and credential-process implementation, it
 links SQLite; contract crates do not. Typed tenant/provider/revision/account identity scopes results; account sharing is
 explicit. The canonical request-spend ledger shares the operational database with queue and attempt state. Details: [architecture/ai-runtime.md](architecture/ai-runtime.md).
+
+### `symbiotic-agent`
+
+Runs one job as bounded steps inside a sandbox
+([crate README](../crates/symbiotic-agent/README.md)). It sends every model request
+to the URL supplied by the launcher, through the gateway path. It uses neither
+`symbiotic-ai-runtime` nor a provider adapter. `symbiotic-ai-runtime` remains the
+host call layer.
 
 ### `symbiotic-egress` and `symbiotic-credential-process`
 

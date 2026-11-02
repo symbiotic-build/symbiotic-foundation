@@ -26,6 +26,8 @@ use std::sync::Arc;
 use tokio::time::Instant;
 /// Provider-neutral output item stream and wire adapters.
 pub mod item_stream;
+/// Responses requests with function tools, and the function calls in their answers.
+pub mod responses;
 
 pub use symbiotic_core::retry;
 pub use symbiotic_core::{

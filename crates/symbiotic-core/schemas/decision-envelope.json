@@ -426,11 +426,9 @@
       "description": "Life cycle of a decision.",
       "type": "string",
       "enum": [
-        "draft",
         "open",
         "answered",
-        "expired",
-        "superseded"
+        "withdrawn"
       ]
     },
     "EscalationTier": {

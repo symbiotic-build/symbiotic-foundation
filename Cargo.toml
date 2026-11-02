@@ -6,11 +6,13 @@ members = [
     "crates/symbiotic-gateway",
     "crates/symbiotic-ai-runtime",
     "crates/symbiotic-core",
+    "crates/symbiotic-core-service",
     "crates/symbiotic-queue",
     "crates/symbiotic-queue-sqlite",
     "crates/symbiotic-model",
     "crates/symbiotic-trace",
     "crates/symbiotic-portability",
+    "crates/symbiotic-agent",
 ]
 resolver = "2"
 
