@@ -13,6 +13,8 @@ APIs still require changes to meet that contract.
 
 ## Crate Boundaries
 
+- [`symbiotic-core-service`](../crates/symbiotic-core-service/README.md) owns the local job, request, budget and decision store with append-only events and reconciliation.
+
 ```mermaid
 flowchart TB
     Core["symbiotic-core\nids, labels, retry policy"]

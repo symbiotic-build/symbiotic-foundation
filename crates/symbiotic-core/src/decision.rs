@@ -161,11 +161,9 @@ pub struct SafeDefault {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionState {
-    Draft,
     Open,
     Answered,
-    Expired,
-    Superseded,
+    Withdrawn,
 }
 
 /// An answer bound to the revision it answers.

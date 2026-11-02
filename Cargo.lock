@@ -1558,6 +1558,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "symbiotic-core-service"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "symbiotic-core",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "symbiotic-credential-process"
 version = "0.2.0"
 dependencies = [
