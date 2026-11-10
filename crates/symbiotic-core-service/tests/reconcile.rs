@@ -29,6 +29,91 @@ fn report(store: &mut symbiotic_core_service::Store, dir: &std::path::Path) -> V
         json!({"day":chrono::Utc::now().format("%Y-%m-%d").to_string(),"warden_state":dir}),
     )
 }
+fn create_warden_job(store: &mut symbiotic_core_service::Store, id: &str) {
+    ok(
+        store,
+        "job.create",
+        json!({"id":id,"kind":"review","product":"warden"}),
+    );
+}
+#[test]
+fn warden_job_comparison_ignores_other_products() {
+    for product in ["test", "Warden", "warden-other"] {
+        let (_dir, mut store) = store();
+        let warden = tempfile::tempdir().unwrap();
+        ok(
+            &mut store,
+            "job.create",
+            json!({"id":ID,"kind":"review","product":product}),
+        );
+        let result = report(&mut store, warden.path());
+        assert_eq!(result["passed"], true, "{product}: {result}");
+        assert_eq!(
+            result["jobs"],
+            json!({"in_core":0,"in_warden":0,"missing_from_core":[],"extra_in_core":[]})
+        );
+        manifest(warden.path());
+        let result = report(&mut store, warden.path());
+        assert_eq!(result["passed"], false, "{product}: {result}");
+        assert_eq!(
+            result["jobs"],
+            json!({"in_core":0,"in_warden":1,"missing_from_core":[ID],"extra_in_core":[]})
+        );
+    }
+}
+#[test]
+fn known_non_warden_requests_still_receive_usage_and_quota_checks() {
+    let (_dir, mut store) = store();
+    let warden = tempfile::tempdir().unwrap();
+    create(&mut store, "job");
+    let mut no_usage = record("without", None);
+    no_usage["usage"] = Value::Null;
+    no_usage["status"] = json!(500);
+    ok(&mut store, "request.record", no_usage);
+    let mut refused = record("refused", None);
+    refused["account"] = json!("unmetered");
+    refused["refused"] = json!("quota_exhausted");
+    refused["usage"] = Value::Null;
+    refused["status"] = json!(402);
+    ok(&mut store, "request.record", refused);
+    ok(&mut store, "request.record", record("full", Some(100.0)));
+    ok(&mut store, "request.record", record("after", None));
+    let result = report(&mut store, warden.path());
+    assert_eq!(
+        result["requests"],
+        json!({"total":4,"without_usage":[{"request_id":"without","account":"account","route":"route","status":500}],"refused":[{"request_id":"refused","account":"unmetered","route":"route","status":402,"refused":"quota_exhausted"}],"unknown_job":[]})
+    );
+    assert_eq!(result["accounts_without_quota_meter"], json!(["unmetered"]));
+    assert_eq!(
+        result["quota"]["violations"],
+        json!([{"budget_id":"account/weekly","request_id":"after","problem":"request sent while exhausted without an answered allow_over_limit decision"}])
+    );
+    assert_eq!(result["passed"], false);
+    assert_eq!(
+        result["jobs"],
+        json!({"in_core":0,"in_warden":0,"missing_from_core":[],"extra_in_core":[]})
+    );
+}
+#[test]
+fn request_stops_being_unknown_when_any_product_creates_its_job() {
+    let (_dir, mut store) = store();
+    let warden = tempfile::tempdir().unwrap();
+    ok(&mut store, "request.record", record("request", None));
+    let result = report(&mut store, warden.path());
+    assert_eq!(result["passed"], false);
+    assert_eq!(result["requests"]["unknown_job"], json!(["request"]));
+    create(&mut store, "job");
+    let result = report(&mut store, warden.path());
+    assert_eq!(
+        result["requests"],
+        json!({"total":1,"without_usage":[],"refused":[],"unknown_job":[]})
+    );
+    assert_eq!(result["passed"], true, "{result}");
+    assert_eq!(
+        result["jobs"],
+        json!({"in_core":0,"in_warden":0,"missing_from_core":[],"extra_in_core":[]})
+    );
+}
 #[test]
 fn matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest() {
     let (_dir, mut store) = store();
@@ -37,7 +122,7 @@ fn matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest() {
     // SHA-256('/jobs/review example' || 00 || 'receipt-1'), first 16 bytes.
     let empty = report(&mut store, warden.path());
     assert_eq!(empty["jobs"]["missing_from_core"], json!([ID]));
-    create(&mut store, ID);
+    create_warden_job(&mut store, ID);
     let result = report(&mut store, warden.path());
     assert_eq!(
         result,
@@ -49,8 +134,8 @@ fn missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed() {
     let (_dir, mut store) = store();
     let warden = tempfile::tempdir().unwrap();
     manifest(warden.path());
-    create(&mut store, "extra");
-    create(&mut store, "job");
+    create_warden_job(&mut store, "extra");
+    create_warden_job(&mut store, "job");
     let mut no_usage = record("without", None);
     no_usage["usage"] = Value::Null;
     no_usage["status"] = json!(500);
@@ -78,9 +163,9 @@ fn missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed() {
 fn account_without_budget_is_reported_without_failure_and_local_refusal_is_not_missing_usage() {
     let (_dir, mut store) = store();
     let warden = tempfile::tempdir().unwrap();
-    // There must be a matching manifest for every core job.
+    // There must be a matching manifest for every Warden job in core.
     manifest(warden.path());
-    create(&mut store, ID);
+    create_warden_job(&mut store, ID);
     let mut request = record("refused", None);
     request["job_id"] = json!(ID);
     request["refused"] = json!("quota_exhausted");
@@ -98,7 +183,7 @@ fn account_without_budget_is_reported_without_failure_and_local_refusal_is_not_m
     assert_eq!(result["quota"]["violations"], json!([]));
     // A separate empty core file proves the unmetered account never changes passed.
     let (_other, mut clean) = common::store();
-    create(&mut clean, ID);
+    create_warden_job(&mut clean, ID);
     let mut request = record("request", None);
     request["job_id"] = json!(ID);
     ok(&mut clean, "request.record", request);
@@ -223,7 +308,7 @@ fn utc_day_bounds_include_start_and_exclude_next_day_for_jobs_and_requests() {
         ("end", "2026-11-02T23:59:59.999Z"),
         ("next", "2026-11-03T00:00:00.000Z"),
     ] {
-        create(&mut store, id);
+        create_warden_job(&mut store, id);
         conn.execute(
             "UPDATE jobs SET created=?1 WHERE id=?2",
             rusqlite::params![created, id],
