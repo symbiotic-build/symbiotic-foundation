@@ -440,38 +440,70 @@ pub(crate) fn events_since(conn: &Connection, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn job_list_seeks_to_the_cursor_instead_of_scanning_earlier_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path()).unwrap();
+        let mut jobs = Vec::new();
         for index in 0..1000 {
             let line = json!({"call":"job.create","args":{"id":format!("job-{index:04}"),"kind":"review","product":"test"}}).to_string();
-            assert!(dispatch(&mut store, &line).starts_with("{\"ok\""));
+            let response: Value = serde_json::from_str(&dispatch(&mut store, &line)).unwrap();
+            let mut job = response["ok"]["job"].clone();
+            job.as_object_mut().unwrap().remove("cost");
+            jobs.push(job);
         }
-        let conn = Connection::open(dir.path().join("core.sqlite")).unwrap();
+        let mut measurements = Vec::new();
         for (product, state) in [
             (None, None),
             (Some("test"), None),
             (None, Some("ready")),
             (Some("test"), Some("ready")),
         ] {
-            let (sql, parameters) = job_list_query(product, state, Some("job-0900"), 11);
-            let plan: Vec<String> = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .unwrap()
-                .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
-                .unwrap()
-                .map(|step| step.unwrap())
-                .collect();
+            let mut page_steps = Vec::new();
+            for (after, start) in [(None, 0), (Some("job-0900"), 901)] {
+                let limit = 10;
+                let mut args = json!({"limit":limit});
+                for (field, value) in [("product", product), ("state", state), ("after", after)] {
+                    if let Some(value) = value {
+                        args[field] = json!(value);
+                    }
+                }
+                let line = json!({"call":"job.list","args":args}).to_string();
+                let steps = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&steps);
+                store.conn.progress_handler(
+                    1,
+                    Some(move || {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                );
+                let response = dispatch(&mut store, &line);
+                store.conn.progress_handler(0, None::<fn() -> bool>);
+                let steps = steps.load(Ordering::Relaxed);
+                let response: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(
+                    response,
+                    json!({"ok":{"jobs":jobs[start..start + limit],"next_after":jobs[start + limit - 1]["id"]}}),
+                    "product={product:?} state={state:?} after={after:?}"
+                );
+                page_steps.push(steps);
+            }
+            measurements.push((product, state, page_steps));
+        }
+        for (product, state, page_steps) in measurements {
+            // Equal-sized matching pages allow at most 2x the first page's work.
+            // Scanning the 901 earlier jobs must exceed this cursor-seek bound.
             assert!(
-                plan.iter()
-                    .any(|step| step.starts_with("SEARCH jobs") && step.contains("(id>?)")),
-                "cursor must seek the primary key: {plan:?}"
-            );
-            assert!(
-                !plan.iter().any(|step| step.starts_with("SCAN jobs")),
-                "cursor must not scan earlier jobs: {plan:?}"
+                page_steps[1] <= 2 * page_steps[0],
+                "product={product:?} state={state:?}: late page used {} SQLite VM steps, first page used {} (bound: 2x)",
+                page_steps[1],
+                page_steps[0]
             );
         }
     }
