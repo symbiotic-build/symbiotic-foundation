@@ -77,7 +77,7 @@ pub(crate) fn run(conn: &Connection, args: &Value) -> Result<Value> {
     );
     let core = rows(
         conn,
-        "SELECT id FROM jobs WHERE created>=?1 AND created<?2",
+        "SELECT id FROM jobs WHERE created>=?1 AND created<?2 AND product='warden'",
         params![start, end],
     )?
     .into_iter()

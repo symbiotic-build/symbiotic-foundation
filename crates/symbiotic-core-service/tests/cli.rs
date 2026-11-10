@@ -84,7 +84,7 @@ fn standalone_cli_serves_calls_reconciles_and_creates_private_socket_and_backup(
     let job = ok(
         state.path(),
         "job.create",
-        json!({"id":id,"kind":"review","product":"test"}),
+        json!({"id":id,"kind":"review","product":"warden"}),
     );
     assert_eq!(job["job"]["state"], "ready");
     let mut request = common::record("request", Some(91.0));
