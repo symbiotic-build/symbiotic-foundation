@@ -249,7 +249,7 @@ symbiotic-core --state /state budget.get '{"account":"codex-gmail"}'
 symbiotic-core --state /state decision.answer '<JSON args>'
 symbiotic-core --state /state job.transition '{"id":"job","to":"running"}'
 symbiotic-core --state /state job.heartbeat '{"id":"job"}'
-symbiotic-core --state /state job.list '{"product":"test","state":"running","limit":100}'
+symbiotic-core --state /state job.list '{"product":"warden","state":"running","limit":100}'
 symbiotic-core --state /state events.since '{"after":0}'
 symbiotic-core --state /state reconcile --day 2026-11-02 --warden-state /warden-state
 ```
@@ -276,6 +276,7 @@ Each bullet names the failure prevented and the test function in its linked file
 - Job events exclude heartbeats even after a transition, preventing liveness from entering canonical history: [tests/jobs.rs](tests/jobs.rs), `job_events_never_carry_the_heartbeat`. Ended jobs retain their last heartbeat.
 - A create retry after a heartbeat preserves the original sequence, preventing duplicate creation history: [tests/jobs.rs](tests/jobs.rs), `create_retry_after_heartbeat_returns_the_original_sequence`.
 - Job listing combines exact product and state filters, preventing unrelated jobs from entering results: [tests/jobs.rs](tests/jobs.rs), `job_list_filters_by_state_and_product_alone_and_together`.
+- Cursor pages seek the primary key instead of scanning earlier jobs, preventing repeated work on later pages: [src/calls.rs](src/calls.rs), `job_list_seeks_to_the_cursor_instead_of_scanning_earlier_jobs`.
 - Job listing uses exclusive id cursors and matching-row continuation, preventing repeated rows and false continuation: [tests/jobs.rs](tests/jobs.rs), `job_list_pages_by_id_and_reports_continuation`.
 - Job listing returns stored fields and heartbeats without cost or new events, preventing request-history work and listing writes: [tests/jobs.rs](tests/jobs.rs), `job_list_returns_stored_fields_and_heartbeat_without_cost`.
 - Invalid listing filters, cursors and limits fail without writes, preventing malformed queries from being accepted: [tests/jobs.rs](tests/jobs.rs), `job_list_rejects_invalid_filters_cursors_and_limits`.
@@ -289,6 +290,7 @@ Each bullet names the failure prevented and the test function in its linked file
 - An older reading never moves a budget, preventing an outbox from rolling it back: [tests/budgets.rs](tests/budgets.rs), `old_reading_changes_nothing_and_reading_without_limit_is_not_a_budget`.
 - Repeated exhaustion reuses an open exhaustion decision, preventing duplicate questions: [tests/budgets.rs](tests/budgets.rs), `exhaustion_after_warning_reuses_unanswered_exhaustion_decision`.
 - Each budget's `spent`, `limit` and `state` equal its last `budget.reading` event. The allowance (`over_limit_allowed`) is not in that event: rebuilding it also needs the `decision.answered` events of its exhaustion decisions and the readings that return the budget to `open`, and no test checks that rebuild. Sequence checks prevent record/event divergence, duplicate open decisions and jobs proceeding with unanswered decisions: [tests/sequences.rs](tests/sequences.rs), `generated_operations_preserve_budget_event_and_job_invariants` (32 fixed seeds, 80 operations each; `SEQUENCE_SEED` replays one seed).
+- Generated heartbeats change only running jobs' liveness and never enter events. Generated listings return every stored job once in id order without cost. Last accepted heartbeats, unchanged event counts and complete pages are checked after each operation and after reopening: [tests/sequences.rs](tests/sequences.rs), `generated_operations_preserve_budget_event_and_job_invariants`.
 - Migration from version 1 preserves jobs and append-only history, preventing data loss during upgrade: [tests/store.rs](tests/store.rs), `version_one_job_survives_migration_and_events_remain_append_only`.
 - Owner-only socket permissions prevent group and other access: [tests/cli.rs](tests/cli.rs), `standalone_cli_serves_calls_reconciles_and_creates_private_socket_and_backup`. Rejection of a different peer uid has no automated test.
 - Reconcile compares core and Warden jobs, preventing missing or extra jobs from passing: [tests/reconcile.rs](tests/reconcile.rs), `missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed`; `matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest` checks agreement and the Warden id.

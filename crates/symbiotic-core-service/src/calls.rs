@@ -210,16 +210,13 @@ pub(crate) fn job_list(conn: &Connection, args: &Value) -> Result<Value> {
         return Err(invalid("state"));
     }
     let limit = page_limit(args)?;
-    let mut jobs = rows(
-        conn,
-        "SELECT * FROM jobs WHERE (?1 IS NULL OR product=?1) AND (?2 IS NULL OR state=?2) AND (?3 IS NULL OR id>?3) ORDER BY id LIMIT ?4",
-        params![
-            args["product"].as_str(),
-            args["state"].as_str(),
-            args["after"].as_str(),
-            limit + 1
-        ],
-    )?;
+    let (sql, parameters) = job_list_query(
+        args["product"].as_str(),
+        args["state"].as_str(),
+        args["after"].as_str(),
+        limit + 1,
+    );
+    let mut jobs = rows(conn, &sql, rusqlite::params_from_iter(parameters))?;
     let next_after = if jobs.len() > limit as usize {
         jobs.pop();
         jobs.last()
@@ -230,6 +227,39 @@ pub(crate) fn job_list(conn: &Connection, args: &Value) -> Result<Value> {
     };
     Ok(json!({"jobs":jobs,"next_after":next_after}))
 }
+/// Build the listing statement and its bound parameters for validated filters.
+/// `row_limit` includes the extra row used to detect continuation.
+fn job_list_query(
+    product: Option<&str>,
+    state: Option<&str>,
+    after: Option<&str>,
+    row_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value as SqlValue;
+    let mut sql = String::from("SELECT * FROM jobs");
+    let mut parameters = Vec::new();
+    for (column, operator, value) in [
+        ("product", "=", product),
+        ("state", "=", state),
+        ("id", ">", after),
+    ] {
+        if let Some(value) = value {
+            sql.push_str(if parameters.is_empty() {
+                " WHERE "
+            } else {
+                " AND "
+            });
+            sql.push_str(column);
+            sql.push_str(operator);
+            sql.push('?');
+            parameters.push(SqlValue::Text(value.into()));
+        }
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    parameters.push(SqlValue::Integer(row_limit));
+    (sql, parameters)
+}
+
 fn page_limit(args: &Value) -> Result<i64> {
     match args.get("limit") {
         None => Ok(1000),
@@ -405,4 +435,44 @@ pub(crate) fn events_since(conn: &Connection, args: &Value) -> Result<Value> {
         .and_then(|v| v["seq"].as_i64())
         .unwrap_or(after);
     Ok(json!({"events":events,"last_seq":last}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_list_seeks_to_the_cursor_instead_of_scanning_earlier_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        for index in 0..1000 {
+            let line = json!({"call":"job.create","args":{"id":format!("job-{index:04}"),"kind":"review","product":"test"}}).to_string();
+            assert!(dispatch(&mut store, &line).starts_with("{\"ok\""));
+        }
+        let conn = Connection::open(dir.path().join("core.sqlite")).unwrap();
+        for (product, state) in [
+            (None, None),
+            (Some("test"), None),
+            (None, Some("ready")),
+            (Some("test"), Some("ready")),
+        ] {
+            let (sql, parameters) = job_list_query(product, state, Some("job-0900"), 11);
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                .unwrap()
+                .map(|step| step.unwrap())
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH jobs") && step.contains("(id>?)")),
+                "cursor must seek the primary key: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN jobs")),
+                "cursor must not scan earlier jobs: {plan:?}"
+            );
+        }
+    }
 }
