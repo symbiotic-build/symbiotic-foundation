@@ -443,6 +443,7 @@ backslash; no duplicate headers; no `Transfer-Encoding` or `Expect`; a
 `Content-Length` within `max_request_bytes` on POST. GET may omit Content-Length
 for an empty body. The caller's `Authorization`,
 cookies, `Host` and forwarding headers are never copied.
+An optional [forwarder socket](215-forwarder-socket.md) adds a separate peer user, tenant route set and trusted run identity.
 
 **Admission.** Each passthrough route registers its account with the runtime exactly
 like a typed route. Typed and passthrough routes on the same `(tenant, account)` or

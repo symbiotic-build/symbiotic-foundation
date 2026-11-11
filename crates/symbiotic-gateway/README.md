@@ -21,7 +21,7 @@ The JSON configuration refuses unknown fields and has no `version` field:
 - `max_header_bytes`: maximum HTTP request header bytes; at least 4 124, preserving the previous top-level minimum.
 - `io_timeout_seconds`: positive caller socket I/O and core record-delivery timeout.
 - `passthrough`: required server configuration with `socket_path`, optional `health_path`,
-  positive `max_connections`, `routes` and optional `retry_policies`.
+  positive `max_connections`, `routes`, optional `retry_policies` and optional `forwarder`.
 
 The `passthrough` object retains its existing JSON shape. Routes retain their
 method/path bindings, destinations, secret sources, stream dialects, header
@@ -34,6 +34,34 @@ The gateway protects the process before reading configuration or secrets. It
 retains `credential-process.lock` so a gateway and typed credential process cannot
 open the same state directory concurrently. Provision the socket's parent as an
 owner-only directory. The gateway does not open a typed socket or model registry.
+
+## Forwarder socket
+
+An optional `passthrough.forwarder` block requires all three fields and rejects unknown fields:
+
+```json
+"forwarder": {"socket_path":"/run/gateway-forwarder/http.sock", "peer_uid":1234, "tenant":"forwarded"}
+```
+
+The socket path must be absolute and distinct from other configured paths.
+Its directory must differ from the owner socket directory.
+The tenant must be nonblank and have at least one route.
+
+Provision a directory owned by the gateway user, with mode 0750 or 02750 exactly.
+For example, `install -d -o gateway -g forwarder -m 2750 /run/gateway-forwarder` creates a setgid directory for the forwarder's group.
+The socket has mode 0660 and must inherit the directory's group, or startup fails.
+On Linux, setgid is needed when that group differs from the gateway's group.
+The gateway never changes ownership.
+
+Each forwarder connection sends `run <identity>\n` before HTTP.
+The identity contains 1–64 characters from `A-Za-z0-9._-`; CR is forbidden.
+Invalid, overlong or silent first lines close without any answer or request record.
+The forwarder selects only its tenant's routes; the owner selects all remaining routes.
+Method/path pairs may repeat across these sets; route names remain globally unique.
+Caller `x-symbiotic-request-id` values are ignored without validation on the forwarder socket and never reach the provider.
+The generated request ID is `<identity>-<32 hexadecimal UUID characters>`, preserving the identity as `job_id` on every attempt.
+Records gain no tenant field: readers derive tenant from the recorded route.
+See the [design record](../../docs/design/215-forwarder-socket.md).
 
 ## Error classification, retries and concurrency
 
@@ -125,7 +153,7 @@ SIGTERM or SIGINT. Import refuses an existing store unless `--replace` is given.
 ## Request records and the quota gate
 
 Every upstream attempt produces one record when that attempt ends, including
-failures and continuations. Attempt 1 uses the caller's `x-symbiotic-request-id`;
+failures and continuations. On the owner socket, attempt 1 uses the caller's `x-symbiotic-request-id`;
 attempt n ≥ 2 uses `<request_id>.<n>`. Requests without a caller id receive a local
 UUID. Every attempt's `job_id` removes the caller id's final hyphen and suffix,
 or keeps the whole caller id when it has no hyphen. A matched request that ends

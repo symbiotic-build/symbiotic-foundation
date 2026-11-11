@@ -647,7 +647,7 @@ async fn passthrough_contract_retry_after_rounds_fractional_seconds_up() {
             .await
             .unwrap();
         let owner = process.clone();
-        let handler = tokio::spawn(async move { connection(&owner, server).await });
+        let handler = tokio::spawn(async move { connection(&owner, server, false).await });
         let (status, headers, body) = decoded(&read(caller).await);
         assert_eq!(status, 429);
         assert!(
@@ -1482,7 +1482,7 @@ async fn passthrough_contract_parser_refuses_bare_newlines_before_or_within_the_
         let (mut caller, server) = UnixStream::pair().unwrap();
         caller.write_all(bytes).await.unwrap();
         let owner = process.clone();
-        let handler = tokio::spawn(async move { connection(&owner, server).await });
+        let handler = tokio::spawn(async move { connection(&owner, server, false).await });
         let (actual, _, body) = decoded(&read(caller).await);
         assert_eq!(actual, status, "framing: {bytes:?}");
         assert_eq!(
@@ -2211,7 +2211,7 @@ async fn slot_wait_publishes_request_identity_and_wait_header_then_removes_waite
     let (mut caller, server) = UnixStream::pair().unwrap();
     caller.write_all(b"POST /v1/responses HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\nx-symbiotic-request-id: synthetic-job\r\n\r\n{}").await.unwrap();
     let owner = process.clone();
-    let handler = tokio::spawn(async move { connection(&owner, server).await });
+    let handler = tokio::spawn(async move { connection(&owner, server, false).await });
     tokio::time::timeout(Duration::from_secs(2), pass.changed.notified())
         .await
         .unwrap();
@@ -4158,4 +4158,383 @@ async fn gateway_429_new_session_hold_keeps_established_sessions_moving() {
     assert!(retry.head.contains("session-id: first\r\n"));
     retry.reply.send(Reply::json()).ok().unwrap();
     assert_eq!(decoded(&read(first).await).2, Reply::json().body);
+}
+
+async fn forwarder_answer(provider: &mut Fixture, caller: UnixStream) {
+    provider
+        .next()
+        .await
+        .reply
+        .send(Reply::json())
+        .ok()
+        .unwrap();
+    let (status, _, body) = decoded(&read(caller).await);
+    assert_eq!((status, body), (200, Reply::json().body));
+}
+fn forwarder_config(config: &mut GatewayConfig) {
+    config.io_timeout_seconds = 10;
+    let dir = config.state_dir.parent().unwrap().join("forwarder");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o2750)).unwrap();
+    let mut value = serde_json::to_value(&*config).unwrap();
+    value["passthrough"]["forwarder"] =
+        json!({"socket_path":dir.join("pass.sock"),"peer_uid":current_uid(),"tenant":"forwarded"});
+    let mut route = value["passthrough"]["routes"][0].clone();
+    route["name"] = json!("forwarded");
+    route["tenant"] = json!("forwarded");
+    route["path"] = json!("/forwarded");
+    value["passthrough"]["routes"]
+        .as_array_mut()
+        .unwrap()
+        .push(route);
+    *config = serde_json::from_value(value).unwrap();
+}
+async fn forwarder_connect(
+    harness: &Harness,
+    line: &[u8],
+    path: Option<&str>,
+    extra: &str,
+) -> UnixStream {
+    let path_socket = harness._dir.path().join("forwarder/pass.sock");
+    let mut caller = UnixStream::connect(path_socket).await.unwrap();
+    let mut bytes = line.to_vec();
+    if let Some(path) = path {
+        bytes.extend_from_slice(
+            format!("POST {path} HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n{extra}\r\n{{}}")
+                .as_bytes(),
+        );
+    }
+    caller.write_all(&bytes).await.unwrap();
+    caller
+}
+async fn closed_without_answer(mut caller: UnixStream) {
+    let mut bytes = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(3), caller.read_to_end(&mut bytes))
+        .await
+        .unwrap();
+    assert!(result.is_ok() || result.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
+    assert_eq!(bytes, b"");
+}
+
+#[tokio::test]
+async fn forwarder_socket_serves_the_configured_peer_and_drops_any_other_before_a_read() {
+    use std::os::unix::fs::MetadataExt;
+    for allowed in [true, false] {
+        let mut provider = Fixture::start().await;
+        let harness = Harness::start(&provider, |c| {
+            forwarder_config(c);
+            let mut value = serde_json::to_value(&*c).unwrap();
+            let uid = current_uid().wrapping_add(u32::from(!allowed));
+            value["passthrough"]["forwarder"]["peer_uid"] = json!(uid);
+            *c = serde_json::from_value(value).unwrap();
+        })
+        .await;
+        let dir = harness._dir.path().join("forwarder");
+        let socket = fs::metadata(dir.join("pass.sock")).unwrap();
+        assert_eq!(
+            (socket.permissions().mode() & 0o777, socket.gid()),
+            (0o660, fs::metadata(dir).unwrap().gid())
+        );
+        if allowed {
+            // Maximum identity length, sent together with HTTP, proves no read-ahead.
+            let caller = forwarder_connect(
+                &harness,
+                format!("run {}\n", "r".repeat(64)).as_bytes(),
+                Some("/forwarded"),
+                "",
+            )
+            .await;
+            forwarder_answer(&mut provider, caller).await;
+        } else {
+            closed_without_answer(forwarder_connect(&harness, b"", None, "").await).await;
+            assert!(request_records(&harness).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn owner_socket_still_refuses_a_foreign_peer_when_a_forwarder_is_configured() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(dir.path());
+    forwarder_config(&mut settings);
+    let process = open(settings).unwrap();
+    let listener = bind(&process).unwrap();
+    let path = process.config().passthrough.socket_path.clone();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let task = tokio::spawn(serve_until(
+        process,
+        listener,
+        std::future::pending(),
+        current_uid().wrapping_add(1),
+    ));
+    closed_without_answer(UnixStream::connect(path).await.unwrap()).await;
+    task.abort();
+    let _ = task.await;
+}
+
+async fn rejected_forwarder_line(line: &[u8]) {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, |c| {
+        forwarder_config(c);
+        c.passthrough.max_connections = 1;
+        c.io_timeout_seconds = if line.is_empty() { 1 } else { 10 };
+    })
+    .await;
+    closed_without_answer(forwarder_connect(&harness, line, None, "").await).await;
+    assert!(request_records(&harness).await.is_empty());
+    // The owner listener must share the released slot, too.
+    let caller = harness.connect("/v1/responses", b"{}", "").await;
+    forwarder_answer(&mut provider, caller).await;
+    let caller = forwarder_connect(&harness, b"run r\n", Some("/forwarded"), "").await;
+    forwarder_answer(&mut provider, caller).await;
+}
+#[tokio::test]
+async fn forwarder_connection_that_sends_nothing_is_closed_without_answer_slot_or_record() {
+    rejected_forwarder_line(b"").await;
+}
+#[tokio::test]
+async fn forwarder_connection_with_an_overlong_first_line_is_closed_without_answer_slot_or_record()
+{
+    rejected_forwarder_line(format!("run {}", "a".repeat(66)).as_bytes()).await;
+    // One character over the limit, with its newline inside the 70 bytes.
+    rejected_forwarder_line(format!("run {}\n", "a".repeat(65)).as_bytes()).await;
+}
+#[tokio::test]
+async fn forwarder_connection_with_a_malformed_first_line_is_closed_without_answer_slot_or_record()
+{
+    for line in [
+        b"other r\n".as_slice(),
+        b"run \n",
+        b"run a/b\n",
+        b"run r\r\n",
+    ] {
+        rejected_forwarder_line(line).await;
+    }
+}
+
+#[tokio::test]
+async fn forwarder_record_job_id_is_the_run_identity_despite_a_caller_request_id() {
+    let (capture, _guard) = LogCapture::install("info");
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, forwarder_config).await;
+    for header in [
+        "caller-1".to_owned(),
+        "".into(),
+        KEY.into(),
+        "x".repeat(100),
+    ] {
+        let caller = forwarder_connect(
+            &harness,
+            b"run a-b.c-1\n",
+            Some("/forwarded"),
+            &format!("x-symbiotic-request-id: {header}\r\n"),
+        )
+        .await;
+        let upstream = provider.next().await;
+        assert!(!upstream.head.contains("x-symbiotic-request-id"));
+        upstream.reply.send(Reply::json()).ok().unwrap();
+        assert_eq!(decoded(&read(caller).await).2, Reply::json().body);
+    }
+    let records = request_records(&harness).await;
+    assert_eq!(records.len(), 4);
+    for record in &records {
+        assert_eq!(record["job_id"], "a-b.c-1");
+        let suffix = record["request_id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("a-b.c-1-")
+            .unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            capture
+                .lines()
+                .iter()
+                .any(|line| line["spans"][0]["request_id"] == record["request_id"])
+        );
+    }
+}
+#[tokio::test]
+async fn forwarder_record_of_a_retried_attempt_keeps_the_run_identity_as_job_id() {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, forwarder_config).await;
+    let caller = forwarder_connect(
+        &harness,
+        b"run a-b.c-1\n",
+        Some("/forwarded"),
+        "x-symbiotic-request-id: caller-1\r\n",
+    )
+    .await;
+    let first = provider.next().await;
+    first.reply.send(Reply::rate(0)).ok().unwrap();
+    forwarder_answer(&mut provider, caller).await;
+    let records = request_records(&harness).await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[1]["request_id"],
+        format!("{}.2", records[0]["request_id"].as_str().unwrap())
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r["job_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("a-b.c-1"); 2]
+    );
+}
+#[tokio::test]
+async fn forwarder_record_names_a_route_of_the_forwarder_tenant() {
+    let mut provider = Fixture::start().await;
+    let mut harness = Harness::start(&provider, |c| {
+        forwarder_config(c);
+        c.passthrough.routes[1].path = "/v1/responses".into();
+    })
+    .await;
+    for forwarded in [true, false] {
+        let caller = if forwarded {
+            forwarder_connect(&harness, b"run r\n", Some("/v1/responses"), "").await
+        } else {
+            harness.connect("/v1/responses", b"{}", "").await
+        };
+        forwarder_answer(&mut provider, caller).await;
+    }
+    let records = request_records(&harness).await;
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| json!([r["route"], r["account"]]))
+            .collect::<Vec<_>>(),
+        vec![
+            json!(["forwarded", "forwarded/account"]),
+            json!(["responses", "tenant/account"])
+        ]
+    );
+    assert!(records.iter().all(|r| r.get("tenant").is_none()));
+    harness.stop.take().unwrap().send(()).unwrap();
+    (&mut harness.task).await.unwrap().unwrap();
+    for path in [
+        harness.path().to_owned(),
+        harness._dir.path().join("forwarder/pass.sock"),
+    ] {
+        assert!(UnixStream::connect(path).await.is_err());
+    }
+}
+#[tokio::test]
+async fn each_socket_answers_404_for_a_route_of_the_other_set() {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, forwarder_config).await;
+    for caller in [
+        harness.connect("/forwarded", b"{}", "").await,
+        forwarder_connect(&harness, b"run r\n", Some("/v1/responses"), "").await,
+    ] {
+        let (status, _, body) = decoded(&read(caller).await);
+        assert_eq!(
+            (status, body),
+            (404, br#"{"error":{"code":"route_not_found"}}"#.to_vec())
+        );
+    }
+    assert!(provider.incoming.try_recv().is_err());
+    assert!(request_records(&harness).await.is_empty());
+}
+#[tokio::test]
+async fn forwarder_directory_open_to_others_or_group_writable_stops_the_start() {
+    for mode in [0o755, 0o770, 0o700, 0o1750] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = config(dir.path());
+        forwarder_config(&mut settings);
+        fs::set_permissions(
+            dir.path().join("forwarder"),
+            fs::Permissions::from_mode(mode),
+        )
+        .unwrap();
+        let process = open(settings).unwrap();
+        let listener = bind(&process).unwrap();
+        assert_eq!(
+            serve_until(process, listener, std::future::pending(), current_uid()).await,
+            Err(GatewayError::StateUnavailable)
+        );
+    }
+}
+#[test]
+fn forwarder_block_with_a_missing_field_a_shared_directory_or_no_route_is_a_configuration_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(dir.path());
+    forwarder_config(&mut settings);
+    assert_eq!(settings.validate_routes(), Ok(()));
+    let mut crossing = settings.clone();
+    crossing.passthrough.routes[0].fallback_routes = vec!["forwarded".into()];
+    assert_eq!(
+        crossing.validate_routes(),
+        Err(GatewayError::InvalidRequest)
+    );
+    let valid = serde_json::to_value(&settings).unwrap();
+    for field in ["socket_path", "peer_uid", "tenant"] {
+        let mut value = valid.clone();
+        value["passthrough"]["forwarder"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(serde_json::from_value::<GatewayConfig>(value).is_err());
+    }
+    for replacement in [
+        json!({"tenant":" "}),
+        json!({"tenant":"missing"}),
+        json!({"socket_path":"relative.sock"}),
+        json!({"socket_path":dir.path().join("other.sock")}),
+    ] {
+        let mut value = valid.clone();
+        value["passthrough"]["forwarder"]
+            .as_object_mut()
+            .unwrap()
+            .extend(replacement.as_object().unwrap().clone());
+        assert_eq!(
+            serde_json::from_value::<GatewayConfig>(value)
+                .unwrap()
+                .validate_routes(),
+            Err(GatewayError::InvalidRequest)
+        );
+    }
+    for pointer in [
+        "/core_socket_path",
+        "/state_dir",
+        "/passthrough/health_path",
+        "/passthrough/routes/0/secret/path",
+    ] {
+        let mut value = valid.clone();
+        *value.pointer_mut(pointer).unwrap() =
+            valid["passthrough"]["forwarder"]["socket_path"].clone();
+        assert_eq!(
+            serde_json::from_value::<GatewayConfig>(value)
+                .unwrap()
+                .validate_routes(),
+            Err(GatewayError::InvalidRequest)
+        );
+    }
+    let mut value = valid;
+    value["passthrough"]["forwarder"]["unknown"] = json!(true);
+    assert!(serde_json::from_value::<GatewayConfig>(value).is_err());
+}
+#[tokio::test]
+async fn configuration_without_a_forwarder_block_serializes_and_behaves_as_before() {
+    let mut provider = Fixture::start().await;
+    let harness = Harness::start(&provider, |_| {}).await;
+    let value = serde_json::to_value(harness.process.config()).unwrap();
+    assert!(value["passthrough"].get("forwarder").is_none());
+    assert_eq!(
+        serde_json::to_value(serde_json::from_value::<GatewayConfig>(value.clone()).unwrap())
+            .unwrap(),
+        value
+    );
+    let caller = harness
+        .connect("/v1/responses", b"{}", "x-symbiotic-request-id: job-1\r\n")
+        .await;
+    forwarder_answer(&mut provider, caller).await;
+    let records = request_records(&harness).await;
+    assert_eq!(
+        (&records[0]["request_id"], &records[0]["job_id"]),
+        (&json!("job-1"), &json!("job"))
+    );
 }
