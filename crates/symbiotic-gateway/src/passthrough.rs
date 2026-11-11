@@ -1,4 +1,4 @@
-//! Same-UID undecoded HTTP forwarding through the runtime's account admission.
+//! Peer-authenticated HTTP forwarding through the runtime's account admission.
 //!
 //! Ordering: authenticate peer, parse and match, check credential, acquire adaptive permit and FIFO slot,
 //! wait for shared cooldown, renew, pace, recheck cooldown, send. Hold the slot through
@@ -61,12 +61,15 @@ use tokio::time::Instant;
 
 type Result<T> = std::result::Result<T, GatewayError>;
 
-/// Configuration for a same-UID HTTP/1.1 socket.
+/// Configuration for peer-authenticated HTTP/1.1 sockets.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassthroughConfig {
     /// Socket in a provisioned owner-only directory.
     pub socket_path: PathBuf,
+    /// Optional separate socket for a forwarder with trusted run identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarder: Option<ForwarderConfig>,
     /// Optional sanitized, atomically replaced health file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_path: Option<PathBuf>,
@@ -77,6 +80,18 @@ pub struct PassthroughConfig {
     /// Named sparse retry overrides, selected by a caller-only header.
     #[serde(default)]
     pub retry_policies: HashMap<String, RetryPolicy>,
+}
+
+/// A trusted forwarder channel, isolated by peer user and tenant.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwarderConfig {
+    /// Absolute socket path in a gateway-owned directory of mode 0750 or 02750.
+    pub socket_path: PathBuf,
+    /// Only this peer user may send `run <identity>\n` followed by HTTP.
+    pub peer_uid: u32,
+    /// Select only this tenant's routes; records derive tenant from their route.
+    pub tenant: String,
 }
 
 /// HTTP methods supported by an undecoded route.
@@ -249,6 +264,30 @@ fn header_list_valid(headers: &[String], response: bool) -> bool {
 
 pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
     let pass = &config.passthrough;
+    let forwarded = |route: &PassthroughRoute| {
+        pass.forwarder
+            .as_ref()
+            .is_some_and(|f| f.tenant == route.tenant)
+    };
+    if pass.forwarder.as_ref().is_some_and(|f| {
+        !f.socket_path.is_absolute()
+            || f.socket_path.parent() == pass.socket_path.parent()
+            || [
+                &config.state_dir,
+                &config.core_socket_path,
+                &pass.socket_path,
+            ]
+            .into_iter()
+            .chain(pass.health_path.iter())
+            .chain(pass.routes.iter().map(|r| match &r.secret {
+                SecretSource::LoginFile { path, .. } | SecretSource::OwnerOnlyFile { path } => path,
+            }))
+            .any(|p| p == &f.socket_path)
+            || f.tenant.trim().is_empty()
+            || !pass.routes.iter().any(forwarded)
+    }) {
+        return Err(GatewayError::InvalidRequest);
+    }
     if !config.core_socket_path.is_absolute()
         || !pass.socket_path.is_absolute()
         || pass.max_connections == 0
@@ -293,7 +332,7 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             || !names.insert(&route.name)
-            || !paths.insert((route.method, &route.path))
+            || !paths.insert((forwarded(route), route.method, &route.path))
             || route.tenant.trim().is_empty()
             || route.account.trim().is_empty()
             || !path_valid(&route.path)
@@ -311,10 +350,12 @@ pub(crate) fn validate(config: &GatewayConfig) -> Result<()> {
             })
             || !retry_policy::valid(&route.retry_policy)
             || route.fallback_routes.iter().any(|n| {
-                !pass
-                    .routes
-                    .iter()
-                    .any(|r| &r.name == n && r.stream == route.stream && r.method == route.method)
+                !pass.routes.iter().any(|r| {
+                    &r.name == n
+                        && r.stream == route.stream
+                        && r.method == route.method
+                        && forwarded(r) == forwarded(route)
+                })
             })
             || route.new_session.as_ref().is_some_and(|c| {
                 c.session_headers.is_empty() || !header_list_valid(&c.session_headers, false)
@@ -575,6 +616,11 @@ async fn serve_until(
 ) -> Result<()> {
     let pass = &process.inner.passthrough;
     let config = &process.config().passthrough;
+    let forwarder = config
+        .forwarder
+        .as_ref()
+        .map(|f| crate::server::bind_forwarder_path(&f.socket_path))
+        .transpose()?;
     let mut cooldown_changes = pass
         .routes
         .first()
@@ -624,18 +670,25 @@ async fn serve_until(
             }
             accepted = async {
                 let permit = connections.clone().acquire_owned().await.map_err(|_| GatewayError::StateUnavailable)?;
-                let (socket, _) = listener.accept().await.map_err(|_| GatewayError::Transport)?;
-                Ok::<_, GatewayError>((socket, permit))
+                let (accepted, forwarded) = tokio::select! {
+                    accepted = listener.accept() => (accepted, false),
+                    accepted = async { match &forwarder {
+                        Some(listener) => listener.accept().await,
+                        None => std::future::pending().await,
+                    }} => (accepted, true),
+                };
+                let (socket, _) = accepted.map_err(|_| GatewayError::Transport)?;
+                Ok::<_, GatewayError>((socket, permit, forwarded))
             } => {
-                let (socket, permit) = accepted?;
+                let (socket, permit, forwarded) = accepted?;
                 let Ok(peer) = socket.peer_cred() else { continue; };
-                // SAFETY: geteuid takes no arguments and retains no memory.
-                if peer.uid() != owner_uid { continue; }
+                let expected = if forwarded { config.forwarder.as_ref().map_or(owner_uid, |f| f.peer_uid) } else { owner_uid };
+                if peer.uid() != expected { continue; }
                 let process = process.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
                     // The handler logs failures inside the request span.
-                    let _ = connection(&process, socket).await;
+                    let _ = connection(&process, socket, forwarded).await;
                 });
             }
         }
@@ -731,11 +784,46 @@ async fn read_request(socket: &mut UnixStream, max_header_bytes: u32) -> Result<
         length,
     })
 }
-async fn connection(process: &Gateway, socket: UnixStream) -> Result<()> {
-    let wait = RequestLog::new();
+async fn read_run(socket: &mut UnixStream) -> Result<String> {
+    let mut bytes = Vec::new();
+    for _ in 0..70 {
+        let byte = socket
+            .read_u8()
+            .await
+            .map_err(|_| GatewayError::Transport)?;
+        if byte == b'\n' {
+            let identity = bytes
+                .strip_prefix(b"run ")
+                .ok_or(GatewayError::InvalidRequest)?;
+            if identity.is_empty()
+                || identity.len() > 64
+                || !identity
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(b))
+            {
+                return Err(GatewayError::InvalidRequest);
+            }
+            return String::from_utf8(identity.to_vec()).map_err(|_| GatewayError::InvalidRequest);
+        }
+        bytes.push(byte);
+    }
+    Err(GatewayError::InvalidRequest)
+}
+async fn connection(process: &Gateway, mut socket: UnixStream, forwarded: bool) -> Result<()> {
+    let mut wait = RequestLog::new();
+    if forwarded {
+        let run = tokio::time::timeout(
+            Duration::from_secs(process.config().io_timeout_seconds),
+            read_run(&mut socket),
+        )
+        .await
+        .map_err(|_| GatewayError::Timeout)??;
+        wait.request_id = format!("{run}-{}", uuid::Uuid::new_v4().simple());
+        wait.span.record("request_id", wait.request_id.as_str());
+    }
     let span = wait.span.clone();
     async {
-        let result = connection_request(process, socket, wait).await;
+        let result = connection_request(process, socket, wait, forwarded).await;
         if let Err(error) = &result {
             tracing::warn!(code = %error, "passthrough connection ended");
         }
@@ -748,6 +836,7 @@ async fn connection_request(
     process: &Gateway,
     mut socket: UnixStream,
     mut wait: RequestLog,
+    forwarded: bool,
 ) -> Result<()> {
     let timeout = Duration::from_secs(process.config().io_timeout_seconds);
     let request = match tokio::time::timeout(
@@ -762,14 +851,21 @@ async fn connection_request(
     };
     let pass = &process.inner.passthrough;
     let route = pass.routes.iter().find(|route| {
-        path_valid(&request.path)
+        process
+            .config()
+            .passthrough
+            .forwarder
+            .as_ref()
+            .is_some_and(|f| f.tenant == route.config.tenant)
+            == forwarded
+            && path_valid(&request.path)
             && route.config.path == request.path
             && route.config.method.text() == request.method
     });
     let request_id = request
         .headers
         .iter()
-        .find(|(name, _)| name == REQUEST_ID_HEADER)
+        .find(|(name, _)| !forwarded && name == REQUEST_ID_HEADER)
         .map(|(_, value)| value);
     let mut invalid_id = request_id.is_some_and(|value| !printable(value, 64));
     if let Some(value) = request_id {
