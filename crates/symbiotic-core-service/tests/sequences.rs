@@ -24,8 +24,109 @@ fn decisions(conn: &Connection, open_only: bool) -> Vec<Value> {
     }).unwrap().map(Result::unwrap).filter(|d| !open_only || d["state"] == "open").collect()
 }
 
-fn invariants(store: &mut Store, conn: &Connection) {
+fn stored_jobs(conn: &Connection) -> Vec<Value> {
+    conn.prepare(
+        "SELECT json_object('id',id,'kind',kind,'product',product,'inputs',json(inputs),
+         'rule_revision',rule_revision,'model_route',model_route,'budget_id',budget_id,
+         'state',state,'waiting_for',json(waiting_for),'result_ref',result_ref,
+         'created',created,'updated',updated,'heartbeat_at',heartbeat_at) FROM jobs ORDER BY id",
+    )
+    .unwrap()
+    .query_map([], |row| row.get::<_, String>(0))
+    .unwrap()
+    .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+    .collect()
+}
+
+fn listing_matches_store(store: &mut Store, conn: &Connection, limit: usize) {
+    let expected = stored_jobs(conn);
+    let before_events = events(store);
+    let mut after = None;
+    for start in (0..expected.len().max(1)).step_by(limit) {
+        let end = (start + limit).min(expected.len());
+        let next = if end < expected.len() {
+            expected[end - 1]["id"].clone()
+        } else {
+            Value::Null
+        };
+        let mut args = json!({"limit":limit});
+        if let Some(id) = after {
+            args["after"] = id;
+        }
+        assert_eq!(
+            ok(store, "job.list", args),
+            json!({"jobs":expected[start..end],"next_after":next}),
+            "pages must return every stored job exactly once in id order without cost"
+        );
+        after = Some(next);
+    }
+    assert_eq!(stored_jobs(conn), expected, "listing never writes jobs");
+    assert_eq!(events(store), before_events, "listing appends no event");
+}
+
+fn heartbeat_matches_store(
+    store: &mut Store,
+    conn: &Connection,
+    id: &str,
+    heartbeats: &mut BTreeMap<String, Value>,
+) {
+    let mut expected = stored_jobs(conn);
+    let before_events = events(store);
+    let job = expected.iter_mut().find(|job| job["id"] == id).unwrap();
+    let state = job["state"].as_str().unwrap().to_owned();
+    let start = time();
+    let response = call(store, "job.heartbeat", json!({"id":id}));
+    let end = time();
+    if state == "running" {
+        let timestamp = response["ok"]["heartbeat_at"]
+            .as_str()
+            .expect("accepted heartbeat has a timestamp");
+        assert!((start.as_str()..=end.as_str()).contains(&timestamp));
+        assert_eq!(response, json!({"ok":{"id":id,"heartbeat_at":timestamp}}));
+        job["heartbeat_at"] = json!(timestamp);
+        heartbeats.insert(id.to_owned(), json!(timestamp));
+    } else {
+        let reason = if ["done", "failed", "cancelled"].contains(&state.as_str()) {
+            "job_state_terminal"
+        } else {
+            "job_not_running"
+        };
+        assert_eq!(response["error"]["reason"], reason);
+    }
+    assert_eq!(
+        stored_jobs(conn),
+        expected,
+        "heartbeat changes only a running job's heartbeat_at"
+    );
+    assert_eq!(events(store), before_events, "heartbeat appends no event");
+}
+
+fn invariants(
+    store: &mut Store,
+    conn: &Connection,
+    heartbeats: &BTreeMap<String, Value>,
+    event_count: usize,
+) {
     let all = events(store);
+    assert_eq!(
+        all.len(),
+        event_count,
+        "only the other operations append events"
+    );
+    for event in &all {
+        assert!(
+            event["payload"].get("heartbeat_at").is_none(),
+            "event contains liveness: {event}"
+        );
+    }
+    for job in stored_jobs(conn) {
+        assert_eq!(
+            job.get("heartbeat_at"),
+            Some(&heartbeats[job["id"].as_str().unwrap()]),
+            "stored heartbeat is null or the last accepted heartbeat"
+        );
+    }
+    listing_matches_store(store, conn, 2);
     assert!(
         all.windows(2)
             .all(|w| w[0]["seq"].as_i64().unwrap() < w[1]["seq"].as_i64().unwrap()),
@@ -131,13 +232,15 @@ fn generated_operations_preserve_budget_event_and_job_invariants() {
         let mut generator = Generator(seed);
         let mut requests = Vec::<Value>::new();
         let mut jobs = Vec::<String>::new();
+        let mut heartbeats = BTreeMap::<String, Value>::new();
+        let mut event_count = 0;
         for step in 0..80 {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let open = decisions(&conn, true);
-                let operation = match generator.pick(7) {
+                let operation = match generator.pick(9) {
                     3 if requests.is_empty() => 0,
                     4 if open.is_empty() => 0,
-                    6 if jobs.is_empty() => 0,
+                    6 | 7 if jobs.is_empty() => 0,
                     operation => operation,
                 };
                 match operation {
@@ -249,6 +352,7 @@ fn generated_operations_preserve_budget_event_and_job_invariants() {
                             )["job"]["state"],
                             expected
                         );
+                        heartbeats.insert(id.clone(), Value::Null);
                         jobs.push(id);
                     }
                     6 => {
@@ -270,14 +374,30 @@ fn generated_operations_preserve_budget_event_and_job_invariants() {
                             );
                         }
                     }
-                    _ => unreachable!("generator selects one of seven operations"),
+                    7 => {
+                        let id = &jobs[generator.pick(jobs.len())];
+                        heartbeat_matches_store(&mut store, &conn, id, &mut heartbeats);
+                    }
+                    8 => listing_matches_store(&mut store, &conn, 1 + generator.pick(3)),
+                    _ => unreachable!("generator selects one of nine operations"),
                 }
-                invariants(&mut store, &conn);
+                if operation <= 6 {
+                    event_count = events(&mut store).len();
+                }
+                invariants(&mut store, &conn, &heartbeats, event_count);
             }));
             assert!(
                 result.is_ok(),
                 "replay with SEQUENCE_SEED={seed}; failed at step {step}"
             );
+        }
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        invariants(&mut store, &conn, &heartbeats, event_count);
+        // Recheck the call semantics against each persisted state after reopening.
+        for id in &jobs {
+            heartbeat_matches_store(&mut store, &conn, id, &mut heartbeats);
+            invariants(&mut store, &conn, &heartbeats, event_count);
         }
     }
 }

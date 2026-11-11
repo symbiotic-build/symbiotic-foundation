@@ -194,3 +194,61 @@ fn help_and_usage_have_distinct_exit_codes() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
 }
+
+#[test]
+fn cli_records_a_heartbeat_and_lists_running_jobs() {
+    let state = tempfile::tempdir().unwrap();
+    let mut server = Server(
+        Command::new(BIN)
+            .arg("--state")
+            .arg(state.path())
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while UnixStream::connect(state.path().join("core.sock")).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "server exited before binding"
+        );
+        assert!(Instant::now() < deadline, "socket never became ready");
+        std::thread::yield_now();
+    }
+    ok(
+        state.path(),
+        "job.create",
+        json!({"id":"job","kind":"review","product":"test"}),
+    );
+    ok(
+        state.path(),
+        "job.create",
+        json!({"id":"ready","kind":"review","product":"test"}),
+    );
+    let mut expected = ok(
+        state.path(),
+        "job.transition",
+        json!({"id":"job","to":"running"}),
+    )["job"]
+        .clone();
+    let history = ok(state.path(), "events.since", json!({}));
+    let heartbeat = ok(state.path(), "job.heartbeat", json!({"id":"job"}));
+    chrono::DateTime::parse_from_rfc3339(heartbeat["heartbeat_at"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        heartbeat,
+        json!({"id":"job","heartbeat_at":heartbeat["heartbeat_at"]})
+    );
+    expected["heartbeat_at"] = heartbeat["heartbeat_at"].clone();
+    expected.as_object_mut().unwrap().remove("cost");
+    assert_eq!(
+        ok(
+            state.path(),
+            "job.list",
+            json!({"product":"test","state":"running"})
+        ),
+        json!({"jobs":[expected],"next_after":null})
+    );
+    assert_eq!(ok(state.path(), "events.since", json!({})), history);
+}

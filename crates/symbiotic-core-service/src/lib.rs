@@ -64,9 +64,9 @@ impl Store {
             .mode(0o700)
             .create(state)?;
         fs::set_permissions(state, fs::Permissions::from_mode(0o700))?;
-        Self::open_version(&state.join("core.sqlite"), 2)
+        Self::open_version(&state.join("core.sqlite"), 3)
     }
-    /// Open a database and migrate through `version` (1 or 2).
+    /// Open a database and migrate through `version` (1 through 3).
     /// This also permits constructing historical files for migration checks.
     pub fn open_version(path: &Path, version: u32) -> Result<Self> {
         let mut conn = Connection::open(path)?;
@@ -81,9 +81,10 @@ impl Store {
 
 /// Apply numbered SQL migrations atomically, refusing unknown newer versions.
 pub fn migrate(conn: &mut Connection, target: u32) -> Result<()> {
-    const SQL: [&str; 2] = [
+    const SQL: [&str; 3] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_read_indexes.sql"),
+        include_str!("../migrations/0003_job_heartbeat.sql"),
     ];
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -124,6 +125,8 @@ pub fn dispatch(store: &mut Store, line: &str) -> String {
         let value = match call {
             "job.create" => calls::job_create(&tx, args),
             "job.transition" => calls::job_transition(&tx, args),
+            "job.heartbeat" => calls::job_heartbeat(&tx, args),
+            "job.list" => calls::job_list(&tx, args),
             "request.record" => calls::request_record(&tx, args),
             "decision.answer" => budgets::answer(&tx, args),
             "budget.get" => {

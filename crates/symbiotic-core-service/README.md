@@ -1,6 +1,6 @@
 # symbiotic-core-service
 
-The core service stores jobs, model request records, provider budgets and operator decisions in one SQLite database. Each write commits its records and append-only events together. It tracks work reported by products; it does not execute jobs or make model calls. The library exposes `Store::open`, `Store::open_version`, `migrate` and `dispatch` for in-process use. The binary `symbiotic-core` serves the owning user over a Unix socket.
+The core service stores jobs, model request records, provider budgets and operator decisions in one SQLite database. Each state-changing write commits its records and append-only events together. It tracks work reported by products; it does not execute jobs or make model calls. The library exposes `Store::open`, `Store::open_version`, `migrate` and `dispatch` for in-process use. The binary `symbiotic-core` serves the owning user over a Unix socket.
 
 ## State folder
 
@@ -8,13 +8,13 @@ The core service stores jobs, model request records, provider budgets and operat
 - `core.sock`: owning-user socket. The server runs with umask 077, so the socket, store and backups give group and others no access.
 - `backups/core-YYYYMMDDTHHMMSSZ.sqlite`: a backup at server start and hourly thereafter; the newest 48 matching files remain.
 
-The state folder has mode 0700. The store uses a 60 s busy timeout, WAL, `synchronous=FULL` and `fullfsync=ON`. Numbered [migrations](migrations/0001_initial.sql) run in one IMMEDIATE transaction; [read indexes](migrations/0002_read_indexes.sql) are version 2. `PRAGMA user_version` records the version. Newer files fail with `store_version_newer`. Updates and deletes on events fail with `events are append-only`.
+The state folder has mode 0700. The store uses a 60 s busy timeout, WAL, `synchronous=FULL` and `fullfsync=ON`. Numbered [migrations](migrations/0001_initial.sql) run in one IMMEDIATE transaction; [read indexes](migrations/0002_read_indexes.sql) are version 2, and [job heartbeats](migrations/0003_job_heartbeat.sql) are version 3. `PRAGMA user_version` records the version. Newer files fail with `store_version_newer`. Updates and deletes on events fail with `events are append-only`.
 
 The bare SQLite operations are inserts and updates in one transaction per write, indexed record lookups and ordered event reads. The service layer adds field validation, state rules and JSON responses. It keeps no extra cache.
 
-The tables are `events`, `jobs`, `job_decisions`, `decisions`, `budgets` and `requests`. They are required by the core service record contract. The event payload carries the data needed to rebuild each record.
+The tables are `events`, `jobs`, `job_decisions`, `decisions`, `budgets` and `requests`. They are required by the core service record contract. The event payload carries the data needed to rebuild each record. Job `heartbeat_at`, like derived `cost`, is outside the canonical job record. Heartbeats append no event, and a store rebuilt from events has null heartbeats. A heartbeat each minute would otherwise add 1 440 event rows per job per day.
 
-The seven read indexes cover `events(subject_kind, subject_id)`, `requests(job_id)`, `requests(account, time)`, `jobs(created)`, `budgets(account)`, `decisions(budget_id, state)` and `requests(time)`. Each index adds one B-tree entry per row and maintenance on indexed writes. The account and decision indexes avoid unrelated rows on every request; the time indexes select the report day in SQLite.
+The seven read indexes cover `events(subject_kind, subject_id)`, `requests(job_id)`, `requests(account, time)`, `jobs(created)`, `budgets(account)`, `decisions(budget_id, state)` and `requests(time)`. Each index adds one B-tree entry per row and maintenance on indexed writes. The account and decision indexes avoid unrelated rows on every request; the time indexes select the report day in SQLite. `job.list` walks the primary key in ascending id order and applies its filters without a new index. An index is added when a measured listing needs one. Listing reads stored job fields without reading requests or deriving cost.
 
 Job cost is derived from requests; there is no stored cost or charged column. Budgets store their account once; window fields stay inside the stored reading (`meter`), without separate `owner` or `window` columns.
 
@@ -161,7 +161,7 @@ Args: `{id, kind, product, inputs?: [string], rule_revision?: string, model_rout
 
 Warden jobs use the exact, case-sensitive `product` value `"warden"`. Other product names remain unrestricted.
 
-Response: `{duplicate, seq, job}`. `job` holds `id`, `kind`, `product`, `inputs`, `rule_revision`, `model_route`, `budget_id`, `state`, `waiting_for`, `result_ref`, `created`, `updated` and `cost`. Absent optional strings are null; absent arrays are empty. `cost` holds per-field sums of `usage.normalized`, `requests` and `requests_without_usage`. Missing usage fields stay absent.
+Response: `{duplicate, seq, job}`. `job` holds `id`, `kind`, `product`, `inputs`, `rule_revision`, `model_route`, `budget_id`, `state`, `waiting_for`, `result_ref`, `created`, `updated`, `heartbeat_at` and `cost`. Absent optional strings are null; absent arrays are empty. `cost` holds per-field sums of `usage.normalized`, `requests` and `requests_without_usage`. Missing usage fields stay absent.
 
 Creation is idempotent on `id` and the create args. A different body fails with `job_id_conflict`. Each named decision must exist (`decision_not_found`). The initial state is `waiting` if any named decision is not `answered`; otherwise it is `ready`. Creation writes `job_decisions` and `job.created`. A duplicate returns the original sequence and the current job without another event.
 
@@ -175,6 +175,26 @@ Response: `{duplicate, seq, job}`. A transition to the current nonterminal state
 - `ready` requires `waiting`. `running` requires `waiting` or `ready`. Both fail with `job_waiting_for_decision` if a named decision is not answered.
 - `done` and `failed` require `running`; other invalid transitions fail with `job_transition_invalid`. `cancelled` accepts every nonterminal state.
 - Events are `job.ready`, `job.started`, `job.finished`, `job.failed` and `job.cancelled`, respectively.
+
+### `job.heartbeat`
+
+Args: `{id}`. Response: `{id, heartbeat_at}`.
+
+A running job stores the service's current UTC time in `heartbeat_at`. The call changes no other field and appends no event. It does not derive cost or read requests. A new job has null `heartbeat_at`; an ended job keeps its last value.
+
+A missing job fails with `job_not_found`. A terminal job (`done`, `failed`, `cancelled`) fails with `job_state_terminal`. A `waiting` or `ready` job fails with `job_not_running`. Invalid args fail with `args_invalid`.
+
+A stale heartbeat changes nothing by itself. The service does not fail, reclaim or restart a job. Heartbeats provide liveness reporting without claims, leases, owners, attempts or retries.
+
+### `job.list`
+
+Args: `{product?: string, state?: string, after?: string, limit?: integer}`.
+
+`product` matches exactly. `state` is `waiting`, `ready`, `running`, `done`, `failed` or `cancelled`. Supplied filters combine with AND. `after` is an exclusive job-id cursor. `limit` defaults to 1 000 and accepts 0 through 10 000. Invalid filters, cursors or limits fail with `args_invalid`.
+
+Response: `{jobs: [...], next_after}`. Jobs follow ascending `id`. Each job holds `id`, `kind`, `product`, `inputs`, `rule_revision`, `model_route`, `budget_id`, `state`, `waiting_for`, `result_ref`, `created`, `updated` and `heartbeat_at`. The response excludes derived `cost` and appends no event.
+
+The query fetches `limit + 1` matching rows. `next_after` is the last returned id when another matching row exists, otherwise null. With `limit` 0, the result is `{jobs: [], next_after: null}` because no id was returned.
 
 ### `decision.answer`
 
@@ -230,6 +250,8 @@ symbiotic-core --state /state request.record -
 symbiotic-core --state /state budget.get '{"account":"codex-gmail"}'
 symbiotic-core --state /state decision.answer '<JSON args>'
 symbiotic-core --state /state job.transition '{"id":"job","to":"running"}'
+symbiotic-core --state /state job.heartbeat '{"id":"job"}'
+symbiotic-core --state /state job.list '{"product":"warden","state":"running","limit":100}'
 symbiotic-core --state /state events.since '{"after":0}'
 symbiotic-core --state /state reconcile --day 2026-11-02 --warden-state /warden-state
 ```
@@ -251,6 +273,17 @@ Each bullet names the failure prevented and the test function in its linked file
 - Events reject updates and deletes, preventing rewritten history: [tests/store.rs](tests/store.rs), `version_one_job_survives_migration_and_events_remain_append_only`.
 - Records and events commit together, preventing partial requests or budget changes after a failed write: [tests/requests.rs](tests/requests.rs), `invalid_derived_reading_rolls_back_request_and_prior_readings`.
 - Idempotent `job.create` prevents duplicate jobs and rejects changed create bodies: [tests/jobs.rs](tests/jobs.rs), `create_is_idempotent_after_transitions_and_conflicts_on_changed_body`.
+- Heartbeats store service time without changing other job fields or event history, preventing liveness reports from changing state or growing the event log: [tests/jobs.rs](tests/jobs.rs), `running_job_heartbeat_stores_the_service_time_and_appends_no_event`.
+- Missing, non-running and terminal jobs reject heartbeats without writes, preventing invalid liveness updates: [tests/jobs.rs](tests/jobs.rs), `heartbeat_rejects_missing_waiting_ready_and_final_jobs_without_writes`.
+- Job events exclude heartbeats even after a transition, preventing liveness from entering canonical history: [tests/jobs.rs](tests/jobs.rs), `job_events_never_carry_the_heartbeat`. Ended jobs retain their last heartbeat.
+- A create retry after a heartbeat preserves the original sequence, preventing duplicate creation history: [tests/jobs.rs](tests/jobs.rs), `create_retry_after_heartbeat_returns_the_original_sequence`.
+- Job listing combines exact product and state filters, preventing unrelated jobs from entering results: [tests/jobs.rs](tests/jobs.rs), `job_list_filters_by_state_and_product_alone_and_together`.
+- Dispatched cursor listings return complete expected pages with and without product and state filters. On 1 000 matching jobs, a page after job 900 uses at most twice the first page's SQLite virtual-machine steps, preventing repeated scans of earlier jobs: [src/calls.rs](src/calls.rs), `job_list_seeks_to_the_cursor_instead_of_scanning_earlier_jobs`.
+- Job listing uses exclusive id cursors and matching-row continuation, preventing repeated rows and false continuation: [tests/jobs.rs](tests/jobs.rs), `job_list_pages_by_id_and_reports_continuation`.
+- Job listing returns stored fields and heartbeats without cost or new events, preventing request-history work and listing writes: [tests/jobs.rs](tests/jobs.rs), `job_list_returns_stored_fields_and_heartbeat_without_cost`.
+- Invalid listing filters, cursors and limits fail without writes, preventing malformed queries from being accepted: [tests/jobs.rs](tests/jobs.rs), `job_list_rejects_invalid_filters_cursors_and_limits`.
+- Migration from version 2 preserves jobs and events with null heartbeats, preventing upgrade data loss: [tests/store.rs](tests/store.rs), `version_two_records_survive_the_heartbeat_migration`. Creation, heartbeats and reopening work after upgrade.
+- Both calls work through the real socket and CLI, preventing a dispatch-only implementation: [tests/cli.rs](tests/cli.rs), `cli_records_a_heartbeat_and_lists_running_jobs`.
 - Idempotent `request.record` prevents duplicate charges and rejects changed request bodies: [tests/requests.rs](tests/requests.rs), `request_retry_uses_original_sequence_and_rejects_changed_body`.
 - A job naming an unanswered decision starts `waiting` and cannot run, preventing unauthorized work: [tests/jobs.rs](tests/jobs.rs), `unanswered_decision_blocks_running_until_answered`.
 - The 90 % and 100 % thresholds raise their decisions, preventing missed budget choices: [tests/budgets.rs](tests/budgets.rs), `thresholds_open_one_decision_each_and_reset_withdraws_open_decisions`.
@@ -259,6 +292,7 @@ Each bullet names the failure prevented and the test function in its linked file
 - An older reading never moves a budget, preventing an outbox from rolling it back: [tests/budgets.rs](tests/budgets.rs), `old_reading_changes_nothing_and_reading_without_limit_is_not_a_budget`.
 - Repeated exhaustion reuses an open exhaustion decision, preventing duplicate questions: [tests/budgets.rs](tests/budgets.rs), `exhaustion_after_warning_reuses_unanswered_exhaustion_decision`.
 - Each budget's `spent`, `limit` and `state` equal its last `budget.reading` event. The allowance (`over_limit_allowed`) is not in that event: rebuilding it also needs the `decision.answered` events of its exhaustion decisions and the readings that return the budget to `open`, and no test checks that rebuild. Sequence checks prevent record/event divergence, duplicate open decisions and jobs proceeding with unanswered decisions: [tests/sequences.rs](tests/sequences.rs), `generated_operations_preserve_budget_event_and_job_invariants` (32 fixed seeds, 80 operations each; `SEQUENCE_SEED` replays one seed).
+- Generated heartbeats change only running jobs' liveness and never enter events. Generated listings return every stored job once in id order without cost. Last accepted heartbeats, unchanged event counts and complete pages are checked after each operation and after reopening: [tests/sequences.rs](tests/sequences.rs), `generated_operations_preserve_budget_event_and_job_invariants`.
 - Migration from version 1 preserves jobs and append-only history, preventing data loss during upgrade: [tests/store.rs](tests/store.rs), `version_one_job_survives_migration_and_events_remain_append_only`.
 - Owner-only socket permissions prevent group and other access: [tests/cli.rs](tests/cli.rs), `standalone_cli_serves_calls_reconciles_and_creates_private_socket_and_backup`. Rejection of a different peer uid has no automated test.
 - Reconcile compares only core jobs with exact `product = "warden"` against Warden manifests, preventing unrelated products from causing false failures or satisfying missing Warden jobs: [tests/reconcile.rs](tests/reconcile.rs), `warden_job_comparison_ignores_other_products`. Missing or extra Warden jobs fail in `missing_extra_without_usage_unknown_job_and_exhausted_requests_are_listed`; `matching_warden_jobs_pass_and_model_job_id_matches_fixed_digest` checks agreement and the Warden id.

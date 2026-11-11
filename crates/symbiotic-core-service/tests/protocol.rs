@@ -6,12 +6,18 @@ use symbiotic_core_service::dispatch;
 #[test]
 fn seeded_malformed_lines_never_panic_and_return_exactly_one_json_result() {
     let (_dir, mut store) = store();
+    assert_eq!(
+        ok(&mut store, "job.list", json!({})),
+        json!({"jobs":[],"next_after":null})
+    );
     let warden = tempfile::tempdir().unwrap();
     let mut recorded = record("request", Some(100.0));
     recorded["time"] = json!("2026-11-02T12:00:00.000Z");
     let requests = [
         json!({"call":"job.create","args":{"id":"job","kind":"review","product":"test"}}),
         json!({"call":"job.transition","args":{"id":"job","to":"running"}}),
+        json!({"call":"job.heartbeat","args":{"id":"job"}}),
+        json!({"call":"job.list","args":{"state":"running","limit":10}}),
         json!({"call":"request.record","args":recorded}),
         json!({"call":"budget.get","args":{"account":"account"}}),
         json!({"call":"decision.answer","args":{"decision_id":"budget-account-weekly-exhausted-1","revision":1,"answer":{"kind":"option","optionId":"keep_refusing"},"answered_by":{"id":"operator","kind":"human","displayName":"Operator"}}}),

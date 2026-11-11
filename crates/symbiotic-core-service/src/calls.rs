@@ -32,12 +32,13 @@ fn job(conn: &Connection, id: &str) -> Result<Value> {
     Ok(job)
 }
 fn job_event(conn: &Connection, id: &str, kind: &str, job: &Value) -> Result<i64> {
-    // Cost is derived on read and is never part of the canonical job record.
+    // Derived cost and liveness are outside the canonical job record.
     let mut payload = job.clone();
-    payload
+    let record = payload
         .as_object_mut()
-        .ok_or_else(|| Error::new("store_error", "invalid job record"))?
-        .remove("cost");
+        .ok_or_else(|| Error::new("store_error", "invalid job record"))?;
+    record.remove("cost");
+    record.remove("heartbeat_at");
     Ok(append(conn, "job", id, kind, &payload)?.0)
 }
 
@@ -98,7 +99,7 @@ pub(crate) fn job_create(conn: &Connection, args: &Value) -> Result<Value> {
     };
     let time = now();
     conn.execute(
-        "INSERT INTO jobs VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,?10)",
+        "INSERT INTO jobs (id,kind,product,inputs,rule_revision,model_route,budget_id,state,waiting_for,result_ref,created,updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10,?10)",
         params![
             id,
             kind,
@@ -170,6 +171,103 @@ pub(crate) fn job_transition(conn: &Connection, args: &Value) -> Result<Value> {
     let value = job(conn, id)?;
     let seq = job_event(conn, id, kind, &value)?;
     Ok(json!({"duplicate":false,"seq":seq,"job":value}))
+}
+pub(crate) fn job_heartbeat(conn: &Connection, args: &Value) -> Result<Value> {
+    fields(args, &["id"])?;
+    let id = string(args, "id")?;
+    let state: String = conn
+        .query_row("SELECT state FROM jobs WHERE id=?1", [id], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| Error::new("job_not_found", format!("job {id} does not exist")))?;
+    if ["done", "failed", "cancelled"].contains(&state.as_str()) {
+        return Err(Error::new(
+            "job_state_terminal",
+            format!("job {id} is {state}"),
+        ));
+    }
+    if state != "running" {
+        return Err(Error::new(
+            "job_not_running",
+            format!("job {id} is {state}"),
+        ));
+    }
+    let time = now();
+    conn.execute(
+        "UPDATE jobs SET heartbeat_at=?1 WHERE id=?2",
+        params![time.0, id],
+    )?;
+    Ok(json!({"id":id,"heartbeat_at":time.0}))
+}
+pub(crate) fn job_list(conn: &Connection, args: &Value) -> Result<Value> {
+    fields(args, &["product", "state", "after", "limit"])?;
+    for field in ["product", "state", "after"] {
+        optional_string(args, field)?;
+    }
+    if args.get("state").is_some()
+        && !["waiting", "ready", "running", "done", "failed", "cancelled"]
+            .contains(&string(args, "state")?)
+    {
+        return Err(invalid("state"));
+    }
+    let limit = page_limit(args)?;
+    let (sql, parameters) = job_list_query(
+        args["product"].as_str(),
+        args["state"].as_str(),
+        args["after"].as_str(),
+        limit + 1,
+    );
+    let mut jobs = rows(conn, &sql, rusqlite::params_from_iter(parameters))?;
+    let next_after = if jobs.len() > limit as usize {
+        jobs.pop();
+        jobs.last()
+            .map(|job| job["id"].clone())
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    Ok(json!({"jobs":jobs,"next_after":next_after}))
+}
+/// Build the listing statement and its bound parameters for validated filters.
+/// `row_limit` includes the extra row used to detect continuation.
+fn job_list_query(
+    product: Option<&str>,
+    state: Option<&str>,
+    after: Option<&str>,
+    row_limit: i64,
+) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value as SqlValue;
+    let mut sql = String::from("SELECT * FROM jobs");
+    let mut parameters = Vec::new();
+    for (column, operator, value) in [
+        ("product", "=", product),
+        ("state", "=", state),
+        ("id", ">", after),
+    ] {
+        if let Some(value) = value {
+            sql.push_str(if parameters.is_empty() {
+                " WHERE "
+            } else {
+                " AND "
+            });
+            sql.push_str(column);
+            sql.push_str(operator);
+            sql.push('?');
+            parameters.push(SqlValue::Text(value.into()));
+        }
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    parameters.push(SqlValue::Integer(row_limit));
+    (sql, parameters)
+}
+
+fn page_limit(args: &Value) -> Result<i64> {
+    match args.get("limit") {
+        None => Ok(1000),
+        Some(v) => v
+            .as_i64()
+            .filter(|x| (0..=10000).contains(x))
+            .ok_or_else(|| invalid("limit")),
+    }
 }
 fn readings(meter: &Value) -> Result<&[Value]> {
     match meter.get("readings") {
@@ -326,13 +424,7 @@ pub(crate) fn events_since(conn: &Connection, args: &Value) -> Result<Value> {
             .filter(|x| *x >= 0)
             .ok_or_else(|| invalid("after"))?,
     };
-    let limit = match args.get("limit") {
-        None => 1000,
-        Some(v) => v
-            .as_i64()
-            .filter(|x| (0..=10000).contains(x))
-            .ok_or_else(|| invalid("limit"))?,
-    };
+    let limit = page_limit(args)?;
     let events = rows(
         conn,
         "SELECT * FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2",
@@ -343,4 +435,76 @@ pub(crate) fn events_since(conn: &Connection, args: &Value) -> Result<Value> {
         .and_then(|v| v["seq"].as_i64())
         .unwrap_or(after);
     Ok(json!({"events":events,"last_seq":last}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn job_list_seeks_to_the_cursor_instead_of_scanning_earlier_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut jobs = Vec::new();
+        for index in 0..1000 {
+            let line = json!({"call":"job.create","args":{"id":format!("job-{index:04}"),"kind":"review","product":"test"}}).to_string();
+            let response: Value = serde_json::from_str(&dispatch(&mut store, &line)).unwrap();
+            let mut job = response["ok"]["job"].clone();
+            job.as_object_mut().unwrap().remove("cost");
+            jobs.push(job);
+        }
+        let mut measurements = Vec::new();
+        for (product, state) in [
+            (None, None),
+            (Some("test"), None),
+            (None, Some("ready")),
+            (Some("test"), Some("ready")),
+        ] {
+            let mut page_steps = Vec::new();
+            for (after, start) in [(None, 0), (Some("job-0900"), 901)] {
+                let limit = 10;
+                let mut args = json!({"limit":limit});
+                for (field, value) in [("product", product), ("state", state), ("after", after)] {
+                    if let Some(value) = value {
+                        args[field] = json!(value);
+                    }
+                }
+                let line = json!({"call":"job.list","args":args}).to_string();
+                let steps = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&steps);
+                store.conn.progress_handler(
+                    1,
+                    Some(move || {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }),
+                );
+                let response = dispatch(&mut store, &line);
+                store.conn.progress_handler(0, None::<fn() -> bool>);
+                let steps = steps.load(Ordering::Relaxed);
+                let response: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(
+                    response,
+                    json!({"ok":{"jobs":jobs[start..start + limit],"next_after":jobs[start + limit - 1]["id"]}}),
+                    "product={product:?} state={state:?} after={after:?}"
+                );
+                page_steps.push(steps);
+            }
+            measurements.push((product, state, page_steps));
+        }
+        for (product, state, page_steps) in measurements {
+            // Equal-sized matching pages allow at most 2x the first page's work.
+            // Scanning the 901 earlier jobs must exceed this cursor-seek bound.
+            assert!(
+                page_steps[1] <= 2 * page_steps[0],
+                "product={product:?} state={state:?}: late page used {} SQLite VM steps, first page used {} (bound: 2x)",
+                page_steps[1],
+                page_steps[0]
+            );
+        }
+    }
 }

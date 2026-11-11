@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::{io::Read, path::PathBuf};
 use symbiotic_core_service::server;
-const USAGE: &str = "Usage: symbiotic-core [--state DIR] serve\n       symbiotic-core [--state DIR] <job.create|job.transition|request.record|budget.get|decision.answer|events.since> <JSON|->\n       symbiotic-core [--state DIR] reconcile --day YYYY-MM-DD --warden-state DIR\nState defaults to SYMBIOTIC_CORE_STATE.\n";
+const USAGE: &str = "Usage: symbiotic-core [--state DIR] serve\n       symbiotic-core [--state DIR] <job.create|job.transition|job.heartbeat|job.list|request.record|budget.get|decision.answer|events.since> <JSON|->\n       symbiotic-core [--state DIR] reconcile --day YYYY-MM-DD --warden-state DIR\nState defaults to SYMBIOTIC_CORE_STATE.\n";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
@@ -59,6 +59,8 @@ async fn run() -> Result<u8, Box<dyn std::error::Error>> {
         if ![
             "job.create",
             "job.transition",
+            "job.heartbeat",
+            "job.list",
             "request.record",
             "budget.get",
             "decision.answer",

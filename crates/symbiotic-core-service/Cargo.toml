@@ -22,4 +22,5 @@ symbiotic-core = { path = "../symbiotic-core" }
 libc = "0.2"
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
