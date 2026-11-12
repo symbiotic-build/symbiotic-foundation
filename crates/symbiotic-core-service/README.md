@@ -90,10 +90,18 @@ The gateway sends one per model request, from its outbox, after the response end
 Fields:
 
 - **One record per upstream attempt:** a caller request that the gateway retries, continues or falls back to another account sends one record per attempt, each with its own usage, meter, account and route. Job cost is the sum of all attempts.
-- `request_id` (string, required): attempt 1 carries the caller's id, which for Warden is `<model_job_id>-<n>`; attempt n ≥ 2 carries `<caller id>.<n>`. The core is idempotent on it.
-- `job_id` (string, required): the caller's job id, the same for every attempt (for Warden, the part of the caller's id before the last `-`). The gateway sends it; the core does not parse ids. A request whose job is not in the core yet is still stored; reconcile reports it if the job never arrives.
+- `request_id` (string, required): on the owner socket, attempt 1 carries the caller's valid `x-symbiotic-request-id`, which for Warden is `<model_job_id>-<n>`.
+  An absent or invalid header leaves the generated `local-<uuid>` ID.
+  On the [forwarder socket](../symbiotic-gateway/README.md#forwarder-socket), the gateway ignores that header and generates `<run identity>-<32 hexadecimal characters>` from the connection's first line.
+  On both sockets, attempt n ≥ 2 carries `<request ID of attempt 1>.<n>`. The core is idempotent on it.
+- `job_id` (string, required): the same for every attempt.
+  On the owner socket, it is the request ID of attempt 1 before the last `-`, or the whole ID if no `-` occurs.
+  For Warden, this is the caller's job id. On the forwarder socket, it is the run identity.
+  The gateway sends it; the core does not parse ids. A request whose job is not in the core yet is still stored; reconcile reports it if the job never arrives.
 - `account`, `route`, `model` (strings, required).
-- `status` (integer, required): that attempt's upstream HTTP status, 502 for a network failure. A local refusal or local error with no upstream call is one record with the caller's id and the status returned to the caller.
+- `status` (integer, required): that attempt's upstream HTTP status, 502 for a network failure.
+  A local refusal or local error after route selection, with no upstream call, is one record with that socket's attempt-1 request ID and the status returned to the caller.
+  Connections rejected before route selection write no record, including forwarder connections with missing, overlong or malformed first lines.
 - `account` names: the route's sharing key as `shared:<key>` when set, else `<tenant>/<account>` (deployed Warden routes: `warden/codex` and so on). Budgets and the quota gate use the same names; the core never splits an account, budget or decision id.
 - `refused` (string, optional): present only for a local refusal with no upstream call. Step 1 value: `quota_exhausted`, with `status` 402 and `usage` null.
 - `time` (string, required): when the response ended or the refusal happened. The request row normalizes it to UTC with millisecond precision and `Z` for text range queries. The `model.request` event preserves the args exactly as sent.

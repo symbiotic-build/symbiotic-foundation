@@ -21,6 +21,15 @@ The record removed the final hyphen and suffix to derive `job_id`.
 Retries appended `.2`, `.3` and so on to the request ID.
 Records carried account and route without a tenant field.
 
+## Naming conventions
+
+New public names follow the existing configuration conventions: the `forwarder`
+block and its fields `socket_path`, `peer_uid` and `tenant` use lower snake case,
+subject first. The Rust type `ForwarderConfig` uses upper camel case with the
+existing `Config` suffix. The first-line command `run` is one lower-case word,
+followed by a single space, the run identity and a line feed.
+The first-line rule below defines the identity's character set; this change adds no error reasons.
+
 ## Decisions
 
 - **Optional block:** `PassthroughConfig.forwarder` contains required `socket_path`, `peer_uid` and `tenant` fields and refuses unknown fields.
