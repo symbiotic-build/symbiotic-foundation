@@ -22,6 +22,8 @@ pub use balance::DecimalAmount;
 use chrono::{DateTime, Utc};
 #[path = "passthrough_balance.rs"]
 mod balance;
+#[path = "passthrough_usage.rs"]
+mod usage;
 use crate::GatewayError;
 pub use balance::{BalanceConfig, BalanceProvider, Currency, LowBalance};
 use forward::RequestLog;

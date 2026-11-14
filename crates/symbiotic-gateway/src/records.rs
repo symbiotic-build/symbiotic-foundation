@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -16,6 +18,14 @@ use tokio::{
 };
 
 type Result<T> = std::result::Result<T, GatewayError>;
+
+const USAGE_READ_INTERVAL: Duration = Duration::from_secs(300);
+
+/// A route-owned read pairing each observation with its original window length in seconds.
+/// Credentials and transport stay with the route; polling performs one read.
+pub(crate) type UsageRead<'a> = Pin<
+    Box<dyn Future<Output = std::result::Result<Vec<(Reading, u64)>, &'static str>> + Send + 'a>,
+>;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Reading {
@@ -184,12 +194,15 @@ struct Sources {
     closed: bool,
 }
 impl Sources {
-    fn closed(&mut self, account: &str, name: &str, now: DateTime<Utc>) -> bool {
-        let newest = match (&self.local, &self.core) {
+    fn newest(&self) -> Option<&Observation> {
+        match (&self.local, &self.core) {
             (Some(local), Some(core)) if local.at() > core.at() => Some(local),
             (_, Some(core)) => Some(core),
             (local, _) => local.as_ref(),
-        };
+        }
+    }
+    fn closed(&mut self, account: &str, name: &str, now: DateTime<Utc>) -> bool {
+        let newest = self.newest();
         // An allowance answers one window; it lapses with that window's reset.
         let reason = if self
             .core
@@ -222,6 +235,7 @@ impl Sources {
 struct AccountGate {
     readings: HashMap<String, Sources>,
     last_refresh: Option<Instant>,
+    last_usage_read: Option<Instant>,
 }
 impl AccountGate {
     fn closed(&mut self, account: &str, now: DateTime<Utc>) -> bool {
@@ -269,6 +283,7 @@ impl Records {
                                 .map_err(|_| GatewayError::StateUnavailable)?
                                 .unwrap_or_default(),
                             last_refresh: None,
+                            last_usage_read: None,
                         }),
                         refresh: tokio::sync::Mutex::new(()),
                     },
@@ -386,7 +401,7 @@ impl Records {
         }
         Ok(())
     }
-    pub async fn closed(&self, name: &str) -> Result<bool> {
+    pub async fn closed(&self, name: &str, usage_reader: Option<UsageRead<'_>>) -> Result<bool> {
         let account = self
             .accounts
             .get(name)
@@ -424,6 +439,53 @@ impl Records {
                 ),
             }
         }
+        if let Some(reader) = usage_reader {
+            let due = {
+                let mut gate = account
+                    .gate
+                    .lock()
+                    .map_err(|_| GatewayError::StateUnavailable)?;
+                if gate.closed(name, (self.clock)())
+                    && gate
+                        .last_usage_read
+                        .is_none_or(|at| at.elapsed() >= USAGE_READ_INTERVAL)
+                {
+                    // Stamp before the read: failures and waiting requests share the interval.
+                    gate.last_usage_read = Some(Instant::now());
+                    true
+                } else {
+                    false
+                }
+            };
+            if due {
+                match reader.await {
+                    Ok(readings) => {
+                        let readings = {
+                            let gate = account
+                                .gate
+                                .lock()
+                                .map_err(|_| GatewayError::StateUnavailable)?;
+                            readings
+                                .into_iter()
+                                .filter_map(|(mut reading, window_seconds)| {
+                                    let stored =
+                                        &gate.readings.get(&reading.name)?.newest()?.reading;
+                                    if stored.window_minutes.and_then(|m| m.checked_mul(60))
+                                        != Some(window_seconds)
+                                    {
+                                        return None;
+                                    }
+                                    reading.limit = stored.limit;
+                                    Some(reading)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        self.observe(name, &readings, (self.clock)());
+                    }
+                    Err(code) => tracing::warn!(code, account = name, "provider usage read failed"),
+                }
+            }
+        }
         let mut gate = account
             .gate
             .lock()
@@ -432,7 +494,7 @@ impl Records {
     }
     pub async fn run(&self) -> Result<()> {
         for account in self.accounts.keys() {
-            self.closed(account).await?;
+            self.closed(account, None).await?;
         }
         let mut core: Option<Core> = None;
         let mut delay = Duration::from_secs(1);

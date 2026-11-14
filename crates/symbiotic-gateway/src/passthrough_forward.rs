@@ -570,7 +570,11 @@ impl Passthrough {
         let mut authentication: Option<(HeaderMap, Option<LoginRequest>)> = None;
         loop {
             wait.prepare_record(route, &request_model);
-            if self.records.closed(&wait.account).await? {
+            if self
+                .records
+                .closed(&wait.account, self.usage_reader(route))
+                .await?
+            {
                 wait.refused = true;
                 return self
                     .local_error(write, started, 402, "quota_exhausted", wait, None)
