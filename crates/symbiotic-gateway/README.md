@@ -217,6 +217,33 @@ The gateway asks the core for `budget.get` at startup and at most once every 10 
 while closed gates receive requests. Each lookup times out after 2 s. A failed
 lookup preserves the gate. An offline core does not prevent startup or forwarding
 through open gates. Records accumulate in the outbox until delivery resumes.
-Opening restores gate observations before admission. An exhausted account stays
-closed across restart during a core outage until reset or core permission.
+Opening restores gate observations before admission.
+
+When a request reaches a closed Codex gate, a route with a ChatGPT Codex login
+also reads `GET <route-origin>/backend-api/wham/usage`. The destination must use
+HTTPS, host `chatgpt.com` and port 443. The read uses the route's HTTP client and
+login headers, including `chatgpt-account-id`. It sends no body or model name.
+It calls only the usage path, never a path that lists or consumes reset credits.
+This read reports quota state and runs no model, so it cannot spend credits.
+
+The cost is at most one usage read per closed account per 300 s, including failed
+reads. There are no usage reads while the gate is open or without an arriving
+request. Requests for the account wait for an in-flight read before the gate
+judges them. The read times out after 2 s and uses the route's `max_response_bytes`
+bound. Failure preserves observations and logs one static diagnostic code without
+provider text.
+
+The answer's `rate_limit.primary_window` and `secondary_window` become local
+`codex.primary` and `codex.secondary` observations through the response-header
+observation path. Each window's `limit_window_seconds` must equal the newest
+stored reading's `window_minutes` multiplied by 60. A different window leaves
+that reading unchanged. The correspondence between usage-read windows and
+response-header windows has not been verified against the provider.
+Matching windows retain the stored limit and record
+`used_percent`, `reset_at` and the local read time in the existing `gate` table.
+No additional persistent structure is created. The existing gate rule judges the
+waiting request after observation: a reading below the limit opens it with
+`below_limit`; an exhausted reading retains the refusal and updates its reset
+time. This lets the gateway learn when the provider resets a window before its
+stored reset time. Stored observations survive reopening the records store.
 The core owns budgets and credit decisions. The health file adds no record or quota fields and omits the retired `cost` field.

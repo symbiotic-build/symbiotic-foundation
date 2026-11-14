@@ -1270,3 +1270,6 @@ async fn request_records_failed_json_keeps_reported_usage_for_both_dialects() {
         }
     }
 }
+
+#[path = "quota_usage_tests.rs"]
+mod quota_usage_tests;
