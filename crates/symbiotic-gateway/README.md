@@ -237,7 +237,9 @@ The answer's `rate_limit.primary_window` and `secondary_window` become local
 `codex.primary` and `codex.secondary` observations through the response-header
 observation path. Each window's `limit_window_seconds` must equal the newest
 stored reading's `window_minutes` multiplied by 60. A different window leaves
-that reading unchanged. Matching windows retain the stored limit and record
+that reading unchanged. The correspondence between usage-read windows and
+response-header windows has not been verified against the provider.
+Matching windows retain the stored limit and record
 `used_percent`, `reset_at` and the local read time in the existing `gate` table.
 No additional persistent structure is created. The existing gate rule judges the
 waiting request after observation: a reading below the limit opens it with

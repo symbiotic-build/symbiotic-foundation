@@ -798,7 +798,12 @@ impl Passthrough {
                 Err(_) => return Err(GatewayError::StateUnavailable),
             };
             let Some(sent) = sent else {
-                if quota_refused {
+                if quota_refused
+                    && self
+                        .records
+                        .closed(&wait.account, self.usage_reader(route))
+                        .await?
+                {
                     wait.refused = true;
                     return self
                         .local_error(write, started, 402, "quota_exhausted", wait, None)

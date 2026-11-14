@@ -137,6 +137,95 @@ async fn closed_usage_below_limit_releases_waiting_requests_and_logs_one_transit
 }
 
 #[tokio::test]
+async fn queued_before_exhaustion_waits_for_usage_and_obeys_the_result_without_an_extra_read() {
+    for used in [20, 100] {
+        let mut provider = Fixture::start().await;
+        let harness = Harness::start(&provider, usage_config).await;
+        let reset =
+            (harness.process.inner.passthrough.now() + chrono::Duration::days(1)).timestamp();
+        let first = harness.connect("/v1/responses", b"{}", "").await;
+        let response = provider.next().await;
+        let slot = harness.account().acquire().await.unwrap();
+        let model::ModelRequestAdmission::Ready(grant) =
+            harness.account().request_admission().await.unwrap()
+        else {
+            panic!("an open, unpaced account must admit a request");
+        };
+        let queued = harness
+            .connect(
+                "/v1/responses",
+                b"{}",
+                "x-symbiotic-request-id: synthetic-queued\r\n",
+            )
+            .await;
+        waiting_ids(&harness, &["synthetic-queued"]).await;
+        response
+            .reply
+            .send(responses_reply(100, reset))
+            .ok()
+            .unwrap();
+        assert_eq!(decoded(&read(first).await).0, 200);
+
+        let refreshing = harness.connect("/v1/responses", b"{}", "").await;
+        let usage = provider.next().await;
+        assert_usage(&usage);
+        // Release the queued caller while the usage read still holds the refresh lock.
+        drop(slot);
+        drop(grant);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), queued.readable())
+                .await
+                .is_err(),
+            "queued caller answered before the usage read completed (used={used})"
+        );
+        assert_no_provider_request(&mut provider);
+        usage
+            .reply
+            .send(usage_reply(used, reset, 604800))
+            .ok()
+            .unwrap();
+        if used < 100 {
+            for _ in 0..2 {
+                let model = provider.next().await;
+                assert!(
+                    model
+                        .head
+                        .starts_with("POST /backend-api/codex/responses HTTP/1.1")
+                );
+                model.reply.send(Reply::json()).ok().unwrap();
+            }
+            assert_eq!(
+                (
+                    decoded(&read(queued).await).0,
+                    decoded(&read(refreshing).await).0
+                ),
+                (200, 200)
+            );
+        } else {
+            assert_quota_refusal(queued).await;
+            assert_quota_refusal(refreshing).await;
+        }
+        assert_no_provider_request(&mut provider);
+
+        advance_clock(Duration::from_secs(200)).await;
+        let next = harness.connect("/v1/responses", b"{}", "").await;
+        if used < 100 {
+            let model = provider.next().await;
+            assert!(
+                model
+                    .head
+                    .starts_with("POST /backend-api/codex/responses HTTP/1.1")
+            );
+            model.reply.send(Reply::json()).ok().unwrap();
+            assert_eq!(decoded(&read(next).await).0, 200);
+        } else {
+            assert_quota_refusal(next).await;
+        }
+        assert_no_provider_request(&mut provider);
+    }
+}
+
+#[tokio::test]
 async fn closed_usage_exhausted_updates_reset_and_waits_300_seconds_between_reads() {
     let mut provider = Fixture::start().await;
     let harness = Harness::start(&provider, usage_config).await;
